@@ -1,0 +1,78 @@
+{
+  "$schema": "test-manifest",
+  "description": "逐题求解回归的测试契约。file 相对 test/ 目录；maxTracks 是题目规定的铺轨上限（null = 未知，不强制）；hasSolution 是预期是否有解（优先级高于夹具内嵌 expected）；timeoutMs 可覆盖单题超时。执行器按目录递归发现 JSON，本清单缺失的文件按默认值运行——不要依赖本清单作为文件总目录。",
+  "defaults": {
+    "hasSolution": true,
+    "maxTracks": null
+  },
+  "cases": [
+    {
+      "file": "测试/关卡-4x6-20260722-6-2A.json",
+      "maxTracks": null
+    },
+    {
+      "file": "测试/关卡-4x8-20260722-6-3A.json",
+      "maxTracks": 9
+    },
+    {
+      "file": "测试/关卡-5x5-20260722-7-6A.json",
+      "maxTracks": 11
+    },
+    {
+      "file": "测试/关卡-6x7-8-3A.json",
+      "maxTracks": 16,
+      "timeoutMs": 240000,
+      "note": "16 轨解存在但 DFS 需要约 2-3 分钟（单 Worker、seed 0）；CSP 会先给出 17 轨超限解。缩短耗时属于后续搜索优化。"
+    },
+    {
+      "file": "测试/关卡-7x4-20260722-5-3A.json",
+      "maxTracks": null
+    },
+    {
+      "file": "测试/关卡-7x5-20260722-5-7.json",
+      "maxTracks": null
+    },
+    {
+      "file": "测试/关卡-7x5-20260722-7-4A.json",
+      "maxTracks": null,
+      "note": "零号车踩变轨触发器后停车/循环。DFS 对'零号车驶向未决 blank'尚不能同时展开铺轨/不铺轨两个后继世界，当前无候选不是无解证明。"
+    },
+    {
+      "file": "测试/关卡-7x8-20260722-8-7.json",
+      "maxTracks": null,
+      "note": "4 Barrier + 颜色触发器远程切换，静态 CSP 不适用，联合 DFS 20s 预算耗尽。"
+    },
+    {
+      "file": "测试/关卡-8x5-20260722-8-1A.json",
+      "maxTracks": null,
+      "note": "静态 4 车组合题。有限 CSP 枚举失败后回退 DFS 仍预算耗尽；不能报告为无解。"
+    },
+    {
+      "file": "测试/关卡-8x9-20260722-6-9D.json",
+      "maxTracks": null,
+      "note": "4 颜色变轨 T + 1 自变 T + 全局触发器，时序状态爆炸，预算耗尽。"
+    },
+    {
+      "file": "测试/关卡-9x5-20260722-5-6B.json",
+      "maxTracks": null
+    },
+    {
+      "file": "测试/关卡-9x9-20260722-7-7C.json",
+      "maxTracks": null
+    },
+    {
+      "file": "scratch_solve_7x7.json",
+      "maxTracks": null
+    },
+    {
+      "file": "scratch_solve_8x8.json",
+      "maxTracks": null,
+      "note": "4 零号车 + 4 颜色变轨 T，距终点启发式无效，当前算法极限基准。"
+    },
+    {
+      "file": "scratch_test_autoswitch_6x4.json",
+      "maxTracks": null,
+      "note": "夹具期望 hasSolution:true，但初始两车相邻同向，第 1 步权威模拟必然 TAILING（先于任何铺轨生效）。待关卡作者确认：修正初始布局 / 改期望为不可解 / 重新核对追尾规则。在确认前不要删除追尾判定。"
+    }
+  ]
+}
