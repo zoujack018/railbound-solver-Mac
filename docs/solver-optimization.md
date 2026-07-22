@@ -191,6 +191,19 @@ BFS 距离场，placed 变化时局部失效或容忍过期）。
 再拼接（段间衔接 = 端口 + 到达时间约束）。段数少、每段短，桶不易溢出。
 验证：7×7-8-5A 的 CSP 是否能产出候选；与 P1 时间盒配合。
 
+10×11-8-6A 的一次性原型补充了一个重要实施约束：不能先把每车两段做完整
+笛卡尔积再合并四车。固定 50,000 工作单元中，23,529 用于段展开、26,471
+用于 car1 的行程配对/端口合并，尚未建立 car2 域，更没有完整布局或
+`simulate()` 调用。该路径必须报告 `generator-degenerate-no-full-layout` 与
+`complete:false`，不能写 template exhausted。
+
+后续 P8 原型应改成终点漏斗优先的增量合并：反向枚举 platform→AutoSwitch
+段，先合并北侧 car3→car1、再合并南侧 car2→car4，逐格维护可支持全部
+entry→exit usage 的轨型域；然后才接 start→platform 段。站台固定直轨的入口
+W/E 都要保留，长度窗口由实际段长产生。每次段配对、轨型合并和完整叶都必须
+进入同一个工作预算；`fullLeaves===0` 只能说明生成器退化。该专项仍是可能丢解
+的候选生成器，失败不得参与 `search-exhausted`，成功候选仍须经过 `simulate()`。
+
 ### P9 多 Worker 组合策略（portfolio）
 
 现状：浏览器按硬件并发起 N 个 Worker 只差 shuffle seed；测试执行器单
