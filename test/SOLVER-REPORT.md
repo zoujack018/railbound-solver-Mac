@@ -107,6 +107,35 @@ P1 在该题的实际搜索路径上不执行；在本轮只允许落地一个�
 不能再叠加 DFS 剪枝或排序来制造通过结果。后续若继续攻关，应另起单变量优化
 轮次并重新做同样的完备性与金丝雀核验。
 
+#### 10×11 扩展只读探针
+
+为排除“只需扩大 P1 覆盖或增加现有预算”的可能，提交后又做了不修改工作树的
+只读探针。大型 CSP admission 通过运行时内存替换旧 `useful <= 45` 条件实现，
+并在第一条 DFS progress 消息处停止；它不是本轮已落地的 P1 改动，也没有写回
+Worker。
+
+| CSP 探针配置 | CSP 时间 | 路径枚举 | 组合迭代 | 候选 | 终止位置 |
+|---|---:|---:|---:|---|---|
+| 默认 5s / 100k paths / 5M combinations | 1,406.84 ms | 100,000 | 0 | 无 | `csp-path-budget` |
+| 5s / 1M paths / 5M combinations | 5,000.15 ms | 359,675 | 259,106 | 无 | `csp-time-budget` |
+| 60s / 1M paths / 5M combinations | 6,712.93 ms | 359,675 | 5,000,000 | 无 | `csp-combination-budget` |
+| 60s / 1M paths / 50M combinations | 32,379.70 ms | 971,958 | 50,000,000 | 无 | `csp-combination-budget` |
+
+默认 admission 只会增加约 1.4 秒无候选前置工作；即使放宽到 5,000 万组合，
+仍未产生候选。扩大 admission 还会改变原本直接 DFS 的调度路径，属于需要独立
+A/B 的另一变量，不能静默归因于当前 P1，因此没有落地。
+
+现有浏览器 seed 公式也做了完整 portfolio 复核：seed 0 加上
+`i * 7919 + 31`（`i=1..15`）共 16 个 Worker，每个搜索 15,000,000 个 DFS
+节点。合计 240,000,000 节点、16 个 seed 全部 0 候选，均正确终止为
+`complete:false` + `dfs-iteration-budget`。另一个非浏览器 seed 1 同样在 15M
+节点无候选。
+
+最后将 seed 0 单独放宽到 60,000,000 节点：343,690.78ms，最深 174 步，仍
+没有候选；结果继续是 `complete:false` + `dfs-iteration-budget`。因此不能通过
+提高默认预算、扩大 P1 admission 或现有多 seed 来宣称目标已解决；下一步需要
+另起单变量的 DFS 专项优化轮次。
+
 ### 本轮验收状态
 
 - 仓库现有 10 条金丝雀全部通过：包含要求中的 9 条契约，以及额外的 rear-end
