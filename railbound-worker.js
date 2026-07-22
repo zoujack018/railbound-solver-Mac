@@ -28,6 +28,171 @@ const MAX_ENUM_ITERS = 4000000;
 const PATH_SLACK = 6;
 const MAX_ALTERNATES = 5;
 const CSP_BEAM_WIDTH = 2000;
+const DEFAULT_CSP_TIMEBOX = Object.freeze({
+  enabled: true,
+  maxMs: 5000,
+  maxPaths: 100000,
+  maxCombinations: 5000000,
+});
+const DEFAULT_DFS_MAX_ITERATIONS = 15000000;
+
+function elapsedMs(startedAt) {
+  return performance.now() - startedAt;
+}
+
+function finiteBudget(value, fallback) {
+  const n = Number(value);
+  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : fallback;
+}
+
+function normalizeCspTimebox(raw = {}) {
+  const value = raw && typeof raw === "object" ? raw : {};
+  return {
+    enabled: value.enabled !== false,
+    maxMs: finiteBudget(value.maxMs, DEFAULT_CSP_TIMEBOX.maxMs),
+    maxPaths: finiteBudget(value.maxPaths, DEFAULT_CSP_TIMEBOX.maxPaths),
+    maxCombinations: finiteBudget(value.maxCombinations, DEFAULT_CSP_TIMEBOX.maxCombinations),
+  };
+}
+
+function createCspGuard(rawConfig, telemetry = null) {
+  const config = normalizeCspTimebox(rawConfig);
+  const startedAt = performance.now();
+  let timePolls = 0;
+  const stats = {
+    attempted: false,
+    skipped: false,
+    skipReason: null,
+    timeboxEnabled: config.enabled,
+    config: { ...config },
+    aborted: false,
+    abortReason: null,
+    pathIterations: 0,
+    pathsEnumerated: 0,
+    pathsRetained: 0,
+    pathsByCar: {},
+    combinationIterations: 0,
+    overflow: false,
+    overflowReasons: [],
+  };
+
+  function abort(reason) {
+    if (!stats.aborted) {
+      stats.aborted = true;
+      stats.abortReason = reason;
+    }
+    return true;
+  }
+  function checkTime(force = false) {
+    if (stats.aborted) return true;
+    if (!config.enabled) return false;
+    timePolls += 1;
+    if ((force || (timePolls & 1023) === 0) && elapsedMs(startedAt) >= config.maxMs) {
+      return abort("csp-time-budget");
+    }
+    return false;
+  }
+  function carStats(name) {
+    const key = String(name);
+    if (!stats.pathsByCar[key]) {
+      stats.pathsByCar[key] = {
+        invocations: 0,
+        pathIterations: 0,
+        pathsEnumerated: 0,
+        pathsRetained: 0,
+        overflow: false,
+        overflowReasons: [],
+      };
+    }
+    return stats.pathsByCar[key];
+  }
+  function addOverflow(reason, name = null) {
+    stats.overflow = true;
+    if (!stats.overflowReasons.includes(reason)) stats.overflowReasons.push(reason);
+    if (name !== null) {
+      const cs = carStats(name);
+      cs.overflow = true;
+      if (!cs.overflowReasons.includes(reason)) cs.overflowReasons.push(reason);
+    }
+  }
+  function beginCar(name) {
+    carStats(name).invocations += 1;
+  }
+  function notePathIteration(name) {
+    if (stats.aborted) return true;
+    stats.pathIterations += 1;
+    carStats(name).pathIterations += 1;
+    if (stats.pathIterations % 100000 === 0) {
+      postToMain({
+        type: "progress",
+        phase: "csp",
+        iters: 0,
+        cspMs: telemetry?.cspStartedAt ? elapsedMs(telemetry.cspStartedAt) : (telemetry?.cspMs || 0),
+        dfsMs: telemetry?.dfsMs || 0,
+        cspStats: snapshot(),
+      });
+    }
+    return checkTime();
+  }
+  function notePath(name) {
+    if (stats.aborted) return true;
+    stats.pathsEnumerated += 1;
+    carStats(name).pathsEnumerated += 1;
+    if (config.enabled && stats.pathsEnumerated >= config.maxPaths) abort("csp-path-budget");
+    return stats.aborted;
+  }
+  function noteRetained(name, count) {
+    stats.pathsRetained += count;
+    carStats(name).pathsRetained += count;
+  }
+  function noteCombination() {
+    if (stats.aborted) return true;
+    stats.combinationIterations += 1;
+    if (stats.combinationIterations % 100000 === 0) {
+      postToMain({
+        type: "progress",
+        phase: "csp",
+        iters: 0,
+        cspMs: telemetry?.cspStartedAt ? elapsedMs(telemetry.cspStartedAt) : (telemetry?.cspMs || 0),
+        dfsMs: telemetry?.dfsMs || 0,
+        cspStats: snapshot(),
+      });
+    }
+    if (config.enabled && stats.combinationIterations >= config.maxCombinations) return abort("csp-combination-budget");
+    return checkTime();
+  }
+  function snapshot() {
+    const pathsByCar = {};
+    for (const [name, value] of Object.entries(stats.pathsByCar)) {
+      pathsByCar[name] = { ...value, overflowReasons: [...value.overflowReasons] };
+    }
+    return {
+      ...stats,
+      config: { ...stats.config },
+      pathsByCar,
+      overflowReasons: [...stats.overflowReasons],
+    };
+  }
+  return {
+    config,
+    stats,
+    abort,
+    checkTime,
+    beginCar,
+    notePathIteration,
+    notePath,
+    noteRetained,
+    noteCombination,
+    addOverflow,
+    snapshot,
+  };
+}
+
+function emitCandidate(solution, telemetry, source) {
+  const candidateMs = elapsedMs(telemetry.startedAt);
+  if (telemetry.firstCandidateMs === null) telemetry.firstCandidateMs = candidateMs;
+  postToMain({ type: "solution", solution, candidateMs, source });
+}
 
 // ═══════════ Search helpers ═══════════
 
@@ -38,7 +203,7 @@ function getPorts(tn) {
   return [...p];
 }
 
-function bfsMinSteps(car, pz, bs, waypoints = [], blocked = null) {
+function bfsMinSteps(car, pz, bs, waypoints = [], blocked = null, cspGuard = null) {
   const gx = pz.goal[0], gy = pz.goal[1], ge = pz.goalEntry || pz.goal_entry;
   const tm = buildTunnelMap(pz.tunnels);
   const tsm = buildTSwitchMap(pz.tswitches);
@@ -47,6 +212,7 @@ function bfsMinSteps(car, pz, bs, waypoints = [], blocked = null) {
   const q = [[car.x, car.y, car.entry, startWp, 0]];
   const visited = new Set();
   for (let qi = 0; qi < q.length; qi++) {
+    if (cspGuard && cspGuard.checkTime()) return Infinity;
     const [x, y, entry, wpIdx, steps] = q[qi];
     const sk = x + "," + y + "," + entry + "," + wpIdx;
     if (visited.has(sk)) continue; visited.add(sk);
@@ -85,7 +251,7 @@ function bfsMinSteps(car, pz, bs, waypoints = [], blocked = null) {
   return Infinity;
 }
 
-function buildHeuristic(car, pz, bs, waypoints = [], blocked = null) {
+function buildHeuristic(car, pz, bs, waypoints = [], blocked = null, cspGuard = null) {
   const gx = pz.goal[0], gy = pz.goal[1], ge = pz.goalEntry || pz.goal_entry;
   const tm = buildTunnelMap(pz.tunnels);
   const tsm = buildTSwitchMap(pz.tswitches);
@@ -95,6 +261,7 @@ function buildHeuristic(car, pz, bs, waypoints = [], blocked = null) {
   const q = [[car.x, car.y, car.entry, startWp, 0]];
   let bestTotal = Infinity;
   for (let qi = 0; qi < q.length; qi++) {
+    if (cspGuard && cspGuard.checkTime()) break;
     const [x, y, entry, wpIdx, steps] = q[qi];
     const sk = x + "," + y + "," + entry + "," + wpIdx;
     if (fwd.has(sk)) continue; fwd.set(sk, steps);
@@ -151,17 +318,22 @@ function buildHeuristic(car, pz, bs, waypoints = [], blocked = null) {
 
 // ═══════════ Path enumeration ═══════════
 
-function enumeratePaths(car, pz, bs, meta, maxCost, waypoints = [], minRequiredArrival = 0, blocked = null) {
+function enumeratePaths(car, pz, bs, meta, maxCost, waypoints = [], minRequiredArrival = 0, blocked = null, cspGuard = null) {
   const ge = pz.goalEntry || pz.goal_entry, gx = pz.goal[0], gy = pz.goal[1], pathLimit = pz.maxPaths || MAX_PATHS;
-  const heur = buildHeuristic(car, pz, bs, waypoints, blocked);
+  if (cspGuard) cspGuard.beginCar(car.name);
+  const heur = buildHeuristic(car, pz, bs, waypoints, blocked, cspGuard);
   const minSteps = heur.minTotal;
   const isZero = isZeroCar(car);
-  if (minSteps === Infinity && !isZero) return { paths: [], overflow: false, minSteps };
+  if (minSteps === Infinity && !isZero) {
+    if (cspGuard) cspGuard.noteRetained(car.name, 0);
+    return { paths: [], overflow: false, overflowReasons: [], minSteps };
+  }
   const slack = pz.pathSlack ?? PATH_SLACK;
   const minLen = Math.max(minSteps === Infinity ? 0 : minSteps, minRequiredArrival);
   const maxLen = isZero ? (pz.maxSteps || pz.max_steps || 50) : Math.min(pz.maxSteps || pz.max_steps || 50, minLen + slack);
   let iters = 0;
   let overflow = false;
+  const overflowReasons = new Set();
   const tunnelMap = buildTunnelMap(pz.tunnels);
   const tswitchMap = buildTSwitchMap(pz.tswitches);
   const autoSwitchMap = buildAutoSwitchMap(pz.autoSwitches || pz.auto_switches);
@@ -186,17 +358,21 @@ function enumeratePaths(car, pz, bs, meta, maxCost, waypoints = [], minRequiredA
   }
   const pathBuckets = {}, bucketOrder = [], perBucket = pz.maxPathsPerBucket || Math.max(80, Math.ceil(pathLimit / 48));
   function keepPath(p) {
+    if (cspGuard) cspGuard.notePath(car.name);
     const b = pathBucket(p);
     let arr = pathBuckets[b];
     if (!arr) { arr = []; pathBuckets[b] = arr; bucketOrder.push(b); }
     if (arr.length < perBucket) { arr.push(p); return; }
     overflow = true;
+    overflowReasons.add("path-bucket-capacity");
     let wi = 0;
     for (let i = 1; i < arr.length; i++) if (pathCompare(arr[i], arr[wi]) > 0) wi = i;
     if (pathCompare(p, arr[wi]) < 0) arr[wi] = p;
   }
   function dfs(x, y, entry, assigns, visited, cost, steps, wpIdx) {
-    if (iters++ > MAX_ENUM_ITERS) { overflow = true; return; }
+    iters += 1;
+    if (cspGuard && cspGuard.notePathIteration(car.name)) return;
+    if (iters > MAX_ENUM_ITERS) { overflow = true; overflowReasons.add("path-enumeration-iterations"); return; }
     if (cost > maxCost || steps >= maxLen) { if (isZero && assigns.length > 0) keepPath({ assigns, steps }); return; }
     if (steps + (minSteps === Infinity ? 0 : heur.h(x, y, entry, wpIdx)) > maxLen) return;
     const k = pk(x, y);
@@ -261,8 +437,15 @@ function enumeratePaths(car, pz, bs, meta, maxCost, waypoints = [], minRequiredA
   }
   const initialWpIdx = nextWpIdxFor(car.x, car.y, 0);
   dfs(car.x, car.y, car.entry, [], new Set(), 0, 0, initialWpIdx);
+  if (cspGuard && cspGuard.stats.aborted) {
+    cspGuard.noteRetained(car.name, 0);
+    for (const reason of overflowReasons) cspGuard.addOverflow(reason, car.name);
+    return { paths: [], overflow, overflowReasons: [...overflowReasons], minSteps, maxLen, minLen };
+  }
   for (const b of bucketOrder) pathBuckets[b].sort(pathCompare);
   const paths = [];
+  const bucketPathCount = bucketOrder.reduce((sum, b) => sum + pathBuckets[b].length, 0);
+  if (bucketPathCount > pathLimit) { overflow = true; overflowReasons.add("path-retention-limit"); }
   for (let i = 0; paths.length < pathLimit; i++) {
     let added = false;
     for (const b of bucketOrder) {
@@ -275,21 +458,33 @@ function enumeratePaths(car, pz, bs, meta, maxCost, waypoints = [], minRequiredA
   paths.sort(pathCompare);
   const seen = new Set(), deduped = [];
   for (const p of paths) { const fp = p._key || pathKey(p); if (!seen.has(fp)) { seen.add(fp); deduped.push(p); } }
-  return { paths: deduped, overflow, minSteps, maxLen, minLen };
+  if (cspGuard) {
+    cspGuard.noteRetained(car.name, deduped.length);
+    for (const reason of overflowReasons) cspGuard.addOverflow(reason, car.name);
+  }
+  return { paths: deduped, overflow, overflowReasons: [...overflowReasons], minSteps, maxLen, minLen };
 }
 
 // ═══════════ CSP solver ═══════════
 
-function solveCSP(pz, maxCost, bs, meta) {
+function solveCSP(pz, maxCost, bs, meta, cspGuard, telemetry) {
+  cspGuard.stats.attempted = true;
+  if (cspGuard.checkTime(true)) {
+    return { sol: null, alternates: [], overflow: cspGuard.stats.overflow, info: "CSP aborted: " + cspGuard.stats.abortReason };
+  }
   const platformState = buildPlatformState(pz.platforms);
   const blockedByCar = {};
   for (const car of pz.cars) blockedByCar[car.name] = blockedCellsForCar(platformState, car.name);
   const waypointsByCar = {}, minStepsByCar = {}, waypointCountByCar = {};
   for (const car of pz.cars) {
+    if (cspGuard.checkTime()) break;
     const wps = carWaypoints(platformState, car.name);
     waypointsByCar[car.name] = wps;
     waypointCountByCar[car.name] = wps.length;
-    minStepsByCar[car.name] = bfsMinSteps(car, pz, bs, wps, blockedByCar[car.name]);
+    minStepsByCar[car.name] = bfsMinSteps(car, pz, bs, wps, blockedByCar[car.name], cspGuard);
+  }
+  if (cspGuard.stats.aborted) {
+    return { sol: null, alternates: [], overflow: cspGuard.stats.overflow, info: "CSP aborted: " + cspGuard.stats.abortReason };
   }
   const minRequiredByCar = {};
   let priorMaxArrival = 0;
@@ -318,35 +513,54 @@ function solveCSP(pz, maxCost, bs, meta) {
      Zero cars don't reach the goal, so enumerating their paths causes
      massive path explosion (pathSlack=30, no goal constraint).
      Their correctness is validated by quickCollisionCheck + simulate(). */
-  const allPathResults = pz.cars.map(car => {
-    if (isZeroCar(car)) return { paths: [], overflow: false, minSteps: Infinity, minLen: 0, maxLen: 0 };
-    return enumeratePaths(car, pz, bs, meta, maxCost, waypointsByCar[car.name], minRequiredByCar[car.name] || 0, blockedByCar[car.name]);
-  });
+  const allPathResults = [];
+  for (const car of pz.cars) {
+    if (cspGuard.stats.aborted || cspGuard.checkTime()) break;
+    if (isZeroCar(car)) {
+      cspGuard.beginCar(car.name);
+      cspGuard.noteRetained(car.name, 0);
+      allPathResults.push({ paths: [], overflow: false, overflowReasons: [], minSteps: Infinity, minLen: 0, maxLen: 0 });
+    } else {
+      allPathResults.push(enumeratePaths(car, pz, bs, meta, maxCost, waypointsByCar[car.name], minRequiredByCar[car.name] || 0, blockedByCar[car.name], cspGuard));
+    }
+  }
+  if (cspGuard.stats.aborted) {
+    return { sol: null, alternates: [], overflow: cspGuard.stats.overflow, info: "CSP aborted: " + cspGuard.stats.abortReason };
+  }
   const allPaths = allPathResults.map(r => r.paths);
-  const overflow = allPathResults.some(r => r.overflow);
+  const overflow = allPathResults.some(r => r.overflow) || cspGuard.stats.overflow;
   for (let i = 0; i < allPaths.length; i++) if (!allPaths[i].length) {
     if (isZeroCar(pz.cars[i])) continue;
     return { sol: null, overflow, info: "car " + (i + 1) + " has 0 paths (minSteps=" + allPathResults[i].minSteps + ", req>=" + (minRequiredByCar[pz.cars[i].name] || 0) + ", blocked=" + blockedByCar[pz.cars[i].name].size + ")" };
   }
   const info = "paths: " + allPaths.map((p, i) => "c" + pz.cars[i].name + "=" + p.length + (allPathResults[i].overflow ? "!" : "") + "[" + allPathResults[i].minLen + "-" + allPathResults[i].maxLen + "]").join(" x ");
-  postToMain({ type: "progress", iters: 0, cspInfo: info });
+  postToMain({
+    type: "progress",
+    phase: "csp",
+    iters: 0,
+    cspInfo: info,
+    cspMs: telemetry.cspStartedAt ? elapsedMs(telemetry.cspStartedAt) : 0,
+    dfsMs: telemetry.dfsMs || 0,
+    cspStats: cspGuard.snapshot(),
+  });
 
   /* FIX: Exclude zero car indices from CSP merge order.
      Zero cars have no paths in CSP; they are validated post-hoc. */
   const order = [];
   for (const name of pz.order) { const ci = pz.cars.findIndex(c => String(c.name) === String(name)); if (ci >= 0) order.push(ci); }
   for (let i = 0; i < pz.cars.length; i++) if (!order.includes(i) && !isZeroCar(pz.cars[i]) && allPaths[i].length > 0) order.push(i);
-  let bestSol = null, bestCost = maxCost + 1, iters = 0;
+  let bestSol = null, bestCost = maxCost, iters = 0;
   const alternates = [], alternateKeys = new Set();
   const MAX_I = 15000000;
   function placedKey(placed) { return Object.keys(placed).sort().map(k => k + ":" + placed[k]).join("|"); }
   function rememberSolution(placed, cost) {
+    if (cost > maxCost) return;
     const sol = { ...placed, __cost: cost }, key = placedKey(placed);
-    if (cost < bestCost) { bestCost = cost; bestSol = sol; alternates.length = 0; alternateKeys.clear(); }
+    if (cost < bestCost || (cost === bestCost && bestSol === null)) { bestCost = cost; bestSol = sol; alternates.length = 0; alternateKeys.clear(); }
     if (cost === bestCost && !alternateKeys.has(key) && alternates.length < MAX_ALTERNATES) {
       alternateKeys.add(key); alternates.push(sol);
     }
-    if (bestSol === sol || alternates[alternates.length - 1] === sol) postToMain({ type: "solution", solution: sol });
+    if (bestSol === sol || alternates[alternates.length - 1] === sol) emitCandidate(sol, telemetry, "csp");
   }
 
   const orderPosByCi = [], wpCountByCi = [];
@@ -359,6 +573,9 @@ function solveCSP(pz, maxCost, bs, meta) {
     return { cells: m, steps: path.steps, arrival: path.steps + 2 * wpCountByCi[ci] };
   }));
   for (const list of pathMaps) list.sort((a, b) => Object.keys(a.cells).length - Object.keys(b.cells).length || a.arrival - b.arrival);
+  if (cspGuard.checkTime(true)) {
+    return { sol: bestSol, alternates, overflow: overflow || cspGuard.stats.overflow, info: info + "; CSP aborted: " + cspGuard.stats.abortReason };
+  }
 
   function usagesOfCell(a) {
     const out = [{ entry: a.entry, exit: a.exit }];
@@ -408,7 +625,10 @@ function solveCSP(pz, maxCost, bs, meta) {
   function forwardCheck(asgn, remaining) {
     for (const ci of remaining) {
       let any = false;
-      for (const po of pathMaps[ci]) { if (checkCompat(po.cells, asgn) !== null) { any = true; break; } }
+      for (const po of pathMaps[ci]) {
+        if (cspGuard.noteCombination()) return false;
+        if (checkCompat(po.cells, asgn) !== null) { any = true; break; }
+      }
       if (!any) return false;
     }
     return true;
@@ -561,10 +781,12 @@ function solveCSP(pz, maxCost, bs, meta) {
     const width = pz.cspBeamWidth || CSP_BEAM_WIDTH;
     let states = [{ asgn: {}, cost: 0, arrivals: {}, arrivalSum: 0 }];
     for (let idx = 0; idx < order.length; idx++) {
+      if (cspGuard.stats.aborted) return;
       const ci = order[idx], posCi = orderPosByCi[ci], next = [], seen = new Set();
       const limit = Math.min(pathMaps[ci].length, pz.cspBeamPathLimit || pathMaps[ci].length);
       for (const st of states) {
         for (let pi = 0; pi < limit; pi++) {
+          if (cspGuard.noteCombination()) return;
           const po = pathMaps[ci][pi], aCi = po.arrival;
           let orderOk = true;
           for (const otherCi in st.arrivals) {
@@ -590,6 +812,7 @@ function solveCSP(pz, maxCost, bs, meta) {
       if (!states.length) return;
     }
     for (const st of states) {
+      if (cspGuard.checkTime()) return;
       if (!validateTUsage(st.asgn)) continue;
       const placed = {}; for (const k in st.asgn) placed[k] = st.asgn[k].track;
       if (quickCollisionCheck(placed)) continue;
@@ -599,8 +822,17 @@ function solveCSP(pz, maxCost, bs, meta) {
     }
   }
   function bt(idx, asgn, cost, arrivals) {
-    if (iters++ > MAX_I || cost > bestCost || (cost === bestCost && alternates.length >= MAX_ALTERNATES)) return;
-    if (iters % 100000 === 0) postToMain({ type: "progress", iters: 100000 });
+    if (cspGuard.stats.aborted) return;
+    if (iters++ > MAX_I) { cspGuard.addOverflow("csp-backtracking-iterations"); return; }
+    if (cost > bestCost || (cost === bestCost && alternates.length >= MAX_ALTERNATES)) return;
+    if (iters % 100000 === 0) postToMain({
+      type: "progress",
+      phase: "csp",
+      iters: 100000,
+      cspMs: telemetry.cspStartedAt ? elapsedMs(telemetry.cspStartedAt) : 0,
+      dfsMs: telemetry.dfsMs || 0,
+      cspStats: cspGuard.snapshot(),
+    });
     if (idx === order.length) {
       if (!validateTUsage(asgn)) return;
       const placed = {}; for (const k in asgn) placed[k] = asgn[k].track;
@@ -611,6 +843,7 @@ function solveCSP(pz, maxCost, bs, meta) {
     }
     const ci = order[idx], remaining = order.slice(idx + 1), posCi = orderPosByCi[ci];
     for (const po of pathMaps[ci]) {
+      if (cspGuard.noteCombination()) return;
       const aCi = po.arrival;
       let orderOk = true;
       for (const otherCi in arrivals) {
@@ -636,17 +869,22 @@ function solveCSP(pz, maxCost, bs, meta) {
       if (remaining.length > 0 && !forwardCheck(na, remaining)) continue;
       const newArrivals = { ...arrivals }; newArrivals[ci] = aCi;
       bt(idx + 1, na, cost + compat.added, newArrivals);
-      if (iters > MAX_I) return;
+      if (iters > MAX_I || cspGuard.stats.aborted) return;
     }
   }
   runBeam();
-  bt(0, {}, 0, {});
-  return { sol: bestSol, alternates, overflow, info };
+  if (!cspGuard.stats.aborted) bt(0, {}, 0, {});
+  return {
+    sol: bestSol,
+    alternates,
+    overflow: overflow || cspGuard.stats.overflow,
+    info: cspGuard.stats.aborted ? info + "; CSP aborted: " + cspGuard.stats.abortReason : info,
+  };
 }
 
 // ═══════════ DFS fallback solver ═══════════
 
-function solveDFS(pz, maxSol, minTracks, budget, seed, bs, meta, maxIters = 15000000, prePlaced = {}) {
+function solveDFS(pz, maxSol, minTracks, budget, seed, bs, meta, telemetry, maxIters = DEFAULT_DFS_MAX_ITERATIONS, prePlaced = {}) {
   const placed = { ...prePlaced }, solutions = [], tm = buildTunnelMap(pz.tunnels);
   const _prePlacedCount = Object.keys(prePlaced).length;
   const ge = pz.goalEntry || pz.goal_entry, ms = pz.maxSteps || pz.max_steps || 50, gx = pz.goal[0], gy = pz.goal[1];
@@ -664,6 +902,7 @@ function solveDFS(pz, maxSol, minTracks, budget, seed, bs, meta, maxIters = 1500
   const _hasPlatforms = _platformState.count > 0;
   const _order = requiredOrder(pz);
   let bestCost = budget, iters = 0; const MAX = maxIters;
+  let iterationBudgetHit = false, solutionLimitHit = false;
   /* 零号车多后继世界的端口约束：portBans[k] = 该格禁止出现的入口端口集合。
      当零号车面对某格停车时，最终布局中该格不能有零号车入口侧的端口
      （否则零号车本应驶入）；该格仍可为其他车辆铺设不含该端口的轨道，也可不铺。
@@ -685,14 +924,47 @@ function solveDFS(pz, maxSol, minTracks, budget, seed, bs, meta, maxIters = 1500
   const solutionKeys = new Set();
   function placedKey(obj) { return Object.keys(obj).sort().map(k => k + ":" + obj[k]).join("|"); }
   function rememberSolution(cost) {
+    const authoritative = simulate(pz, placed);
+    if (!authoritative.ok) return false;
     const key = placedKey(placed);
     if (cost < bestCost) { bestCost = cost; solutions.length = 0; solutionKeys.clear(); }
     if (cost === bestCost && !solutionKeys.has(key) && solutions.length < MAX_ALTERNATES) {
       solutionKeys.add(key);
       const sol = { ...placed, __cost: cost };
       solutions.push(sol);
-      postToMain({ type: "solution", solution: sol });
+      emitCandidate(sol, telemetry, "dfs");
+      return true;
     }
+    return false;
+  }
+  function dfsStats(final = false) {
+    const searchComplete = final && !iterationBudgetHit && !solutionLimitHit;
+    let terminationReason = "running";
+    if (final) {
+      if (iterationBudgetHit) terminationReason = solutions.length > 0 ? "candidate-unproven-dfs-budget" : "dfs-iteration-budget";
+      else if (solutionLimitHit) terminationReason = "candidate-unproven-early-stop";
+      else terminationReason = solutions.length > 0 ? "optimal-proven" : "search-exhausted";
+    }
+    return {
+      nodes: iters,
+      iterations: iters,
+      limit: MAX,
+      deepestStep: deepest.step,
+      deepest,
+      iterationBudgetHit,
+      exhausted: iterationBudgetHit,
+      solutionLimitHit,
+      searchComplete,
+      terminationReason,
+      solutions: solutions.length,
+    };
+  }
+  function candidateLimitReached() {
+    if (!minTracks && solutions.length >= Math.max(maxSol, MAX_ALTERNATES)) {
+      solutionLimitHit = true;
+      return true;
+    }
+    return false;
   }
   const useMap = {};
   function hasUsage(k, entry, exit) { const arr = useMap[k]; return !!arr && arr.some(u => u.entry === entry && u.exit === exit); }
@@ -798,7 +1070,21 @@ function solveDFS(pz, maxSol, minTracks, budget, seed, bs, meta, maxIters = 1500
   }
 
   function dfs(cars, arrived, step, visited, toggled, tsToggled, autoToggled, tsLocks, servedPlatforms) {
-    if (iters++ > MAX) return; if (iters % 500000 === 0) postToMain({ type: "progress", iters: 500000 });
+    if (iterationBudgetHit || solutionLimitHit) return;
+    if (iters >= MAX) { iterationBudgetHit = true; return; }
+    iters += 1;
+    if (iters % 500000 === 0) {
+      const progressStats = dfsStats(false);
+      postToMain({
+        type: "progress",
+        phase: "dfs",
+        iters: 500000,
+        cspMs: telemetry.cspMs || 0,
+        dfsMs: telemetry.dfsStartedAt ? elapsedMs(telemetry.dfsStartedAt) : (telemetry.dfsMs || 0),
+        dfsInfo: progressStats,
+        dfsStats: progressStats,
+      });
+    }
     if (step > deepest.step || (step === deepest.step && arrived.length > deepest.arrived.length)) {
       deepest = {
         step,
@@ -820,7 +1106,7 @@ function solveDFS(pz, maxSol, minTracks, budget, seed, bs, meta, maxIters = 1500
     }
     const placedCount = Object.keys(placed).length;
     if (step > ms || placedCount > bestCost || (placedCount === bestCost && solutions.length >= MAX_ALTERNATES)) return;
-    if (!minTracks && solutions.length >= Math.max(maxSol, MAX_ALTERNATES)) return;
+    if (candidateLimitReached()) return;
     for (const c0 of cars) {
       const c = c0; const k = pk(c.x, c.y);
       if (c.parked) continue; /* parked zero car: no track needed */
@@ -851,7 +1137,7 @@ function solveDFS(pz, maxSol, minTracks, budget, seed, bs, meta, maxIters = 1500
             const undo = pushUsage(k, c.entry, up.exit);
             dfs(cars, arrived, step, visited, toggled, tsToggled, autoToggled, tsLocks, servedPlatforms); undo();
             placed[k] = old;
-            if (!minTracks && solutions.length >= Math.max(maxSol, MAX_ALTERNATES)) return;
+            if (candidateLimitReached()) return;
           }
           return; /* Zero car must have a traversable track — can't skip */
         }
@@ -862,7 +1148,7 @@ function solveDFS(pz, maxSol, minTracks, budget, seed, bs, meta, maxIters = 1500
           const undo = pushUsage(k, c.entry, up.exit);
           dfs(cars, arrived, step, visited, toggled, tsToggled, autoToggled, tsLocks, servedPlatforms); undo();
           placed[k] = old;
-          if (!minTracks && solutions.length >= Math.max(maxSol, MAX_ALTERNATES)) return;
+          if (candidateLimitReached()) return;
         }
         if (ex0 !== null) {
           if (!hasUsage(k, c.entry, ex0)) {
@@ -885,7 +1171,7 @@ function solveDFS(pz, maxSol, minTracks, budget, seed, bs, meta, maxIters = 1500
         const undo = pushUsage(k, c.entry, ex);
         dfs(cars, arrived, step, visited, toggled, tsToggled, autoToggled, tsLocks, servedPlatforms); undo();
         delete placed[k];
-        if (!minTracks && solutions.length >= Math.max(maxSol, MAX_ALTERNATES)) return;
+        if (candidateLimitReached()) return;
       }
       /* All cars (including zero) must have a track placed — no skip option */
       return;
@@ -975,7 +1261,7 @@ function solveDFS(pz, maxSol, minTracks, budget, seed, bs, meta, maxIters = 1500
           const _carsB = cars.map(cc => cc === c0 ? { ...cc, parked: true } : cc);
           dfs(_carsB, arrived, step, visited, toggled, tsToggled, autoToggled, tsLocks, servedPlatforms);
           _undoBan();
-          if (!minTracks && solutions.length >= Math.max(maxSol, MAX_ALTERNATES)) { visited.delete(sk); return; }
+          if (candidateLimitReached()) { visited.delete(sk); return; }
           /* 世界 1：继续向下执行，驶入待铺格 */
         } else if (_mismatch && _unassignedBlank) {
           /* 该格入口已被约束禁止 —— 只有停车世界 */
@@ -987,7 +1273,7 @@ function solveDFS(pz, maxSol, minTracks, budget, seed, bs, meta, maxIters = 1500
           const _carsB = cars.map(cc => cc === c0 ? { ...cc, parked: true } : cc);
           dfs(_carsB, arrived, step, visited, toggled, tsToggled, autoToggled, tsLocks, servedPlatforms);
           _undoBan();
-          if (!minTracks && solutions.length >= Math.max(maxSol, MAX_ALTERNATES)) { visited.delete(sk); return; }
+          if (candidateLimitReached()) { visited.delete(sk); return; }
           /* 世界 B：继续向下执行 */
         } else if (_mismatch) {
           _recs.push({ stay: true, c, keep: { ...c, parked: true } }); continue;
@@ -1048,12 +1334,20 @@ function solveDFS(pz, maxSol, minTracks, budget, seed, bs, meta, maxIters = 1500
   }
 
   dfs(pz.cars.map(c => ({ ...c, wait: c.wait || 0 })), [], 1, new Set(), {}, {}, {}, {}, new Set());
+  const finalStats = dfsStats(true);
   postToMain({
     type: "progress",
+    phase: "dfs",
     iters: 0,
-    dfsInfo: { iterations: iters, limit: MAX, exhausted: iters > MAX, solutions: solutions.length, deepest },
+    cspMs: telemetry.cspMs || 0,
+    dfsMs: telemetry.dfsStartedAt ? elapsedMs(telemetry.dfsStartedAt) : (telemetry.dfsMs || 0),
+    dfsInfo: finalStats,
+    dfsStats: finalStats,
   });
-  return solutions.slice(0, Math.max(maxSol, MAX_ALTERNATES));
+  return {
+    solutions: solutions.slice(0, Math.max(maxSol, MAX_ALTERNATES)),
+    stats: finalStats,
+  };
 }
 
 /* solveZeroAware removed: the phased approach (solve normal/zero cars separately
@@ -1066,20 +1360,111 @@ function solveDFS(pz, maxSol, minTracks, budget, seed, bs, meta, maxIters = 1500
 // ═══════════ Worker entry point ═══════════
 
 self.onmessage = function (e) {
-  const { type, requestId, puzzle: pz, seed, maxTracksHint } = e.data;
+  const { type, requestId, puzzle: pz, seed, maxTracksHint, solverOptions: rawSolverOptions } = e.data;
   if (type === "stop") { self.close(); return; }
   if (type !== "solve") return;
   activeRequestId = requestId ?? null;
+  const solverOptions = rawSolverOptions && typeof rawSolverOptions === "object" ? rawSolverOptions : {};
+
+  const telemetry = {
+    startedAt: performance.now(),
+    firstCandidateMs: null,
+    cspStartedAt: null,
+    dfsStartedAt: null,
+    cspMs: 0,
+    dfsMs: 0,
+  };
   const minTracks = pz._minTracks !== false;
   const { useful, meta, pruned } = filterBlanks(pz);
   const bs = new Set(useful.map(b => pk(b[0], b[1])));
   const budget = maxTracksHint > 0 ? Math.min(maxTracksHint, useful.length) : (minTracks ? Infinity : useful.length + 1);
   const fpz = { ...pz, blanks: useful };
-
-  /* Feature detection from unified Rule Layer */
   const features = puzzleHasDynamicState(pz);
+  const cspGuard = createCspGuard(solverOptions.cspTimebox, telemetry);
+  const dfsMaxIterations = finiteBudget(solverOptions.dfsMaxIterations, DEFAULT_DFS_MAX_ITERATIONS);
+  let cspMs = 0, dfsMs = 0;
 
-  postToMain({ type: "progress", iters: 0, pruned });
+  function emptyDfsStats(reason = "not-run") {
+    return {
+      nodes: 0,
+      iterations: 0,
+      limit: dfsMaxIterations,
+      deepestStep: 0,
+      deepest: { step: 0, arrived: [], cars: [], placed: {} },
+      iterationBudgetHit: false,
+      exhausted: false,
+      solutionLimitHit: false,
+      searchComplete: false,
+      terminationReason: reason,
+      solutions: 0,
+    };
+  }
+  function mergeAlternates(a, b) {
+    const out = [], seen = new Set();
+    function key(sol) { return Object.keys(sol).filter(k => k !== "__cost").sort().map(k => k + ":" + sol[k]).join("|"); }
+    for (const list of [a, b]) for (const sol of list || []) {
+      if (!sol || (Number.isFinite(budget) && sol.__cost > budget)) continue;
+      const k = key(sol);
+      if (seen.has(k)) continue;
+      seen.add(k); out.push(sol);
+    }
+    out.sort((left, right) => left.__cost - right.__cost || key(left).localeCompare(key(right)));
+    return out.slice(0, MAX_ALTERNATES);
+  }
+  function finish({ method, info = "", alternates = [], dfsStats = emptyDfsStats(), complete, terminationReason }) {
+    const accepted = alternates.filter(sol => sol && (!Number.isFinite(budget) || sol.__cost <= budget));
+    const finalCost = accepted.length ? Math.min(...accepted.map(sol => sol.__cost)) : null;
+    postToMain({
+      type: "done",
+      method,
+      info,
+      pruned,
+      alternates: accepted,
+      cspMs,
+      dfsMs,
+      cspStats: cspGuard.snapshot(),
+      dfsStats,
+      firstCandidateMs: telemetry.firstCandidateMs,
+      finalCost,
+      complete,
+      terminationReason,
+    });
+  }
+  function markCspSkipped(reason) {
+    cspGuard.stats.skipped = true;
+    cspGuard.stats.skipReason = reason;
+  }
+  function runDfs(dfsBudget) {
+    const dfsStartedAt = performance.now();
+    telemetry.cspMs = cspMs;
+    telemetry.dfsStartedAt = dfsStartedAt;
+    postToMain({
+      type: "progress",
+      phase: "dfs",
+      iters: 0,
+      cspMs,
+      dfsMs,
+      cspStats: cspGuard.snapshot(),
+      dfsStats: emptyDfsStats("running"),
+    });
+    const result = solveDFS(fpz, 1, minTracks, dfsBudget, seed || 0, bs, meta, telemetry, dfsMaxIterations);
+    dfsMs += elapsedMs(dfsStartedAt);
+    telemetry.dfsMs = dfsMs;
+    telemetry.dfsStartedAt = null;
+    return result;
+  }
+  function finishAfterDfs(method, info, cspAlternates, dfsResult) {
+    const alternates = mergeAlternates(cspAlternates, dfsResult.solutions);
+    const hasCandidate = alternates.length > 0;
+    let terminationReason;
+    if (dfsResult.stats.iterationBudgetHit) terminationReason = hasCandidate ? "candidate-unproven-dfs-budget" : "dfs-iteration-budget";
+    else if (dfsResult.stats.solutionLimitHit) terminationReason = "candidate-unproven-early-stop";
+    else terminationReason = hasCandidate ? "optimal-proven" : "search-exhausted";
+    const complete = dfsResult.stats.searchComplete;
+    finish({ method, info, alternates, dfsStats: dfsResult.stats, complete, terminationReason });
+  }
+
+  postToMain({ type: "progress", phase: "prepare", iters: 0, pruned, cspMs: 0, dfsMs: 0, cspStats: cspGuard.snapshot(), dfsStats: emptyDfsStats() });
 
   /* Train 0 handling: CSP enumerates paths only for normal cars (zero car
      excluded — it has no goal). DFS simulates all cars jointly with full
@@ -1089,22 +1474,23 @@ self.onmessage = function (e) {
     /* Global triggers can flip remote state, which static CSP cannot model.
        Auto-switches are local state, so CSP still runs and simulate validates. */
     if (features.cspUnsafe) {
-      postToMain({ type: "progress", iters: 0, cspInfo: "CSP skipped: global triggers (tswTrig=" + features.hasTSwTriggers + " barTrig=" + features.hasBarrierTriggers + ")" });
-      const dfsResult = solveDFS(fpz, 1, minTracks, budget, seed || 0, bs, meta);
-      postToMain({
-        type: "done",
-        method: dfsResult.length > 0 ? "dfs(skip-csp)" : "no-solution",
-        pruned,
-        alternates: dfsResult
-      });
+      markCspSkipped("dynamic-global-state");
+      const cspInfo = "CSP skipped: global triggers (tswTrig=" + features.hasTSwTriggers + " barTrig=" + features.hasBarrierTriggers + ")";
+      postToMain({ type: "progress", phase: "dfs", iters: 0, cspInfo, cspMs, dfsMs, cspStats: cspGuard.snapshot() });
+      const dfsResult = runDfs(budget);
+      finishAfterDfs(dfsResult.solutions.length > 0 ? "dfs(skip-csp)" : "no-solution", cspInfo, [], dfsResult);
       return;
     }
 
     const slacks = pz.pathSlack ? [pz.pathSlack] : [4, 8, 14];
     let lastCsp = null, bestSol = null, bestAlternates = [], bestSlack = null, curBudget = budget;
+    const cspStartedAt = performance.now();
+    telemetry.cspStartedAt = cspStartedAt;
+    postToMain({ type: "progress", phase: "csp", iters: 0, cspMs: 0, dfsMs, cspStats: cspGuard.snapshot() });
     for (const slack of slacks) {
+      if (cspGuard.stats.aborted) break;
       const ppz = { ...fpz, pathSlack: slack };
-      const csp = solveCSP(ppz, curBudget, bs, meta);
+      const csp = solveCSP(ppz, curBudget, bs, meta, cspGuard, telemetry);
       lastCsp = csp;
       if (csp && csp.sol && (!bestSol || csp.sol.__cost < bestSol.__cost)) {
         bestSol = csp.sol;
@@ -1113,40 +1499,40 @@ self.onmessage = function (e) {
         curBudget = csp.sol.__cost - 1;
       }
     }
+    cspMs += elapsedMs(cspStartedAt);
+    telemetry.cspMs = cspMs;
+    telemetry.cspStartedAt = null;
+    postToMain({ type: "progress", phase: "csp", iters: 0, cspInfo: lastCsp ? lastCsp.info : "", cspMs, dfsMs, cspStats: cspGuard.snapshot() });
 
-    /* Dynamic local state (auto-switches) can make static CSP incomplete.
-       Run CSP for candidates, but fall back to DFS unless the puzzle is static.
-       FIX: Zero car paths are excluded from CSP, making it structurally incomplete
-       for zero-car puzzles — always fall through to DFS for joint simulation. */
-    const cspTrustworthy = lastCsp && !lastCsp.overflow && !features.isDynamic && !features.hasZero;
-    if (bestSol && cspTrustworthy) {
-      postToMain({ type: "done", method: "csp(slack=" + bestSlack + ")", info: lastCsp.info, pruned, alternates: bestAlternates }); return;
-    }
-    /* A bounded path slack and finite CSP enumeration cannot prove that a
-       puzzle has no solution. Fall through to DFS when CSP found nothing. */
-
-    function mergeAlternates(a, b) {
-      const out = [], seen = new Set();
-      function key(sol) { return Object.keys(sol).filter(k => k !== "__cost").sort().map(k => k + ":" + sol[k]).join("|"); }
-      for (const list of [a, b]) for (const sol of list || []) {
-        if (!sol) continue;
-        const k = key(sol);
-        if (seen.has(k)) continue;
-        seen.add(k); out.push(sol);
-        if (out.length >= MAX_ALTERNATES) return out;
-      }
-      return out;
+    /* A CSP-only candidate is useful, but bounded slack/path enumeration does
+       not constitute an optimality proof. Any CSP abort always falls through. */
+    const cspTrustworthyCandidate = bestSol && lastCsp && !lastCsp.overflow && !cspGuard.stats.aborted && !features.isDynamic && !features.hasZero;
+    if (cspTrustworthyCandidate) {
+      finish({
+        method: "csp(slack=" + bestSlack + ")",
+        info: lastCsp.info,
+        alternates: bestAlternates,
+        dfsStats: emptyDfsStats("candidate-unproven-csp"),
+        complete: false,
+        terminationReason: "candidate-unproven-csp",
+      });
+      return;
     }
 
-    const dfsBudget = bestSol ? bestSol.__cost : budget;
-    const dfsResult = solveDFS(fpz, 1, minTracks, dfsBudget, seed || 0, bs, meta);
-    const finalCost = dfsResult.length > 0 ? dfsResult[0].__cost : (bestSol ? bestSol.__cost : null);
-    const alternates = mergeAlternates(bestAlternates, dfsResult);
-    const method = bestSol ? (dfsResult.length > 0 && finalCost < bestSol.__cost ? "csp+dfs(csp=" + bestSol.__cost + ",dfs=" + finalCost + ")" : "csp+dfs(csp=" + bestSol.__cost + ",dfs-noimprove)") : (dfsResult.length > 0 ? "dfs" : "no-solution");
-    postToMain({ type: "done", method, info: lastCsp ? lastCsp.info : "", pruned, alternates });
+    /* CSP is candidate generation only. An abort, overflow, dynamic feature,
+       or empty result must reliably enter the sound DFS fallback. */
+    const dfsBudget = bestSol ? Math.min(budget, bestSol.__cost) : budget;
+    const dfsResult = runDfs(dfsBudget);
+    const dfsBest = dfsResult.solutions.length > 0 ? dfsResult.solutions[0].__cost : null;
+    const method = bestSol
+      ? (dfsBest !== null && dfsBest < bestSol.__cost ? "csp+dfs(csp=" + bestSol.__cost + ",dfs=" + dfsBest + ")" : "csp+dfs(csp=" + bestSol.__cost + ",dfs-noimprove)")
+      : (dfsResult.solutions.length > 0 ? "dfs" : "no-solution");
+    finishAfterDfs(method, lastCsp ? lastCsp.info : "", bestAlternates, dfsResult);
     return;
   }
 
-  const dfsResult = solveDFS(fpz, 1, minTracks, budget, seed || 0, bs, meta);
-  postToMain({ type: "done", method: "dfs", pruned, alternates: dfsResult });
+  markCspSkipped("size-threshold");
+  postToMain({ type: "progress", phase: "dfs", iters: 0, cspInfo: "CSP skipped: puzzle size threshold", cspMs, dfsMs, cspStats: cspGuard.snapshot() });
+  const dfsResult = runDfs(budget);
+  finishAfterDfs(dfsResult.solutions.length > 0 ? "dfs(skip-csp)" : "no-solution", "CSP skipped: puzzle size threshold", [], dfsResult);
 };

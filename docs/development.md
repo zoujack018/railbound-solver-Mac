@@ -29,6 +29,55 @@ npm run preview
 
 求解器性能优化的方法论与路线图见 [solver-optimization.md](solver-optimization.md)。
 
+### 求解器预算与对照模式
+
+Worker 的 P1 CSP 时间盒默认开启，并在全部 CSP slack 轮次之间共享以下保守预算：
+
+| 配置 | Worker 默认值 | 逐题执行器环境变量 |
+|---|---:|---|
+| 是否启用共享守卫 | `true` | `CSP_TIMEBOX`（`on` / `off`） |
+| CSP 墙钟 | 5,000 ms | `CSP_TIMEBOX_MS` |
+| 已枚举 CSP 路径 | 100,000 | `CSP_PATH_BUDGET` |
+| CSP 组合迭代 | 5,000,000 | `CSP_COMBINATION_BUDGET` |
+| DFS 迭代 | 15,000,000 | `DFS_MAX_ITERATIONS` |
+
+直接调用 Worker 时，对应消息配置为：
+
+```js
+worker.postMessage({
+  type: "solve",
+  requestId,
+  puzzle,
+  solverOptions: {
+    cspTimebox: {
+      enabled: true,
+      maxMs: 5000,
+      maxPaths: 100000,
+      maxCombinations: 5000000,
+    },
+    dfsMaxIterations: 15000000,
+  },
+});
+```
+
+逐题执行器的常用对照命令：
+
+```bash
+# 当前默认（也可显式写 CSP_TIMEBOX=on）
+npm run test:puzzles
+
+# 修改前基准：只关闭 P1 跨 slack 共享守卫
+CSP_TIMEBOX=off npm run test:puzzles
+
+# 定向压低某一预算，验证 CSP abort -> DFS fallback 协议
+CSP_PATH_BUDGET=1 npm run test:puzzles -- "4x8"
+CSP_COMBINATION_BUDGET=1 npm run test:puzzles -- "4x8"
+```
+
+`CSP_TIMEBOX=off` 不移除原有的单次路径枚举上限、路径桶上限或 CSP beam width，
+因此它表示“P1 关闭”的可回退基准，而不是无限 CSP。环境变量预算必须是正整数；
+没有设置的字段使用 Worker 默认值。
+
 GitHub Actions 会在 Node 20 和 22 上运行 `npm ci` 与 `npm run check`。
 
 ## 修改入口
@@ -49,6 +98,19 @@ GitHub Actions 会在 Node 20 和 22 上运行 `npm ci` 与 `npm run check`。
 `test/format-adapter-tests.js` 递归覆盖当前 16 个 JSON 的解包、分类、严格载入和根目录扫描。
 `test/puzzle-solver-tests.js` 通过 `test/solver-worker-node.js` 运行真实 Worker 搜索，并用
 `simulate()` 复核候选。20 秒/题的当前基线和未通过原因见 `test/SOLVER-REPORT.md`。
+
+逐题输出同时报告 `cspMs` / `dfsMs`、CSP 路径和组合计数/溢出、DFS 节点和最深
+步数、首候选时间、最终成本、`complete` 与 `terminationReason`。外层墙钟超时由
+执行器合成为 `complete:false` + `wall-clock-timeout`；找到候选后执行器仍等待
+`done`，以区分“当前候选”和“已证明最优”。
+
+完备性判读必须使用顶层二元组：
+
+- `complete:true` + `optimal-proven`：候选已由健全 DFS 完整搜索证明最优；
+- `complete:true` + `search-exhausted`：健全 DFS 完整走完且无候选；
+- 任何 `complete:false`：不得声明已证最优或完备无解；
+- `cspStats.aborted:true`：只表示 CSP 提前退出。Worker 必须进入 DFS，最终
+  `complete` 由后续完整搜索链路决定。
 
 上一轮存在的 `test/solver-tests.js` 及若干专项脚本仍缺失。逐题求解回归已经恢复，
 但碰撞、机关、零号车分支和 Worker 取消协议等细粒度断言仍需从上游恢复或重建。
@@ -75,6 +137,11 @@ GitHub Actions 会在 Node 20 和 22 上运行 `npm ci` 与 `npm run check`。
 
 - 所有输出是否通过 `postToMain()` 携带请求 ID？
 - 成功、无解、异常和消息错误是否最终结束线程？
+- CSP 时间盒中止后是否无条件进入 DFS，而没有把部分 CSP 枚举误报为无解？
+- `done` 是否保留 `cspMs`、`dfsMs`、`cspStats`、`dfsStats`、首候选、最终成本、
+  `complete` 和 `terminationReason`？
+- 只有健全搜索完整走完时是否报告 `complete:true`？任何可能丢解或预算中止的路径
+  是否保持 `complete:false`？
 - 编辑关卡后是否可能收到旧结果？
 - 模块 Worker 是否仍能由 Vite 生成独立构建产物？
 - 是否运行了 `npm run check`？

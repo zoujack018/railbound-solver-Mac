@@ -53,13 +53,29 @@
 
 - 固定基准语料：`npm run test:puzzles` 全量 18 题 + 上表金丝雀。
 - 每个优化必须同时报告**节点数**与**墙钟时间**（Worker `done`/`progress`
-  已带 `dfsInfo.iterations`）。节点数下降 = 剪枝更强；节点率上升 = 工程更快。
+  已带结构化 `cspStats` / `dfsStats`）。节点数下降 = 剪枝更强；节点率上升 = 工程更快。
   必须知道自己拿到的是哪一种，两者混在一起的改动要拆开度量。
 - 单变量原则：一次只上一个优化，独立度量；组合收益另行确认。
 - 时间以同机三次取中位数为准；报告写入 `test/SOLVER-REPORT.md` 并注明
   "只用于量级判断"。
 - 停机语义不得混淆：`budget-exhausted / timeout ≠ 无解`；只有健全剪枝下的
   `search-exhausted` 才是当前算法边界内的无解声明。
+
+本轮已补齐统一仪表。`done` 报告 `cspMs`、`dfsMs`、CSP 路径迭代/枚举/保留数、
+组合迭代与溢出、DFS 节点与最深步数、`firstCandidateMs`、`finalCost`、
+`complete` 和 `terminationReason`。`progress` 提供分阶段快照，`solution` 提供
+`candidateMs` 与候选来源。逐题执行器不会在首候选出现时提前结束，而是继续等待
+`done`，并始终通过权威 `simulate()` 复核候选。
+
+停机原因的判读以 `complete` 为总闸门：
+
+- `optimal-proven` / `search-exhausted` 只有在健全 DFS 完整走完时配合
+  `complete:true`；
+- `candidate-unproven-csp`、`candidate-unproven-dfs-budget`、
+  `candidate-unproven-early-stop`、`dfs-iteration-budget` 和执行器产生的
+  `wall-clock-timeout` 均为 `complete:false`；
+- CSP 自身的中止原因记录在 `cspStats.abortReason`，不应覆盖整条搜索链路的
+  顶层 `terminationReason`。
 
 ### 2.4 规则正确性的外部校验（本项目已两次验证有效）
 
@@ -85,14 +101,28 @@
 
 按"预期收益 / 实施风险"排序。每项标注适用题型与验证方式。
 
-### P1 CSP 时间盒（低风险，先做）
+### P1 CSP 时间盒（已实现，低风险）
 
-现状：CSP slack 阶梯 [4,8,14] 串行跑完才进 DFS；6×7-8-3A 光 CSP 就烧约
-2 分钟，7×7-8-5A 的 CSP 四车全部溢出仍硬跑。
-方案：给 CSP 阶段设时间/迭代预算（如总预算的 20–30%），溢出严重
-（多车路径桶全满）时提前放弃；DFS 尽早启动。
-健全性：CSP 只是候选来源之一，跳过不影响完备性（DFS 兜底）。
-验证：6×7 首候选时间应从 133s 显著下降；7×7-8-5A 的 DFS 获得完整预算。
+实现：CSP 的全部 slack 阶梯 `[4, 8, 14]` 共用一个可配置守卫。默认开启，保守
+预算为 5,000 ms、100,000 条已枚举路径和 5,000,000 次组合迭代；任一预算触发后，
+`cspStats.aborted=true`，`abortReason` 分别记录为 `csp-time-budget`、
+`csp-path-budget` 或 `csp-combination-budget`。路径桶/单次枚举原有上限与 overflow
+统计继续保留，未在本轮改变。
+
+配置：Worker 的 `solve` 消息接受
+`solverOptions.cspTimebox={enabled,maxMs,maxPaths,maxCombinations}`。逐题执行器映射为
+`CSP_TIMEBOX=on|off`、`CSP_TIMEBOX_MS`、`CSP_PATH_BUDGET`、
+`CSP_COMBINATION_BUDGET`。`CSP_TIMEBOX=off` 只关闭新增共享守卫，用于前后基准；
+原有 CSP 内部上限仍生效。
+
+健全性：CSP 只是候选来源，不参与完备无解证明。守卫触发后不使用部分枚举结果
+宣告无解，而是无条件进入 DFS。整个 Worker 的 `complete` 由后续健全搜索是否完整
+走完决定：DFS 完整走完仍可报告 `optimal-proven` / `search-exhausted`；DFS 预算耗尽
+则必须是 `complete:false`。未运行 DFS 的 CSP-only 候选也明确报告
+`candidate-unproven-csp` + `complete:false`。
+
+本轮单变量边界：只实现 P1；没有同时实现置换表、可达性剪枝、新分支排序或其他
+性能改动。性能对照结论单独记录在 `test/SOLVER-REPORT.md`。
 
 ### P2 代价迭代加深（min-track proof 模式）
 
@@ -188,13 +218,12 @@ CSP 先/DFS 先、不同排序策略，比纯 seed 更多样。
 
 ## 4. 阶段目标与验收
 
-### 短期（下一轮会话可完成）
+### 短期
 
-1. **仪表先行**：Worker `done` 消息增加 `cspMs / dfsMs / complete` 字段，
-   执行器打印——没有测量就没有优化。
-2. P1 CSP 时间盒 + P6 排序。
-   验收：6×7-8-3A 首个 ≤19 候选 < 60s；全量无回归、金丝雀全绿。
-3. P9①：执行器支持多 Worker。
+1. **已落地：仪表先行**。Worker 与逐题执行器使用上文结构化统计和完备性协议。
+2. **已落地：只实施 P1 CSP 时间盒**。保持单变量实验，不与 P6 或其他优化叠加；
+   对照数据和验收结果写入 `test/SOLVER-REPORT.md`。
+3. 后续每轮仍只选一个优化独立实现和测量。候选方向之一是 P9①：执行器支持多 Worker。
    验收：7×7-8-5A 在 PUZZLE_WORKERS=8、120s 内可解。
 
 ### 中期

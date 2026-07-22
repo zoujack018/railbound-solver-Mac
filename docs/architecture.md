@@ -93,7 +93,8 @@ Vite 在构建时将 Worker 打成独立模块资源。旧函数名 `createWorke
 - 单车路径枚举与 CSP 路径组合。
 - 有预算上限的 DFS 回退。
 - 动态机关特性检测。
-- 通过 `progress`、`solution` 和 `done` 消息回传结果。
+- 跨 CSP slack 轮次共享的时间、路径数和组合数守卫。
+- 通过 `progress`、`solution` 和 `done` 消息回传分阶段仪表与结果。
 
 所有回传消息都带请求 ID；主线程只处理与当前求解匹配的消息。
 
@@ -101,12 +102,50 @@ Vite 在构建时将 Worker 打成独立模块资源。旧函数名 `createWorke
 
 1. `filterBlanks()` 剔除确定无用的可铺设格。
 2. 小型、静态关卡枚举普通火车路径，并用 CSP 合并轨道使用约束。
-3. 全局触发器会跳过静态 CSP；自变 T、零号火车或 CSP 不可信场景会继续进入 DFS。
-4. DFS 在搜索预算内联合模拟车辆和动态状态。
-5. Worker 发送候选解；主线程用权威 `simulate()` 再次验证。
-6. 多 Worker 全部完成后，UI 展示最优已知合法解或错误信息。
+3. CSP 的 `[4, 8, 14]` slack 轮次共用一个守卫；达到时间、已枚举路径或组合迭代
+   预算后设置 `cspStats.aborted`，停止 CSP 并可靠进入 DFS。
+4. 全局触发器会跳过静态 CSP；零号火车、动态状态、CSP 溢出或 CSP 结果不可信时
+   同样继续进入 DFS。CSP 的提前结束从不直接等价于无解。
+5. DFS 在迭代预算内联合模拟车辆和动态状态。只有 DFS 在健全边界内完整走完，
+   整条搜索链路才可能设置 `complete:true`。
+6. Worker 发送候选解；主线程和逐题执行器都用权威 `simulate()` 再次验证。
+7. 多 Worker 全部完成后，UI 展示最优已知合法解或错误信息。
 
-“无解”表示在当前算法边界和预算内未找到方案，不应解释为数学意义上的完备证明。
+一个未找到候选的 Worker 只有同时满足 `complete:true` 和
+`terminationReason:"search-exhausted"`，才能声明在当前健全搜索边界内完备无解。
+其他无候选结果均为未定，不应解释为数学意义上的无解证明。
+
+## Worker 消息与完备性协议
+
+- `progress`：携带 `phase`（`prepare` / `csp` / `dfs`）、当前 `cspMs` / `dfsMs`
+  和可用的 `cspStats` / `dfsStats`。DFS 每 500,000 节点、CSP 路径枚举每
+  100,000 次迭代会发送阶段快照。
+- `solution`：携带候选、`candidateMs` 和来源 `source`；候选仍必须通过
+  `simulate()`，不能仅凭 Worker 快速检查进入结果集。
+- `done`：携带最终 `cspMs`、`dfsMs`、`cspStats`、`dfsStats`、
+  `firstCandidateMs`、`finalCost`、`complete` 与 `terminationReason`。
+
+`cspStats` 记录 CSP 是否尝试、跳过原因、时间盒配置、是否中止及
+`abortReason`，以及路径迭代/枚举/保留数、逐车路径桶、组合迭代数和溢出原因。
+时间盒的中止原因分别是 `csp-time-budget`、`csp-path-budget`、
+`csp-combination-budget`；它们是 CSP 阶段状态，不是顶层无解原因。
+
+`dfsStats` 记录节点/迭代数、上限、最深步数及当时状态、迭代预算是否耗尽、
+候选数量、`searchComplete` 和 DFS 自身的终止原因。顶层终止原因按以下方式解释：
+
+| `terminationReason` | `complete` | 含义 |
+|---|---|---|
+| `optimal-proven` | `true` | 找到候选，且健全 DFS 搜索完整走完，已证明最终成本 |
+| `search-exhausted` | `true` | 健全 DFS 搜索完整走完且无候选 |
+| `candidate-unproven-csp` | `false` | CSP 给出合法候选，但 CSP 候选生成本身不构成最优性证明 |
+| `dfs-iteration-budget` | `false` | DFS 迭代预算耗尽且无候选 |
+| `candidate-unproven-dfs-budget` | `false` | 已有候选，但 DFS 迭代预算耗尽 |
+| `candidate-unproven-early-stop` | `false` | 已有候选，但搜索因候选数量策略提前停止 |
+| `wall-clock-timeout` | `false` | 逐题执行器墙钟超时并终止 Worker；不是 Worker 的完备结论 |
+
+CSP 是否正常完成不会单独决定 `complete`：CSP 中止后若 DFS 完整走完，最终仍可
+报告 `optimal-proven` 或 `search-exhausted`；反之，即使很快找到候选，只要完整搜索
+没有走完，就必须保持 `complete:false`。
 
 ## Worker 生命周期
 

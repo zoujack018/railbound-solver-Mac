@@ -22,6 +22,20 @@ npm run check              # test + build (CI gate)
 npm run preview            # Preview production build at 127.0.0.1
 ```
 
+Solver A/B controls for `test:puzzles`:
+
+```bash
+CSP_TIMEBOX=on CSP_TIMEBOX_MS=5000 npm run test:puzzles
+CSP_PATH_BUDGET=100000 CSP_COMBINATION_BUDGET=5000000 npm run test:puzzles
+CSP_TIMEBOX=off npm run test:puzzles       # Disable only the shared P1 guard
+DFS_MAX_ITERATIONS=15000000 npm run test:puzzles
+```
+
+The Worker default is a conservative shared CSP budget of 5,000 ms, 100,000
+enumerated paths, and 5,000,000 combination iterations. `CSP_TIMEBOX=off`
+restores the pre-P1 comparison mode; legacy per-enumerator caps and the CSP
+beam width remain active.
+
 CI runs `npm ci && npm run check` on Node 20 and 22 via GitHub Actions.
 
 ## Architecture
@@ -51,7 +65,10 @@ index.html → main.jsx → railbound-solver-v3.jsx (699 lines, main editor/orch
 
 - **`puzzle-io.js`** is the trust boundary for all external JSON. `normalizePuzzle()` does strict validation; `parsePuzzleDocument()` handles test fixture unwrapping. New code should never bypass this layer.
 - **`railbound-rules.js`** is the single source of truth for game rules. Worker imports it via ESM. All rule changes go here; Worker candidates must always be re-verified by main-thread `simulate()`.
-- **`railbound-worker.js`** is the search layer. "No solution found" means budget exhausted, not mathematically proven unsolvable.
+- **`railbound-worker.js`** is the search layer. CSP is candidate generation and
+  always falls through to DFS if its shared time/path/combination budget aborts.
+  A no-candidate result is a proof only when `complete === true` and
+  `terminationReason === "search-exhausted"`.
 
 ## Critical domain rules
 
@@ -96,9 +113,18 @@ Compatible field aliases handled on import: `goal_entry`/`goalEntry`, `max_steps
 
 **Changing Worker:** All messages must carry `requestId` via `postToMain()`. Verify old results can't leak after re-solve. Run `npm run build` to confirm module Worker bundling.
 
+`done` telemetry includes `cspMs`, `dfsMs`, `cspStats`, `dfsStats`,
+`firstCandidateMs`, `finalCost`, `complete`, and `terminationReason`.
+`cspStats` distinguishes skipped CSP, guard aborts (`csp-time-budget`,
+`csp-path-budget`, `csp-combination-budget`), path/combination counts, and
+overflow. `dfsStats` reports nodes, deepest step/state, iteration-limit state,
+and whether DFS completed. `complete:false` means neither optimality nor
+unsolvability was proved, even if a legal candidate was found.
+
 ## Current state and caveats
 
-- No git repository. Treat file changes carefully — no rollback available.
-- Historical 73 fine-grained rule tests are missing (scripts were lost). Current coverage: 15 format tests + 5×5 solver regression + per-puzzle Worker execution. See `test/SOLVER-REPORT.md` for solve pass/fail status.
+- A new Git baseline is linked to `zoujack018/railbound-solver-Mac`; history from
+  before the 2026-07-22 repository initialization is still unavailable.
+- Historical 73 fine-grained rule tests are missing (scripts were lost). Current fast coverage: 15 format tests, 10 solver soundness canaries, 2 forced CSP→DFS fallback protocol checks, plus the separately invoked per-puzzle Worker runner. See `test/SOLVER-REPORT.md` for solve pass/fail status.
 - `railbound-solver-v3.jsx` is the largest tech debt: grid state, SVG rendering, solver orchestration, and playback all in one file.
 - Dev and preview servers bind to `127.0.0.1` only. Don't use `--host 0.0.0.0` on untrusted networks.

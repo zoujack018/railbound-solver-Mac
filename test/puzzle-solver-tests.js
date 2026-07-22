@@ -17,7 +17,8 @@ const requestedPattern = process.argv.slice(2).join(" ");
  *   over-limit       只找到超过轨道上限的合法解 —— 判失败
  *   candidate-failed 候选全部被 simulate() 拒绝 —— 判失败（搜索器与规则不一致）
  *   budget-exhausted 迭代预算耗尽仍无候选 —— 不是无解证明
- *   timeout          时间预算耗尽 —— 不是无解证明
+ *   timeout          Worker 外层墙钟预算耗尽 —— 不是无解证明
+ *   incomplete       Worker 未提供完备无解证明 —— 不是无解证明
  *   search-exhausted 搜索空间在预算内走完且无候选 —— 当前算法边界内无解
  * hasSolution=false 的题只有 search-exhausted 算通过；预算耗尽是"不确定"，仍判失败。 */
 
@@ -25,6 +26,42 @@ function positiveInteger(value, fallback) {
   const parsed = Number.parseInt(value, 10);
   return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
 }
+
+function optionalPositiveInteger(value) {
+  if (value == null || value === "") return null;
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isInteger(parsed) || parsed <= 0) throw new Error(`Expected a positive integer, received: ${value}`);
+  return parsed;
+}
+
+function buildSolverOptions(env = process.env) {
+  const mode = String(env.CSP_TIMEBOX || "").trim().toLowerCase();
+  if (mode && mode !== "on" && mode !== "off") {
+    throw new Error(`CSP_TIMEBOX must be on or off, received: ${env.CSP_TIMEBOX}`);
+  }
+
+  const maxMs = optionalPositiveInteger(env.CSP_TIMEBOX_MS);
+  const maxPaths = optionalPositiveInteger(env.CSP_PATH_BUDGET);
+  const maxCombinations = optionalPositiveInteger(env.CSP_COMBINATION_BUDGET);
+  const dfsMaxIterations = optionalPositiveInteger(env.DFS_MAX_ITERATIONS);
+  const cspTimebox = {};
+
+  /* No CSP environment variables means "use Worker defaults". `on` makes that
+     choice explicit; `off` disables only the new P1 shared timebox and restores
+     the pre-P1 CSP baseline (the solver's original internal caps still apply). */
+  if (mode === "off") cspTimebox.enabled = false;
+  else if (mode === "on") cspTimebox.enabled = true;
+  if (maxMs != null) cspTimebox.maxMs = maxMs;
+  if (maxPaths != null) cspTimebox.maxPaths = maxPaths;
+  if (maxCombinations != null) cspTimebox.maxCombinations = maxCombinations;
+
+  const options = {};
+  if (Object.keys(cspTimebox).length) options.cspTimebox = cspTimebox;
+  if (dfsMaxIterations != null) options.dfsMaxIterations = dfsMaxIterations;
+  return options;
+}
+
+const solverOptions = buildSolverOptions();
 
 function findJSONFiles(directory) {
   const files = [];
@@ -83,10 +120,53 @@ async function solveCase(testCase) {
   const candidateFailures = [];
   const overLimit = [];
   let best = null;
+  let firstCandidateMs = null;
   let lastProgress = null;
   let dfsInfo = null;
   let reportedIterations = 0;
   let lastCspInfo = "";
+  const telemetry = {
+    cspMs: null,
+    dfsMs: null,
+    cspStats: null,
+    dfsStats: null,
+    workerFirstCandidateMs: null,
+    workerFinalCost: null,
+    complete: false,
+    terminationReason: null,
+    phase: null,
+  };
+
+  const mergeStats = (previous, next) => {
+    if (!next || typeof next !== "object") return previous;
+    return { ...(previous || {}), ...next };
+  };
+  const captureTelemetry = message => {
+    if (Number.isFinite(message.cspMs)) telemetry.cspMs = message.cspMs;
+    if (Number.isFinite(message.dfsMs)) telemetry.dfsMs = message.dfsMs;
+    if (message.cspStats) telemetry.cspStats = mergeStats(telemetry.cspStats, message.cspStats);
+    if (message.dfsStats) telemetry.dfsStats = mergeStats(telemetry.dfsStats, message.dfsStats);
+    if (Number.isFinite(message.firstCandidateMs)) telemetry.workerFirstCandidateMs = message.firstCandidateMs;
+    if (Number.isFinite(message.finalCost)) telemetry.workerFinalCost = message.finalCost;
+    if (typeof message.complete === "boolean") telemetry.complete = message.complete;
+    if (typeof message.terminationReason === "string" && message.terminationReason) {
+      telemetry.terminationReason = message.terminationReason;
+    }
+    if (typeof message.phase === "string" && message.phase) telemetry.phase = message.phase;
+    /* Transitional compatibility is for measurement only. It must never turn
+       an old `dfsInfo.exhausted === false` into a completeness claim. */
+    if (message.dfsInfo) {
+      dfsInfo = mergeStats(dfsInfo, message.dfsInfo);
+      telemetry.dfsStats = mergeStats(telemetry.dfsStats, {
+        nodes: message.dfsInfo.iterations,
+        limit: message.dfsInfo.limit,
+        deepestStep: message.dfsInfo.deepest?.step ?? message.dfsInfo.deepest,
+        deepest: message.dfsInfo.deepest,
+        iterationBudgetHit: message.dfsInfo.exhausted,
+        solutions: message.dfsInfo.solutions,
+      });
+    }
+  };
 
   return await new Promise(resolve => {
     let settled = false;
@@ -95,7 +175,30 @@ async function solveCase(testCase) {
       settled = true;
       clearTimeout(timer);
       void worker.terminate();
+      const elapsedMs = performance.now() - started;
+      let resolvedCspMs = telemetry.cspMs;
+      let resolvedDfsMs = telemetry.dfsMs;
+      if (result.terminationReason === "wall-clock-timeout") {
+        if (telemetry.phase === "csp") {
+          resolvedCspMs = Math.max(Number.isFinite(resolvedCspMs) ? resolvedCspMs : 0, elapsedMs);
+          resolvedDfsMs = 0;
+        } else if (telemetry.phase === "dfs") {
+          if (!Number.isFinite(resolvedCspMs)) resolvedCspMs = 0;
+          resolvedDfsMs = Math.max(
+            Number.isFinite(resolvedDfsMs) ? resolvedDfsMs : 0,
+            Math.max(0, elapsedMs - resolvedCspMs),
+          );
+        } else {
+          /* A timeout before the Worker announces a phase still must not emit
+             null timings; zero means "no measured phase sample available". */
+          if (!Number.isFinite(resolvedCspMs)) resolvedCspMs = 0;
+          if (!Number.isFinite(resolvedDfsMs)) resolvedDfsMs = 0;
+        }
+      }
       resolve({
+        ...telemetry,
+        cspMs: resolvedCspMs,
+        dfsMs: resolvedDfsMs,
         ...result,
         best,
         overLimit,
@@ -104,20 +207,27 @@ async function solveCase(testCase) {
         dfsInfo,
         reportedIterations,
         lastCspInfo,
-        elapsedMs: Math.round(performance.now() - started),
+        firstCandidateMs,
+        finalCost: best?.cost ?? null,
+        elapsedMs: Math.round(elapsedMs),
       });
     };
     const timer = setTimeout(() => finish({
-      status: "timeout",
-      reason: `时间预算耗尽（${testCase.timeoutMs}ms）——不是无解证明`,
+      status: best ? "solved" : "timeout",
+      method: best ? "validated-candidate" : undefined,
+      reason: best
+        ? `已找到合法候选，但墙钟预算耗尽（${testCase.timeoutMs}ms），未证明最优`
+        : `墙钟预算耗尽（${testCase.timeoutMs}ms）——不是无解证明`,
+      complete: false,
+      terminationReason: "wall-clock-timeout",
     }), testCase.timeoutMs);
 
     worker.on("message", message => {
+      captureTelemetry(message);
       if (message.type === "progress") {
         lastProgress = message;
         reportedIterations += message.iters || 0;
         if (message.cspInfo) lastCspInfo = message.cspInfo;
-        if (message.dfsInfo) dfsInfo = message.dfsInfo;
         return;
       }
       if (message.type === "solution" && message.solution) {
@@ -133,15 +243,34 @@ async function solveCase(testCase) {
           overLimit.push({ cost, steps: result.steps });
           return;
         }
+        if (firstCandidateMs == null) {
+          firstCandidateMs = Number.isFinite(message.candidateMs)
+            ? message.candidateMs
+            : Math.round(performance.now() - started);
+        }
         if (!best || cost < best.cost) {
           best = { cost, steps: result.steps, placed };
         }
-        finish({ status: "solved", method: "validated-candidate", reason: "" });
+        /* Do not finish on the first candidate. The authoritative runner keeps
+           validating candidates until `done`, so it can report the final cost
+           and whether optimality was actually proved. */
         return;
       }
       if (message.type === "done") {
+        const proofMismatch = message.complete === true && (
+          message.terminationReason === "optimal-proven"
+            ? (candidateFailures.length > 0 || !best || message.finalCost !== best.cost)
+            : Boolean(best)
+        );
         if (best) {
-          finish({ status: "solved", method: message.method, reason: "" });
+          finish({
+            status: "solved",
+            method: message.method,
+            reason: proofMismatch
+              ? `Worker 最优证明与权威候选不一致（worker finalCost=${message.finalCost ?? "missing"}, validated=${best.cost}, rejected=${candidateFailures.length}）`
+              : (message.complete === true && message.terminationReason === "optimal-proven" ? "" : "找到合法候选，但未证明最优"),
+            ...(proofMismatch ? { complete: false, terminationReason: "candidate-unproven-early-stop" } : {}),
+          });
           return;
         }
         let status, reason;
@@ -152,12 +281,21 @@ async function solveCase(testCase) {
         } else if (candidateFailures.length) {
           status = "candidate-failed";
           reason = `${candidateFailures.length} 个候选全部被权威 simulate() 拒绝`;
-        } else if (dfsInfo?.exhausted) {
+        } else if (message.terminationReason === "dfs-iteration-budget"
+          || message.terminationReason === "candidate-unproven-dfs-budget"
+          || message.dfsStats?.iterationBudgetHit === true) {
           status = "budget-exhausted";
-          reason = `迭代预算耗尽（${dfsInfo.iterations} 次）——不是无解证明`;
-        } else {
+          const nodes = message.dfsStats?.nodes ?? dfsInfo?.iterations ?? reportedIterations;
+          reason = `DFS 迭代预算耗尽（${nodes} 节点）——不是无解证明`;
+        } else if (message.terminationReason === "wall-clock-timeout") {
+          status = "timeout";
+          reason = "Worker 报告墙钟预算耗尽——不是无解证明";
+        } else if (message.complete === true && message.terminationReason === "search-exhausted") {
           status = "search-exhausted";
-          reason = "搜索空间在预算内走完，无候选（当前算法边界内无解）";
+          reason = "搜索空间完整走完，无候选";
+        } else {
+          status = "incomplete";
+          reason = `搜索未提供完备无解证明（complete=${message.complete === true}, terminationReason=${message.terminationReason || "missing"}）`;
         }
         finish({
           status,
@@ -166,6 +304,7 @@ async function solveCase(testCase) {
           info: message.info || "",
           pruned: message.pruned,
           alternateCount: message.alternates?.length || 0,
+          ...(proofMismatch ? { complete: false, terminationReason: "candidate-unproven-early-stop" } : {}),
         });
       }
     });
@@ -180,6 +319,7 @@ async function solveCase(testCase) {
       puzzle: { ...testCase.puzzle, _minTracks: true },
       seed: 0,
       maxTracksHint: testCase.maxTracks ?? 0,
+      solverOptions,
     });
   });
 }
@@ -189,16 +329,48 @@ function casePassed(testCase, result) {
   return result.status === "solved";
 }
 
+function metric(value) {
+  return Number.isFinite(value) ? String(Math.round(value * 100) / 100) : "-";
+}
+
+function describeTelemetry(result) {
+  const csp = result.cspStats || {};
+  const dfs = result.dfsStats || {};
+  const nodes = dfs.nodes ?? result.dfsInfo?.iterations ?? result.reportedIterations;
+  const deepest = dfs.deepestStep ?? dfs.deepest?.step ?? dfs.deepest ?? result.dfsInfo?.deepest?.step ?? result.dfsInfo?.deepest;
+  const cspAbort = csp.aborted ? (csp.abortReason || "yes") : "no";
+  const cspOverflow = csp.overflow === true ? "yes" : (csp.overflow === false ? "no" : "-");
+  return [
+    `nodes=${metric(nodes)}`,
+    `cspMs=${metric(result.cspMs)}`,
+    `dfsMs=${metric(result.dfsMs)}`,
+    `cspPaths=${metric(csp.pathsEnumerated)}`,
+    `cspPathIters=${metric(csp.pathIterations)}`,
+    `cspCombinations=${metric(csp.combinationIterations)}`,
+    `cspOverflow=${cspOverflow}`,
+    `cspAbort=${cspAbort}`,
+    `deepest=${metric(deepest)}`,
+    `firstCandidateMs=${metric(result.firstCandidateMs)}`,
+    `finalCost=${metric(result.finalCost)}`,
+    `complete=${result.complete === true}`,
+    `terminationReason=${result.terminationReason || "missing"}`,
+  ].join(" · ");
+}
+
 function describeResult(testCase, result) {
+  let summary;
   if (result.status === "solved") {
     const limit = testCase.maxTracks != null ? ` (≤${testCase.maxTracks})` : "";
-    return `${result.best.cost} tracks${limit} · ${result.best.steps} steps · ${result.method}`;
+    summary = `${result.best.cost} tracks${limit} · ${result.best.steps} steps · ${result.method}`
+      + (result.reason ? ` · ${result.reason}` : "");
+  } else {
+    const extras = [];
+    if (result.overLimit?.length) extras.push(`超限解 ${result.overLimit.map(s => s.cost).join("/")} 轨`);
+    if (result.candidateFailures?.length) extras.push(`失败候选 ${result.candidateFailures.length}`);
+    if (result.method) extras.push(result.method);
+    summary = `${result.status} · ${result.reason}${extras.length ? ` · ${extras.join(" · ")}` : ""}`;
   }
-  const extras = [];
-  if (result.overLimit?.length) extras.push(`超限解 ${result.overLimit.map(s => s.cost).join("/")} 轨`);
-  if (result.candidateFailures?.length) extras.push(`失败候选 ${result.candidateFailures.length}`);
-  if (result.method) extras.push(result.method);
-  return `${result.status} · ${result.reason}${extras.length ? ` · ${extras.join(" · ")}` : ""}`;
+  return `${summary} · ${describeTelemetry(result)}`;
 }
 
 const manifest = loadManifest();
@@ -216,7 +388,8 @@ if (!selectedFiles.length) {
   process.exit(2);
 }
 
-console.log(`\nPuzzle solver cases: ${selectedFiles.length} (default timeout ${defaultTimeoutMs}ms each)\n`);
+console.log(`\nPuzzle solver cases: ${selectedFiles.length} (default timeout ${defaultTimeoutMs}ms each)`);
+console.log(`Solver options: ${Object.keys(solverOptions).length ? JSON.stringify(solverOptions) : "Worker defaults"}\n`);
 const results = [];
 for (const filePath of selectedFiles) {
   let testCase;
@@ -253,6 +426,21 @@ if (failed.length) {
       method: result.method,
       info: result.info,
       overLimit: result.overLimit,
+      cspMs: result.cspMs,
+      dfsMs: result.dfsMs,
+      cspStats: result.cspStats,
+      dfsStats: result.dfsStats,
+      nodes: result.dfsStats?.nodes ?? result.dfsInfo?.iterations ?? result.reportedIterations,
+      deepest: result.dfsStats?.deepestStep
+        ?? result.dfsStats?.deepest?.step
+        ?? result.dfsStats?.deepest
+        ?? result.dfsInfo?.deepest?.step
+        ?? result.dfsInfo?.deepest,
+      firstCandidateMs: result.firstCandidateMs,
+      finalCost: result.finalCost,
+      complete: result.complete,
+      terminationReason: result.terminationReason,
+      phase: result.phase,
       dfsInfo: result.dfsInfo,
       reportedIterations: result.reportedIterations,
       lastCspInfo: result.lastCspInfo,

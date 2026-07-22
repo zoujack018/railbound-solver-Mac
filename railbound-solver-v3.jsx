@@ -267,21 +267,42 @@ export default function App() {
     const { pruned } = filterBlanks(p);
     const nW = Math.min(navigator.hardwareConcurrency || 4, 16), t0 = performance.now();
     let totalIters = 0, bestFound = null, done = 0, failures = 0, lastMethod = "?", lastInfo = "";
+    let provenOptimalCost = null, provenNoSolution = false;
+    const incompleteReasons = new Set();
     const url = getWorkerUrl(), pf = { ...p, _minTracks: true }, workers = [], settled = new Set();
+    function terminationLabel(reason) {
+      return ({
+        "dfs-iteration-budget": "DFS 迭代预算耗尽",
+        "candidate-unproven-dfs-budget": "DFS 迭代预算耗尽",
+        "candidate-unproven-csp": "CSP 候选未证明",
+        "candidate-unproven-early-stop": "搜索提前停止",
+        "wall-clock-timeout": "墙钟超时",
+      })[reason] || reason || "搜索未完备";
+    }
     function finishWorker(w, payload = {}) {
       if (requestId !== solveRequestRef.current || settled.has(w)) return;
       settled.add(w); done++;
       if (payload.failed) failures++;
       lastMethod = payload.method || lastMethod;
       lastInfo = payload.info || lastInfo;
+      if (payload.complete === true && payload.terminationReason === "optimal-proven" && Number.isFinite(payload.finalCost)) {
+        provenOptimalCost = provenOptimalCost === null ? payload.finalCost : Math.min(provenOptimalCost, payload.finalCost);
+      } else if (payload.complete === true && payload.terminationReason === "search-exhausted" && payload.finalCost == null) {
+        provenNoSolution = true;
+      } else if (!payload.failed) {
+        incompleteReasons.add(terminationLabel(payload.terminationReason));
+      }
       workersRef.current = workersRef.current.filter(ww => ww !== w);
       w.onmessage = null; w.onerror = null; w.onmessageerror = null;
       try { w.terminate(); } catch { /* Worker may already be closed. */ }
       if (done < nW) return;
       const ms = (performance.now() - t0).toFixed(0);
-      if (bestFound) setMsg(`✓ ${ms}ms · 最优${bestFound.__cost}轨 · ${lastMethod} · 剪除${pruned}${failures ? ` · ${failures}线程失败` : ""}`);
+      const reasonText = [...incompleteReasons].join(" / ") || "当前候选尚未获得一致的最优性证明";
+      if (bestFound && provenOptimalCost === bestFound.__cost) setMsg(`✓ ${ms}ms · 已证最优${bestFound.__cost}轨 · ${lastMethod} · 剪除${pruned}${failures ? ` · ${failures}线程失败` : ""}`);
+      else if (bestFound) setMsg(`△ ${ms}ms · 候选${bestFound.__cost}轨 · 未获最优性证明 (${reasonText}) · 剪除${pruned}${failures ? ` · ${failures}线程失败` : ""}`);
       else if (failures === nW) setMsg(`✕ 求解器启动失败 (${lastInfo || "Worker 未返回错误详情"})`);
-      else setMsg(`✕ 无解 (${ms}ms · ${lastMethod}${lastInfo ? " · " + lastInfo : ""}${failures ? ` · ${failures}线程失败` : ""})`);
+      else if (provenNoSolution) setMsg(`✕ 完备无解 (${ms}ms · ${lastMethod}${lastInfo ? " · " + lastInfo : ""}${failures ? ` · ${failures}线程失败` : ""})`);
+      else setMsg(`△ 未找到候选 · 搜索未完备 (${ms}ms · ${reasonText}${failures ? ` · ${failures}线程失败` : ""})`);
     }
     for (let i = 0; i < nW; i++) {
       const w = new Worker(url, { type: "module" });

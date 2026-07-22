@@ -79,6 +79,37 @@ helper-only 夹具的兼容能力。`test/format-adapter-tests.js` 会递归扫�
 
 一维测试棋盘现在允许使用 `1×N` 或 `N×1`。编辑器新建尺寸按钮仍以 2 为下限，这个放宽主要用于显示和复现规则夹具。
 
+### 本轮新增：求解测量与 P1 CSP 时间盒
+
+Worker 与逐题执行器现在把“找到候选”和“完成证明”分开报告。`done` 消息至少包含：
+
+- `cspMs`、`dfsMs`；
+- `cspStats`：路径迭代/枚举/保留数、逐车路径统计、组合迭代数、溢出状态、
+  是否跳过或中止及其原因；
+- `dfsStats`：节点数、迭代上限、最深步数与状态、是否耗尽迭代预算、搜索是否完整；
+- `firstCandidateMs`、`finalCost`、`complete`、`terminationReason`。
+
+P1 只给 CSP 候选生成阶段增加了一个跨全部 slack 轮次共享的时间/路径/组合预算，
+没有修改轨道上限、关卡数据、碰撞规则、胜利条件或 DFS 分支顺序。保守默认值为：
+
+```js
+solverOptions: {
+  cspTimebox: {
+    enabled: true,
+    maxMs: 5000,
+    maxPaths: 100000,
+    maxCombinations: 5000000,
+  },
+}
+```
+
+CSP 触及任一预算时会记录 `cspStats.aborted` 和 `abortReason`，随后可靠进入 DFS；
+CSP 中止本身既不是无解结论，也不会单独决定整个 Worker 的 `complete`。逐题执行器可用
+`CSP_TIMEBOX=off` 关闭这层共享时间盒，作为修改前基准（原有的 CSP 内部路径、枚举和
+beam 上限仍然生效）。详细配置和结果语义见
+[开发与测试](docs/development.md) 与
+[求解器性能优化](docs/solver-optimization.md)。
+
 ## 3. 当前最重要的堵点
 
 ### 3.1 逐题执行器已重建，历史规则单测仍缺失
@@ -191,7 +222,16 @@ npm run preview   # 本机预览生产产物
 npm audit         # 依赖审计
 ```
 
-完整 16 题包含长耗时基准，暂不放入每次快速 `npm test`。历史规则单测恢复后，
+逐题执行器的求解预算可通过环境变量配置：
+
+```bash
+CSP_TIMEBOX=on CSP_TIMEBOX_MS=5000 npm run test:puzzles
+CSP_PATH_BUDGET=100000 CSP_COMBINATION_BUDGET=5000000 npm run test:puzzles
+CSP_TIMEBOX=off npm run test:puzzles  # 关闭 P1 共享时间盒，运行对照基准
+DFS_MAX_ITERATIONS=15000000 npm run test:puzzles
+```
+
+完整逐题集包含长耗时基准，暂不放入每次快速 `npm test`。历史规则单测恢复后，
 应把稳定的细粒度断言纳入 `npm test` 和 `npm run check`。
 
 ## 5. 用户操作说明
@@ -367,10 +407,13 @@ P2 拆分时不能只按视觉组件切文件，还应先抽出纯数据转换�
 当前约 1,185 行，是第二个主要技术债：
 
 - 静态、小型关卡优先使用路径枚举 + CSP 合并。
-- 动态机关、零号车或 CSP 不可信场景回退 DFS。
+- 动态机关、零号车、CSP 不可信场景或 CSP 时间盒中止时回退 DFS。
 - 多 Worker 使用不同 seed 并行搜索。
 - Worker 回传 `progress`、`solution`、`done`，全部带 request ID。
-- “无解”只表示当前算法与预算内未找到，不是完备数学证明。
+- `progress`/`done` 回传 CSP/DFS 分阶段计时和结构化搜索统计；`solution` 带
+  `candidateMs` 和来源 `source`。
+- 只有 `complete:true` 且 `terminationReason:"search-exhausted"` 才能作为当前搜索边界内的
+  完备无解；预算耗尽、墙钟超时和 `complete:false` 都只表示结果未定。
 
 ## 8. 运行时数据流
 
@@ -391,7 +434,8 @@ P2 拆分时不能只按视觉组件切文件，还应先抽出纯数据转换�
 buildP()
   -> filterBlanks()
   -> N 个模块 Worker
-  -> CSP 或 DFS
+  -> CSP（可时间盒中止）
+  -> 必要时 DFS 回退（受独立迭代预算）
   -> candidate solution
   -> 主线程 simulate() 复核
   -> 只展示合法候选
