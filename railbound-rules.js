@@ -178,10 +178,10 @@ function zeroSafetyKey(cars, toggled, tsToggled, autoToggled, tsLocks) {
 }
 
 /* 追尾判定已删除（2026-07-22，作者确认）：真实 Railbound 允许车辆一格间距
-   跟随行驶；追撞静止车辆的场景由排队机制（跟随等待）与占格碰撞自然覆盖。
-   删除依据：4×8 关卡在原规则下完备搜索最小 11 轨 > 题目上限 9，删除后恰好
-   9 轨；6×7 的 16 轨（上限）解仅因 TAILING 被拒；autoswitch 6×4 夹具的
-   hasSolution:true 与原规则第 1 步必然 TAILING 直接矛盾。 */
+   跟随行驶；若前车静止，后车驶入其占格会由同一步落点重合的 CELL_COLLISION
+   直接拒绝。删除依据：4×8 关卡在原规则下完备搜索最小 11 轨 > 题目上限 9，
+   删除后恰好 9 轨；autoswitch 6×4 夹具的 hasSolution:true 与原规则第 1 步
+   必然 TAILING 直接矛盾。 */
 
 /* 对穿碰撞（2026-07-22，作者确认，实例：7×7-8-5A 自变 T 处 3 向下、4 向右）：
    相邻两车同一步穿过同一条边互换格子是碰撞。只对相邻格互换判撞——

@@ -14,9 +14,9 @@ The app does four things: (1) grid-based level editing, (2) puzzle data validati
 nvm use                    # Node 20.19.0 (.nvmrc)
 npm ci                     # Install from lockfile
 npm run dev                # Dev server at http://127.0.0.1:5173/
-npm test                   # Format assertions + 5×5 solver regression
+npm test                   # 15 format + portfolio contract + canary/protocol checks
 npm run test:format        # Only format/adapter tests
-npm run test:puzzles       # All 16 puzzles (20s/puzzle default, set PUZZLE_TIMEOUT_MS to adjust)
+npm run test:puzzles       # Recursive per-puzzle runner (20s default; configurable)
 npm run build              # Vite production build (includes module Worker bundling)
 npm run check              # test + build (CI gate)
 npm run preview            # Preview production build at 127.0.0.1
@@ -28,19 +28,32 @@ Solver A/B controls for `test:puzzles`:
 CSP_TIMEBOX=on CSP_TIMEBOX_MS=5000 npm run test:puzzles
 CSP_PATH_BUDGET=100000 CSP_COMBINATION_BUDGET=5000000 npm run test:puzzles
 CSP_TIMEBOX=off npm run test:puzzles       # Disable only the shared P1 guard
-P8_BACKBONE=on npm run test:puzzles -- "10x11"
-P8_BACKBONE=off npm run test:puzzles -- "10x11"  # Disable the bounded P8 candidate seed
-P8_BACKBONE_MS=50 P8_BACKBONE_WORK_BUDGET=1000 npm run test:puzzles -- "10x11"
+P12_PATTERN_SEED=on npm run test:puzzles -- "10x11"
+P12_PATTERN_SEED=off npm run test:puzzles -- "10x11"  # Disable the bounded P12 seed
+P12_PATTERN_SEED_MS=50 P12_PATTERN_SEED_WORK_BUDGET=1000 npm run test:puzzles -- "10x11"
+PUZZLE_WORKERS=8 npm run test:puzzles -- "7x7-20260722-8-5A"
 DFS_MAX_ITERATIONS=15000000 npm run test:puzzles
 ```
 
 The Worker default is a conservative shared CSP budget of 5,000 ms, 100,000
 enumerated paths, and 5,000,000 combination iterations. `CSP_TIMEBOX=off`
 restores the pre-P1 comparison mode; legacy per-enumerator caps and the CSP
-beam width remain active. Large puzzles may also try one bounded P8 structured-
-backbone candidate (default soft limit 50 ms / 1,000 work units);
-`P8_BACKBONE=off` disables it for A/B. P8 is heuristic,
-must pass `simulate()`, and never contributes a completeness proof.
+beam width remain active. Large puzzles may also try one bounded P12 pattern
+candidate (default soft limit 50 ms / 1,000 work units);
+`P12_PATTERN_SEED=off` disables it for A/B. P12 is heuristic, must pass
+`simulate()`, and never contributes a completeness proof. The canonical Worker
+message field is `solverOptions.p12Seed`. True P8 means the
+still-unimplemented waypoint/CSP segmented enumeration for 8×8-8-5B.
+
+`PUZZLE_WORKERS` accepts 1..16 and defaults to 1, preserving the old runner path.
+For a positive case, N>1 stops on the first authoritative legal candidate and
+returns `complete:false` / `portfolio-first-valid-candidate`. A negative case
+waits for `complete:true` / `search-exhausted` from the same proof domain. Keep
+portfolio wall time separate from summed worker phase times/nodes; cancelled
+worker phase times are extrapolated from their last phase snapshot and carry
+`phaseTimesExact:false`, while nodes/partial counters remain lower bounds.
+Runner first-candidate/wall clocks include startup; Worker-local candidate time
+is retained separately.
 
 CI runs `npm ci && npm run check` on Node 20 and 22 via GitHub Actions.
 
@@ -56,7 +69,7 @@ index.html → main.jsx → railbound-solver-v3.jsx (699 lines, main editor/orch
   ├── railbound-logic.js         Compatibility re-export (don't add new code here)
   ├── railbound-rules.js (661L)  Authoritative rules, simulate(), reachability, pruning
   └── railbound-worker-code.js   Vite module Worker URL factory
-      └── railbound-worker.js (1201L)  CSP + DFS search, imports rules via ESM
+      └── railbound-worker.js          CSP + P12 seed + DFS search, imports rules via ESM
 ```
 
 ### Data flow
@@ -119,20 +132,49 @@ Compatible field aliases handled on import: `goal_entry`/`goalEntry`, `max_steps
 
 **Changing Worker:** All messages must carry `requestId` via `postToMain()`. Verify old results can't leak after re-solve. Run `npm run build` to confirm module Worker bundling.
 
-`done` telemetry includes `cspMs`, `p8Ms`, `dfsMs`, `cspStats`, `dfsStats`,
+`done` telemetry includes `cspMs`, `p12SeedMs`, `dfsMs`, `cspStats`, `dfsStats`,
 `firstCandidateMs`, `finalCost`, `complete`, and `terminationReason`.
 `cspStats` distinguishes skipped CSP, guard aborts (`csp-time-budget`,
 `csp-path-budget`, `csp-combination-budget`), path/combination counts, and
 overflow. `dfsStats` reports nodes, deepest step/state, iteration-limit state,
 and whether DFS completed. `complete:false` means neither optimality nor
-unsolvability was proved, even if a legal candidate was found. P8 telemetry is
-nested under `cspStats.p8`; a P8 miss or non-applicable template always falls
-through to DFS.
+unsolvability was proved, even if a legal candidate was found. P12 telemetry is
+nested under `cspStats.p12Seed`; a P12 miss or non-applicable template always falls
+through to DFS. P12 progress uses phase `p12-seed`; solution source is
+`p12-pattern-seed`.
+
+In the current optimization round, portfolio execution is the only new
+performance change. Renaming the old bounded seed to P12 and exposing its
+candidate telemetry are protocol/measurement corrections. Keep future work
+single-variable: Barrier P5② or P7, then true P8 segmented enumeration, then
+profile-driven P10 Zobrist/state encoding. The old P4 probe rejects only the
+naive string-key LRU, not Zobrist/P10; the old P5 negative result covers the
+10×11 P5① probe only, not Barrier P5②.
 
 ## Current state and caveats
 
 - A new Git baseline is linked to `zoujack018/railbound-solver-Mac`; history from
   before the 2026-07-22 repository initialization is still unavailable.
-- Historical 73 fine-grained rule tests are missing (scripts were lost). Current fast coverage: 15 format tests, 10 solver soundness canaries, 2 forced CSP→DFS fallback checks, 5 P8 candidate/budget/fallback protocol checks, plus the separately invoked per-puzzle Worker runner. See `test/SOLVER-REPORT.md` for solve pass/fail status.
+- Historical 73 fine-grained rule tests are missing (scripts were lost); do not
+  claim they were restored. Current fast coverage is 15 format assertions, the
+  portfolio contract script (seed/source/proof aggregation), 10 solver soundness
+  canaries, 2 forced CSP→DFS fallback checks, and 5 P12 candidate/budget/fallback
+  checks, plus the separately invoked per-puzzle runner.
+- P12 currently matches only corpus case 10×11-8-6A. It produces a verified
+  37-track/64-step candidate in a few milliseconds but remains `complete:false`;
+  organic first-candidate search and optimality proof without P12 are unresolved.
+  Score it as `solved(p12-seed)`. Its roughly 370 lines are explicit maintenance
+  debt and should be reevaluated if no second corpus case matches.
+- Current-HEAD 7×7-8-5A A/B: N=1 uses 4,911.13ms CSP + 73,048.59ms DFS,
+  reaches 15,000,000 nodes in 77,978ms, and returns no candidate; N=8 finds a
+  26-track/95-step DFS candidate at about 5.45s first-candidate/wall time
+  (winner index 7, seed 55464), with >=43,327 observed nodes, estimated summed
+  CSP about 40.0s, and estimated summed DFS about 3.2–3.4s.
+  This is seed coverage trading CPU for latency—the deterministic CSP is copied
+  about eight times—not pruning or proof improvement.
+- 7×7-8-7A is a slow Barrier benchmark, not a fast canary: budget 19 exhausts
+  completely at 10,199,936 nodes in about 36.1s; budget 20 finds a legal 38-step
+  candidate in about 1.0s, proving minimum 20 under current rules. A v3.02 game
+  screenshot supports a 20-rail inventory but is not a per-level developer text claim.
 - `railbound-solver-v3.jsx` is the largest tech debt: grid state, SVG rendering, solver orchestration, and playback all in one file.
 - Dev and preview servers bind to `127.0.0.1` only. Don't use `--host 0.0.0.0` on untrusted networks.

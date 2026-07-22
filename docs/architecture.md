@@ -94,7 +94,7 @@ Vite 在构建时将 Worker 打成独立模块资源。旧函数名 `createWorke
 - 有预算上限的 DFS 回退。
 - 动态机关特性检测。
 - 跨 CSP slack 轮次共享的时间、路径数和组合数守卫。
-- 大型四车/四站台/单 AutoSwitch 结构的有界 P8 主干候选 seed。
+- 大型四车/四站台/单 AutoSwitch 结构的有界 P12 pattern seed。
 - 通过 `progress`、`solution` 和 `done` 消息回传分阶段仪表与结果。
 
 所有回传消息都带请求 ID；主线程只处理与当前求解匹配的消息。
@@ -105,7 +105,7 @@ Vite 在构建时将 Worker 打成独立模块资源。旧函数名 `createWorke
 2. 小型、静态关卡枚举普通火车路径，并用 CSP 合并轨道使用约束。
 3. CSP 的 `[4, 8, 14]` slack 轮次共用一个守卫；达到时间、已枚举路径或组合迭代
    预算后设置 `cspStats.aborted`，停止 CSP 并可靠进入 DFS。
-4. 超过经典 CSP 规模阈值时，可尝试一次 P8 结构化主干候选。它只根据当前 puzzle
+4. 超过经典 CSP 规模阈值时，可尝试一次 P12 结构化 pattern seed。它只根据当前 puzzle
    的相对几何建立 usage，完整布局必须先通过 Worker 内的 `simulate()`；不适用或
    失败只记录统计并回落，不能声明无解。
 5. 全局触发器会跳过静态 CSP；零号火车、动态状态、CSP 溢出或 CSP 结果不可信时
@@ -113,7 +113,9 @@ Vite 在构建时将 Worker 打成独立模块资源。旧函数名 `createWorke
 6. DFS 在迭代预算内联合模拟车辆和动态状态。只有 DFS 在健全边界内完整走完，
    整条搜索链路才可能设置 `complete:true`。
 7. Worker 发送候选解；主线程和逐题执行器都用权威 `simulate()` 再次验证。
-8. 多 Worker 全部完成后，UI 展示最优已知合法解或错误信息。
+8. 浏览器 UI 聚合自己的多 Worker 结果。Node 逐题执行器默认只跑一个 Worker；
+   `PUZZLE_WORKERS=2..16` 才启用多 seed portfolio。正例遇到首个权威合法候选即
+   快停，其结果固定为 `complete:false`；负例必须继续等待同一证明域的完备证据。
 
 一个未找到候选的 Worker 只有同时满足 `complete:true` 和
 `terminationReason:"search-exhausted"`，才能声明在当前健全搜索边界内完备无解。
@@ -121,23 +123,38 @@ Vite 在构建时将 Worker 打成独立模块资源。旧函数名 `createWorke
 
 ## Worker 消息与完备性协议
 
-- `progress`：携带 `phase`（`prepare` / `csp` / `p8` / `dfs`）、当前
-  `cspMs` / `p8Ms` / `dfsMs`
+- `progress`：携带 `phase`（`prepare` / `csp` / `p12-seed` / `dfs`）、当前
+  `cspMs` / `p12SeedMs` / `dfsMs`
   和可用的 `cspStats` / `dfsStats`。DFS 每 500,000 节点、CSP 路径枚举每
   100,000 次迭代会发送阶段快照。
 - `solution`：携带候选、`candidateMs` 和来源 `source`；候选仍必须通过
   `simulate()`，不能仅凭 Worker 快速检查进入结果集。
-- `done`：携带最终 `cspMs`、`p8Ms`、`dfsMs`、`cspStats`、`dfsStats`、
+- `done`：携带最终 `cspMs`、`p12SeedMs`、`dfsMs`、`cspStats`、`dfsStats`、
   `firstCandidateMs`、`finalCost`、`complete` 与 `terminationReason`。
 
 `cspStats` 记录 CSP 是否尝试、跳过原因、时间盒配置、是否中止及
 `abortReason`，以及路径迭代/枚举/保留数、逐车路径桶、组合迭代数和溢出原因。
 时间盒的中止原因分别是 `csp-time-budget`、`csp-path-budget`、
 `csp-combination-budget`；它们是 CSP 阶段状态，不是顶层无解原因。
-`cspStats.p8` 另记 applicability、cycle family、route/usage 数、完整叶、
-`simulate()` 调用、候选成本和 P8 阶段原因。P8 是启发式候选源，它的
+`cspStats.p12Seed` 另记 applicability、cycle family、route/usage 数、完整叶、
+`simulate()` 调用、候选成本和 P12 阶段原因。P12 是启发式候选源，它的
 `template-not-applicable`、`candidate-over-budget` 或 candidate rejection 都不参与
-顶层完备性判定。
+顶层完备性判定。P12 候选消息的 phase 是 `p12-seed`，source 是
+`p12-pattern-seed`；逐题记分板据此显示 `solved(p12-seed)`。
+
+P12 是公开解拓扑启发的专用候选模板，不是路线图中的 P8。当前它只匹配
+10×11-8-6A，约数毫秒内可生成经 `simulate()` 验证的 37 轨候选；后续 DFS 未完成
+时仍是 `complete:false`，关闭 P12 后的有机首候选与最优性证明均未解决。约 370 行
+专用实现是显式维护负担，若没有第二个语料命中应重新评估。真正 P8 是尚未实现的
+8×8-8-5B waypoint/CSP 分段枚举。canonical Worker 配置入口为
+`solverOptions.p12Seed`。
+
+portfolio 顶层协议不会继承任意 Worker 的证明字段：正例快停合成为
+`portfolio-first-valid-candidate` + `complete:false`；负例只有收到
+`search-exhausted` + `complete:true` 才能证明无解。报告必须把 portfolio 墙钟
+与 `Σobserved+estimated` 的 CSP/P12/DFS 时间和节点分开；取消线程的阶段时间按
+最后 phase 快照外推并标记 `phaseTimesExact:false`，节点及部分计数仍是下界。
+runner 首候选/墙钟包含 Worker 启动，Worker-local 候选时钟另行保留。
 
 `dfsStats` 记录节点/迭代数、上限、最深步数及当时状态、迭代预算是否耗尽、
 候选数量、`searchComplete` 和 DFS 自身的终止原因。顶层终止原因按以下方式解释：
@@ -150,6 +167,7 @@ Vite 在构建时将 Worker 打成独立模块资源。旧函数名 `createWorke
 | `dfs-iteration-budget` | `false` | DFS 迭代预算耗尽且无候选 |
 | `candidate-unproven-dfs-budget` | `false` | 已有候选，但 DFS 迭代预算耗尽 |
 | `candidate-unproven-early-stop` | `false` | 已有候选，但搜索因候选数量策略提前停止 |
+| `portfolio-first-valid-candidate` | `false` | N>1 正例的首个权威合法候选快停；未证明最优 |
 | `wall-clock-timeout` | `false` | 逐题执行器墙钟超时并终止 Worker；不是 Worker 的完备结论 |
 
 CSP 是否正常完成不会单独决定 `complete`：CSP 中止后若 DFS 完整走完，最终仍可
@@ -173,5 +191,15 @@ CSP 是否正常完成不会单独决定 `complete`：CSP 中止后若 DFS 完�
 - React 主编辑器仍有较多状态和内联样式，关卡库已拆出独立组件。
 - `simulate()` 与 `zeroSafetyLookahead()` 仍有部分单车移动逻辑重复；碰撞和世界状态推进已统一。
 - 测试使用轻量自制断言器，尚未引入覆盖率与浏览器级 Worker 测试框架。
-- JSON 逐题 Worker 执行器已经重建，`npm test` 覆盖格式和 5×5 快速回归；上一轮 73 条细粒度规则测试仍缺失。
-- 多 Worker 数量仍直接取硬件并发度，上限 16，缺少关卡语料上的性能基准。
+- JSON 逐题 Worker 执行器已经重建；当前快速门禁为 15 条格式断言、portfolio
+  契约脚本、10 条金丝雀、2 条 fallback 与 5 条 P12 协议检查。上一轮 73 条
+  细粒度规则测试仍缺失，不能写成已经恢复。
+- 浏览器仍按硬件并发度（上限 16）调度；逐题执行器则以
+  `PUZZLE_WORKERS=1..16` 显式控制并默认 1。7×7-8-5A 的 N=8 首候选实测约
+  5.45 秒（26 轨/95 步、winner seed 55464），但 `complete:false`；两次代表跑的
+  Σobserved+estimated CSP 约 40.0 秒、DFS 约 3.2–3.4 秒，不能和墙钟混为一谈。
+- 7×7-8-7A 是 Barrier 慢基准：34 blanks、6 barriers、3 triggers，无平台、
+  AutoSwitch 或零号车；19 轨在 10,199,936 节点/约 36.1 秒完整穷尽，20 轨
+  当前约 1.0 秒得到 38 步候选，因此最小值为 20。它不进入快速 canary。
+- 当前这一轮唯一新增性能优化是执行器 portfolio。P12 正名和候选消息仪表属于
+  协议/测量修正。后续每轮仍只选一个变量：Barrier P5②/P7、真正 P8、P10 Zobrist。

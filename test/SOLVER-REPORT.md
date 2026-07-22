@@ -1,6 +1,6 @@
 # Test 关卡求解报告
 
-更新日期：2026-07-22（第六版：P8 bounded pattern seed 通过 10×11-8-6A）
+更新日期：2026-07-22（第七版：P12 正名、执行器 portfolio 与 Barrier 基准）
 
 ## 结论
 
@@ -10,8 +10,17 @@ seed 0、默认每题 20 秒（6×7-8-3A 单独 300 秒、7×7-8-5A 单独 120 �
 结论。后文“逐题结果”保留这份历史快照，本版 P1 结论以紧随其后的同代码
 `off/on` 对照为准。
 
-三个已知轨道上限全部满足：4×8 = 9（恰好命中）、5×5 = 11（恰好命中）、
-6×7-8-3A ≤ 19（当前最小 17）。
+第四版当时的三个已知轨道上限全部满足：4×8 = 9（恰好命中）、5×5 = 11
+（恰好命中）、6×7-8-3A ≤ 19（当前最小 17）。第七版清单另纳入
+由 [Afterburn 在 Google Play 的开发者回复](https://play.google.com/store/apps/details?hl=de_CH&id=com.Afterburn.Railbound)
+支持的 10×11-8-6A 上限 37，以及由截图支持并经 19/20 双向搜索钉住的
+7×7-8-7A=20；
+二者的证据边界见后文。
+
+第七版不改上述历史快照的统计口径。本轮唯一新增性能优化是逐题执行器
+`PUZZLE_WORKERS=1..16` portfolio；原 bounded pattern seed 正名为 P12，以及
+候选消息补齐 `p12SeedMs` / source，属于协议与测量修正。10×11 应记为
+`solved(p12-seed)`，关闭 P12 后的有机首候选和最优性证明仍未解决。
 
 ## 第五版：测量仪表与 `complete` 语义
 
@@ -48,7 +57,7 @@ JSON、碰撞规则或胜利条件。
 `CSP_COMBINATION_BUDGET`。设置 `CSP_TIMEBOX=off` 可关闭本轮新增的共享时间盒
 守卫，保留既有 CSP 内部容量限制，作为对照模式。
 
-本轮仅落地 P1，没有叠加置换表、可达性剪枝或新的分支排序。
+第五版当轮仅落地 P1，没有叠加置换表、可达性剪枝或新的分支排序。
 
 ### 同代码 A/B 对照
 
@@ -100,10 +109,10 @@ CSP。8×8 waypoint/站台题有 47 个可用格，10×11 目标题有 71 个可
 20 秒 `off/on` 快速对照结果相同是预期控制组表现，不代表时间盒失效，也不能
 归功于 P1。
 
-**10×11-8-6A 本轮仍未通过**：20 秒快速 A/B 都没有候选。额外 P1-on 长跑
+**10×11-8-6A 在第五版当轮仍未通过**：20 秒快速 A/B 都没有候选。额外 P1-on 长跑
 在 85,604.96ms 内访问 15,000,000 个 DFS 节点，最深 166 步，仍无候选；终止
 原因为 `dfs-iteration-budget`，所以必须报告 `complete:false`，不能报告无解。
-P1 在该题的实际搜索路径上不执行；在本轮只允许落地一个性能优化的约束下，
+P1 在该题的实际搜索路径上不执行；在第五版当轮只允许落地一个性能优化的约束下，
 不能再叠加 DFS 剪枝或排序来制造通过结果。后续若继续攻关，应另起单变量优化
 轮次并重新做同样的完备性与金丝雀核验。
 
@@ -155,6 +164,10 @@ P4 精确置换表首先只计数、不剪枝。健全键必须包含完整 `pla
 已被现有栈环检测覆盖，新增跨分支命中为 0。省略布局的粗键虽显示约 97% 重复，
 但那是会错误合并不同轨道世界的不健全假象。因此朴素 P4 不应落地。
 
+这条负结果只否定上述 naive string-key LRU：它没有测试 Zobrist 增量哈希、紧凑
+状态编码或其他 P10 工程实现，不能写成“置换表方向已被否定”。P10 仍需 profile
+后另起单变量实验。
+
 P3 收紧步数与 P2 收紧成本均复用现有 Worker，仅改变内存中的搜索 hint；所有
 无候选结果都是 `complete:false`，没有把严格子空间误报成原题无解：
 
@@ -175,9 +188,12 @@ P5 使用经独立审查的宽松有向可达图：未决 blank 允许全部轨�
 | interval 4096 | 15M | 86,903.51 ms | 3,662 / 3,662 | 0 | false / DFS budget |
 | interval 512 | 15M | 90,770.31 ms | 29,296 / 29,296 | 0 | false / DFS budget |
 
-P5 的判定本身命中强且每次回溯健全，但在固定 15M 预算内只是转向其他分支；
+这次 P5 只测试 10×11 上的 P5①（普通车到终点宽松可达）。其判定本身命中强且
+每次回溯健全，但在固定 15M 预算内只是转向其他分支；
 4096 档回退 1.52%，512 档回退 6.03%，均未产生首候选。因此当前证据也不支持
-直接落地 P5。至此 P2/P3/P4/P5 都没有在目标上给出可合入收益；若开启下一轮，
+在 10×11 上直接落地这一 P5①探针。针对 Barrier 的 P5②触发器/门必需性未测试，
+仍是高优先级方向，绝不能把此结果写成“P5 对 Barrier 无效”。至此这些探针都
+没有在当时 10×11 目标上给出可合入收益；若开启下一轮，
 应先提出新的、单独可证且可测的搜索假设，而不是把这些负结果组合起来。
 
 #### 多模型咨询与漏斗行程原型（临时文件，未落地）
@@ -250,7 +266,7 @@ CSP”，一票选择纯排序 P6。按多数意见只做了一份 `/private/tmp
 - 唯一未满足项是本轮总目标 10×11-8-6A：它仍在 DFS 预算处未定，不能标为通过
   或完备无解。
 
-## 第六版：P8 bounded pattern seed（单变量）
+## 第六版：P12 bounded pattern seed（历史实现，现已正名）
 
 ### 外部 oracle 与权威复核
 
@@ -269,43 +285,127 @@ World 8 walkthrough 的 8-6A 解图（[旧版合集](https://steamcommunity.com/
 connector 版生成 24 个 backbone 叶，却有 182 次 start attachment 零域；二者
 都是 `fullLeaves=0`、`simulateCalls=0`、`complete:false`，没有伪报无解。
 
-本轮最终只落地一个更窄的参数化 topology seed。它明确受公开解拓扑启发，不是
-一般 P8 枚举器；适用谓词要求大型四车/四站台/单 AutoSwitch、对齐的相对起点与
-站台、特定 ownership/间距和 canonical N→S Auto cycle。代码从当前 puzzle 的
+当时落地的更窄参数化 topology seed 曾被误标成 P8，本版统一正名为 P12。它明确
+受公开解拓扑启发，不是一般 P8 枚举器；适用谓词要求大型四车/四站台/单
+AutoSwitch、对齐的相对起点与站台、特定 ownership/间距和 canonical N→S Auto
+cycle。代码从当前 puzzle 的
 相对坐标建立共享 backbone、起点合流和 delay loop，再按 entry→exit usage 交集
 落轨；没有读取文件名、绝对坐标表、literal placed 或已知成本。
 
 候选必须先通过 Worker 内 `simulate()` 才能发送，执行器再次复核。不适用、
 50ms / 1,000 工作单元预算、轨道上限、构造冲突、模拟拒绝与异常都只记录
-`cspStats.p8` 并进入原 DFS。P8 从不产生顶层 `complete:true` 或
-`search-exhausted`。可用 `P8_BACKBONE=off` 完全回退。
+`cspStats.p12Seed` 并进入原 DFS。P12 从不产生顶层 `complete:true` 或
+`search-exhausted`。canonical 接口为 `solverOptions.p12Seed`，执行器变量为
+`P12_PATTERN_SEED` / `P12_PATTERN_SEED_MS` / `P12_PATTERN_SEED_WORK_BUDGET`；
+progress phase 是 `p12-seed`，candidate source 是 `p12-pattern-seed`。执行器只为
+迁移保留兼容输入，但新报告与命令只使用 canonical P12 名称。
 
 ### 同代码开/关对照
 
-为隔离 P8 候选生成，开/关两次都设置 `DFS_MAX_ITERATIONS=1`；节点数故意相同，
+为隔离 P12 候选生成，开/关两次都设置 `DFS_MAX_ITERATIONS=1`；节点数故意相同，
 该实验不声称 DFS 剪枝或节点率提升。时间为本机单 Worker、seed 0 单次测量。
 
-| 关卡文件 | 修改前节点 | 修改后节点 | 修改前 CSP/P8/DFS 时间 | 修改后 CSP/P8/DFS 时间 | 首候选 | 成本 | complete | 结果 |
+| 关卡文件 | 修改前节点 | 修改后节点 | 修改前 CSP/P12/DFS 时间 | 修改后 CSP/P12/DFS 时间 | 首候选 | 成本 | complete | 结果 |
 |---|---:|---:|---:|---:|---:|---:|---|---|
 | 关卡-10x11-20260722-8-6A.json | 1 | 1 | 0 / 0 / 0.79 ms | 0 / 2.43 / 0.64 ms | — → 7.07 ms | — → 37 | false → false | dfs-iteration-budget → candidate-unproven-dfs-budget（solved） |
 
-解释：节点数没有下降，节点率也没有成为本实验变量；P8 只用约 2.43ms 在 DFS 前
+解释：节点数没有下降，节点率也没有成为本实验变量；P12 只用约 2.43ms 在 DFS 前
 生成并验证候选。`complete:false` 表明这是“快速找解”提升，不是最优性或无解证明
-能力提升，也没有把成本从 CSP 转移到 DFS。P8 关闭时仍完全复现旧 DFS 未定结果。
+能力提升，也没有把成本从 CSP 转移到 DFS。P12 关闭时仍完全复现旧 DFS 未定结果。
 
 ### 当前验收
 
 - 10 条金丝雀全部通过；4×8=9、5×5=11、7×5=8、autoswitch=9 及各自减一
   完备无解判定不变，swap/rear-end 仍为完备无解。
-- 两条 P1 强制时间盒回落协议继续通过；P8 另有开启候选、关闭回落、37>36
+- 两条 P1 强制时间盒回落协议继续通过；P12 另有开启候选、关闭回落、37>36
   超预算拒绝、工作预算中止和 8×8 近邻不适用共 5 条协议检查。
 - 10×11 现在由执行器判为 solved：37 轨、64 步、首候选约 7.07ms；由于 DFS
-  未完成，诚实报告 `complete:false` + `candidate-unproven-dfs-budget`。
-- 快速题不进入 P8（`classic-csp-route`），节点数、最小成本和证明状态不变。
-- P8 是本轮唯一落地的性能路径；没有同时合入 TT、可达性剪枝、P6、Beam 或新
+  未完成，诚实报告 `complete:false` + `candidate-unproven-dfs-budget`；新版记分板
+  进一步标成 `solved(p12-seed)`，与有机 DFS/CSP 解区分。
+- 快速题不进入 P12（`classic-csp-route`），节点数、最小成本和证明状态不变。
+- P12 是第六版当时唯一落地的性能路径；没有同时合入 TT、可达性剪枝、P6、Beam 或新
   DFS 分支排序。
 - `npm run check` 通过：15 条格式断言、10 条金丝雀、2 条 P1 fallback、5 条
-  P8 协议检查与 Vite 生产构建全部成功。
+  P12 协议检查与 Vite 生产构建全部成功。
+
+P12 当前只匹配 corpus 中这一道 10×11；关闭它后仍没有有机首候选，也没有 37 轨
+最优性证明。其约 370 行专用实现是显式维护负担；若后续没有第二个 corpus 命中，
+应重新评估保留价值。真正 P8 仍是面向 8×8-8-5B 的 waypoint/CSP 分段枚举，
+截至第七版尚未实现。
+
+## 第七版：执行器 portfolio（本轮唯一性能优化）
+
+### 协议
+
+逐题执行器新增 `PUZZLE_WORKERS=1..16`，默认 1 完全沿用旧单 Worker 路径。
+N>1 时使用与浏览器一致的 seed 序列：index 0 为 0，之后为
+`index * 7919 + 31`。
+
+- 正例：首个候选必须先通过权威 `simulate()`；通过后取消其余 Worker，返回
+  `complete:false` + `portfolio-first-valid-candidate`。这是找解快停，不是
+  最优性证明。
+- 负例：不使用首候选快停，必须等待同一证明域内某个 Worker 返回
+  `complete:true` + `search-exhausted`；预算耗尽和墙钟超时仍是未定。
+- 聚合层不从任意 Worker 对象继承证明字段，并检查候选/最优证明成本冲突。
+- 输出把包含启动的 runner 首候选/总墙钟和 `Σobserved+estimated` CSP/P12/DFS
+  时间分开；Worker-local 候选时钟另行保留。取消线程的阶段时间按最后 phase
+  快照外推并标记 `phaseTimesExact:false`，节点及部分计数仍是下界。
+
+当前快速门禁由 15 条格式断言、portfolio 契约脚本（覆盖 seed、来源标签、正例
+快停、负例证明与冲突聚合）、10 条金丝雀、2 条 P1 fallback 和 5 条 P12
+candidate/budget/fallback 检查组成。历史 73 条细粒度规则脚本仍然缺失，未恢复、
+也没有在当前 `npm test` 中执行。
+
+### 7×7-8-5A 同代码 A/B
+
+以下为当前 HEAD、本机单次运行；两边规则、预算和 Worker 代码相同，只改变
+`PUZZLE_WORKERS`。
+
+| 配置 | 总墙钟 | 首候选 | CSP / DFS | 节点 | 候选 | winner | complete / 原因 |
+|---|---:|---:|---:|---:|---|---|---|
+| N=1 | 77,978ms | — | 4,911.13 / 73,048.59ms | 15,000,000 | 无 | — | false / dfs-iteration-budget |
+| N=8，代表跑 1 | ≈5,438ms | ≈5,429ms | Σobserved+estimated≈40,007 / ≈3,191ms | ≥43,327 | 26轨、95步 | index7 / seed55464 / dfs | false / portfolio-first-valid-candidate |
+| N=8，代表跑 2 | ≈5,470ms | ≈5,461ms | Σobserved+estimated≈40,016 / ≈3,427ms | ≥43,327 | 26轨、95步 | index7 / seed55464 / dfs | false / portfolio-first-valid-candidate |
+
+结论：首候选/墙钟稳定在约 5.45 秒，原因是多 seed 覆盖让 index 7 很早走到合法
+DFS 候选。表中 runner 时钟包含 Worker 启动；阶段合计因取消线程而是按最后 phase
+快照外推的估算值（`phaseTimesExact:false`），不是精确 `Σworker`。
+这不是节点剪枝；取消后的 ≥43,327 只是观测下界，不能与 15M 精确终值计算缩减倍数。
+也不是节点率工程提速：八个 Worker 各自复制了确定性 CSP，估算 ΣCSP 约 40.0 秒，
+接近单 Worker CSP 的八倍；估算 ΣDFS 约 3.2–3.4 秒。它明确是以 CPU/并发工作
+换首解延迟。候选
+`complete:false`，所以证明能力没有提高。
+
+### 7×7-8-7A Barrier 慢基准
+
+新增关卡结构为 7×7、34 blanks、6 barriers、3 triggers；没有 platforms、
+AutoSwitch 或 zero train，CSP 因动态机关不适用。它不进入快速 canary，保留给
+后续 Barrier P5②/P7 的慢基准。
+
+- seed 0、轨道预算 19：10,199,936 节点、约 36.1 秒完整穷尽，结果为
+  `complete:true` + `search-exhausted`。
+- 轨道预算 20：当前 HEAD 约 1.0 秒得到 20 轨、38 步合法候选；结合上一条完备
+  负证明，当前规则下最小值为 20。
+- N=8 约 1.307 秒也可找到候选，但它不是最小性证明；证明仍来自 seed 0 的
+  budget19 完整搜索。
+
+题面库存 20 的外部证据是 [v3.02 游戏截图页](https://steamcommunity.com/sharedfiles/filedetails/?id=3243029658)：
+该 20 轨完成布局时剩余库存显示为 0。
+它支持上限 20，但不是开发者逐关文字声明；报告和 manifest 保留这一限定，不把
+截图证据升级成官方文字表格。
+
+### 本轮边界与下一步
+
+本轮唯一新增性能优化是 portfolio。P12 正名、候选消息补充 `p12SeedMs` / phase /
+source 和记分板来源标签是协议/测量修正，不是第二个性能优化。下一步仍坚持每轮
+单变量：
+
+1. Barrier P5②触发器/门必需性或 P7 成本下界，分别用 8-7A budget19 节点数衡量；
+2. 真正 P8：8×8-8-5B waypoint/CSP 分段枚举；
+3. P10 Zobrist/紧凑状态编码，在 profile 后独立验证。
+
+P4 旧结果只否定 naive string-key TT；P5 旧结果只适用于 10×11 P5①。二者都不能
+被扩写为 P10 或 Barrier P5②的负结论。
 
 ## 规则语义现状（均经作者确认）
 
@@ -385,17 +485,20 @@ DFS 移动阶段原每车每步以 `{ ...pz.fixed, ...placed }` 展开构造合�
 
 ## 未解决项
 
-- **7×7-8-5A**：单 Worker、seed 0 在 120s 内无候选（CSP 四车路径全部溢出，
-  DFS 未完成）。浏览器多 Worker 多 seed 可解（作者截图）。需要 CSP 组合
-  阶段的容量改进或 DFS 排序优化。
+- **7×7-8-5A**：当前单 Worker 在 77,978ms / 15M DFS 节点无候选；N=8
+  portfolio 约 5.45 秒找到 26 轨、95 步候选。它解决了执行器的快速找解路径，
+  但 `complete:false`，且单 Worker 有机搜索与证明能力没有改善。
+- **7×7-8-7A**：已证明当前规则下最小 20（budget19 约36.1秒/10,199,936
+  节点完备穷尽；20轨候选约1.0秒）。作为 Barrier 慢基准保留，不进快速 canary。
 - **7×8（8-7）**：4 Barrier + 颜色触发器，20s 超时。
 - **8×8（8-5B）**：waypoint/站台组合复杂，但 47 个可用格使其跳过 CSP，P1
   时间盒不覆盖该题，20s 直接 DFS 超时。
 - **8×9（6-9D）**：多种动态道岔 + 全局触发器，迭代率已 2.5× 仍不够；
   需要动态状态下界与触发器可达性剪枝。
-- **10×11（8-6A）的最优性证明**仍未完成，但“找到合法解”目标已由第六版 P8
+- **10×11（8-6A）的最优性证明**仍未完成，但“找到合法解”目标已由第六版 P12
   达成：37 轨、64 步、首候选约 7.07ms。结果保持 `complete:false`，不能把 37
-  宣称为已证最小值。
+  宣称为已证最小值；关闭 P12 后的有机首候选仍未解决，记分板必须显示
+  `solved(p12-seed)`。
 - 6×7-8-3A 原先在 CSP 内超时的问题已由 P1 消除：约 6.9s 得到并证明 17 轨
   最优解，不再列为当前慢题。
 - 历史 73 条细粒度规则单测仍缺失；跟随/排队/对穿三项新语义目前只有
