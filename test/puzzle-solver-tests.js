@@ -39,12 +39,19 @@ function buildSolverOptions(env = process.env) {
   if (mode && mode !== "on" && mode !== "off") {
     throw new Error(`CSP_TIMEBOX must be on or off, received: ${env.CSP_TIMEBOX}`);
   }
+  const p8Mode = String(env.P8_BACKBONE || "").trim().toLowerCase();
+  if (p8Mode && p8Mode !== "on" && p8Mode !== "off") {
+    throw new Error(`P8_BACKBONE must be on or off, received: ${env.P8_BACKBONE}`);
+  }
 
   const maxMs = optionalPositiveInteger(env.CSP_TIMEBOX_MS);
   const maxPaths = optionalPositiveInteger(env.CSP_PATH_BUDGET);
   const maxCombinations = optionalPositiveInteger(env.CSP_COMBINATION_BUDGET);
   const dfsMaxIterations = optionalPositiveInteger(env.DFS_MAX_ITERATIONS);
+  const p8MaxMs = optionalPositiveInteger(env.P8_BACKBONE_MS);
+  const p8MaxWorkUnits = optionalPositiveInteger(env.P8_BACKBONE_WORK_BUDGET);
   const cspTimebox = {};
+  const p8 = {};
 
   /* No CSP environment variables means "use Worker defaults". `on` makes that
      choice explicit; `off` disables only the new P1 shared timebox and restores
@@ -54,9 +61,13 @@ function buildSolverOptions(env = process.env) {
   if (maxMs != null) cspTimebox.maxMs = maxMs;
   if (maxPaths != null) cspTimebox.maxPaths = maxPaths;
   if (maxCombinations != null) cspTimebox.maxCombinations = maxCombinations;
+  if (p8Mode) p8.enabled = p8Mode === "on";
+  if (p8MaxMs != null) p8.maxMs = p8MaxMs;
+  if (p8MaxWorkUnits != null) p8.maxWorkUnits = p8MaxWorkUnits;
 
   const options = {};
   if (Object.keys(cspTimebox).length) options.cspTimebox = cspTimebox;
+  if (Object.keys(p8).length) options.p8 = p8;
   if (dfsMaxIterations != null) options.dfsMaxIterations = dfsMaxIterations;
   return options;
 }
@@ -127,6 +138,7 @@ async function solveCase(testCase) {
   let lastCspInfo = "";
   const telemetry = {
     cspMs: null,
+    p8Ms: null,
     dfsMs: null,
     cspStats: null,
     dfsStats: null,
@@ -143,6 +155,7 @@ async function solveCase(testCase) {
   };
   const captureTelemetry = message => {
     if (Number.isFinite(message.cspMs)) telemetry.cspMs = message.cspMs;
+    if (Number.isFinite(message.p8Ms)) telemetry.p8Ms = message.p8Ms;
     if (Number.isFinite(message.dfsMs)) telemetry.dfsMs = message.dfsMs;
     if (message.cspStats) telemetry.cspStats = mergeStats(telemetry.cspStats, message.cspStats);
     if (message.dfsStats) telemetry.dfsStats = mergeStats(telemetry.dfsStats, message.dfsStats);
@@ -177,27 +190,36 @@ async function solveCase(testCase) {
       void worker.terminate();
       const elapsedMs = performance.now() - started;
       let resolvedCspMs = telemetry.cspMs;
+      let resolvedP8Ms = telemetry.p8Ms;
       let resolvedDfsMs = telemetry.dfsMs;
       if (result.terminationReason === "wall-clock-timeout") {
         if (telemetry.phase === "csp") {
           resolvedCspMs = Math.max(Number.isFinite(resolvedCspMs) ? resolvedCspMs : 0, elapsedMs);
+          resolvedP8Ms = 0;
+          resolvedDfsMs = 0;
+        } else if (telemetry.phase === "p8") {
+          if (!Number.isFinite(resolvedCspMs)) resolvedCspMs = 0;
+          resolvedP8Ms = Math.max(Number.isFinite(resolvedP8Ms) ? resolvedP8Ms : 0, elapsedMs - resolvedCspMs);
           resolvedDfsMs = 0;
         } else if (telemetry.phase === "dfs") {
           if (!Number.isFinite(resolvedCspMs)) resolvedCspMs = 0;
+          if (!Number.isFinite(resolvedP8Ms)) resolvedP8Ms = 0;
           resolvedDfsMs = Math.max(
             Number.isFinite(resolvedDfsMs) ? resolvedDfsMs : 0,
-            Math.max(0, elapsedMs - resolvedCspMs),
+            Math.max(0, elapsedMs - resolvedCspMs - resolvedP8Ms),
           );
         } else {
           /* A timeout before the Worker announces a phase still must not emit
              null timings; zero means "no measured phase sample available". */
           if (!Number.isFinite(resolvedCspMs)) resolvedCspMs = 0;
+          if (!Number.isFinite(resolvedP8Ms)) resolvedP8Ms = 0;
           if (!Number.isFinite(resolvedDfsMs)) resolvedDfsMs = 0;
         }
       }
       resolve({
         ...telemetry,
         cspMs: resolvedCspMs,
+        p8Ms: resolvedP8Ms,
         dfsMs: resolvedDfsMs,
         ...result,
         best,
@@ -343,12 +365,14 @@ function describeTelemetry(result) {
   return [
     `nodes=${metric(nodes)}`,
     `cspMs=${metric(result.cspMs)}`,
+    `p8Ms=${metric(result.p8Ms)}`,
     `dfsMs=${metric(result.dfsMs)}`,
     `cspPaths=${metric(csp.pathsEnumerated)}`,
     `cspPathIters=${metric(csp.pathIterations)}`,
     `cspCombinations=${metric(csp.combinationIterations)}`,
     `cspOverflow=${cspOverflow}`,
     `cspAbort=${cspAbort}`,
+    `p8=${csp.p8?.terminationReason || "-"}`,
     `deepest=${metric(deepest)}`,
     `firstCandidateMs=${metric(result.firstCandidateMs)}`,
     `finalCost=${metric(result.finalCost)}`,

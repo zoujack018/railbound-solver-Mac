@@ -1,6 +1,6 @@
 # Test 关卡求解报告
 
-更新日期：2026-07-22（第五版：求解仪表 + P1 CSP 时间盒）
+更新日期：2026-07-22（第六版：P8 bounded pattern seed 通过 10×11-8-6A）
 
 ## 结论
 
@@ -190,6 +190,10 @@ P5 的判定本身命中强且每次回溯健全，但在固定 15M 预算内只
 CSP”，一票选择纯排序 P6。按多数意见只做了一份 `/private/tmp` 一次性原型，
 没有改 Worker。
 
+> 后续公开解转录与权威模拟已经证明本小节首版的 terminal-only / `N/S/N/S`
+> 假设错误；以下数据只保留为“错误模型也必须诚实报告退化”的历史记录。正确的
+> cyclic Auto 结构与已落地结果见“第六版”小节。
+
 该模板把每车切成 `start → platform target → wait2 → autoSwitch → goal`，禁止
 提前穿越 `(8,5)`，并固定按到站顺序使用 AutoSwitch 的 `N/S/N/S` 入口。共享
 格逐条用真实 `exitPort()` 合并，不能构造四端口交叉；轻量轨迹只作提前拒绝，
@@ -232,7 +236,7 @@ CSP”，一票选择纯排序 P6。按多数意见只做了一份 `/private/tmp
 仍只生成候选、仍以 `simulate()` 为唯一接受门、仍强制 `complete:false`；在
 至少到达一个完整叶之前，任何 0 候选结果都只能叫生成器退化，不能叫搜索穷尽。
 
-### 本轮验收状态
+### 第五版 P1 验收状态（历史快照）
 
 - 仓库现有 10 条金丝雀全部通过：包含要求中的 9 条契约，以及额外的 rear-end
   夹具；4×8、5×5、7×5、autoswitch 的最小值均为 `optimal-proven`，其减一预算
@@ -245,6 +249,63 @@ CSP”，一票选择纯排序 P6。按多数意见只做了一份 `/private/tmp
   Vite 生产构建）。
 - 唯一未满足项是本轮总目标 10×11-8-6A：它仍在 DFS 预算处未定，不能标为通过
   或完备无解。
+
+## 第六版：P8 bounded pattern seed（单变量）
+
+### 外部 oracle 与权威复核
+
+在 P2–P5、16 seed、60M DFS 和两个一般化 P8 原型都没有首候选后，查到 Steam
+World 8 walkthrough 的 8-6A 解图（[旧版合集](https://steamcommunity.com/sharedfiles/filedetails/?id=2932832043)、
+[v3.04 图页](https://steamcommunity.com/sharedfiles/filedetails/?id=3356666718)）。人工转录
+只用于校验生成器覆盖面，没有写入关卡 JSON。对六个 T 朝向组合逐一调用本仓库
+`simulate()`，唯一合法组合为 **37 轨、64 步、到站 1→2→3→4**。
+
+权威 history 揭示：四车都从 N 进入 `(8,5)` AutoSwitch；car3 被分流后走共享
+8-step loop 一次，car4 两次。Auto 每次离开后翻相，其他车辆的插入会改变返回时
+相位，因此不能给每车预设入口或 loop 次数。这个证据推翻了上一小节的错误模型。
+
+三个模型随后分别审查 cyclic 合约、attachment 状态与完备性边界。两个更一般的
+固定预算原型仍退化：八段增量版在 500,000 工作单元停于 car2 pre；anchor +
+connector 版生成 24 个 backbone 叶，却有 182 次 start attachment 零域；二者
+都是 `fullLeaves=0`、`simulateCalls=0`、`complete:false`，没有伪报无解。
+
+本轮最终只落地一个更窄的参数化 topology seed。它明确受公开解拓扑启发，不是
+一般 P8 枚举器；适用谓词要求大型四车/四站台/单 AutoSwitch、对齐的相对起点与
+站台、特定 ownership/间距和 canonical N→S Auto cycle。代码从当前 puzzle 的
+相对坐标建立共享 backbone、起点合流和 delay loop，再按 entry→exit usage 交集
+落轨；没有读取文件名、绝对坐标表、literal placed 或已知成本。
+
+候选必须先通过 Worker 内 `simulate()` 才能发送，执行器再次复核。不适用、
+50ms / 1,000 工作单元预算、轨道上限、构造冲突、模拟拒绝与异常都只记录
+`cspStats.p8` 并进入原 DFS。P8 从不产生顶层 `complete:true` 或
+`search-exhausted`。可用 `P8_BACKBONE=off` 完全回退。
+
+### 同代码开/关对照
+
+为隔离 P8 候选生成，开/关两次都设置 `DFS_MAX_ITERATIONS=1`；节点数故意相同，
+该实验不声称 DFS 剪枝或节点率提升。时间为本机单 Worker、seed 0 单次测量。
+
+| 关卡文件 | 修改前节点 | 修改后节点 | 修改前 CSP/P8/DFS 时间 | 修改后 CSP/P8/DFS 时间 | 首候选 | 成本 | complete | 结果 |
+|---|---:|---:|---:|---:|---:|---:|---|---|
+| 关卡-10x11-20260722-8-6A.json | 1 | 1 | 0 / 0 / 0.79 ms | 0 / 2.43 / 0.64 ms | — → 7.07 ms | — → 37 | false → false | dfs-iteration-budget → candidate-unproven-dfs-budget（solved） |
+
+解释：节点数没有下降，节点率也没有成为本实验变量；P8 只用约 2.43ms 在 DFS 前
+生成并验证候选。`complete:false` 表明这是“快速找解”提升，不是最优性或无解证明
+能力提升，也没有把成本从 CSP 转移到 DFS。P8 关闭时仍完全复现旧 DFS 未定结果。
+
+### 当前验收
+
+- 10 条金丝雀全部通过；4×8=9、5×5=11、7×5=8、autoswitch=9 及各自减一
+  完备无解判定不变，swap/rear-end 仍为完备无解。
+- 两条 P1 强制时间盒回落协议继续通过；P8 另有开启候选、关闭回落、37>36
+  超预算拒绝、工作预算中止和 8×8 近邻不适用共 5 条协议检查。
+- 10×11 现在由执行器判为 solved：37 轨、64 步、首候选约 7.07ms；由于 DFS
+  未完成，诚实报告 `complete:false` + `candidate-unproven-dfs-budget`。
+- 快速题不进入 P8（`classic-csp-route`），节点数、最小成本和证明状态不变。
+- P8 是本轮唯一落地的性能路径；没有同时合入 TT、可达性剪枝、P6、Beam 或新
+  DFS 分支排序。
+- `npm run check` 通过：15 条格式断言、10 条金丝雀、2 条 P1 fallback、5 条
+  P8 协议检查与 Vite 生产构建全部成功。
 
 ## 规则语义现状（均经作者确认）
 
@@ -332,8 +393,9 @@ DFS 移动阶段原每车每步以 `{ ...pz.fixed, ...placed }` 展开构造合�
   时间盒不覆盖该题，20s 直接 DFS 超时。
 - **8×9（6-9D）**：多种动态道岔 + 全局触发器，迭代率已 2.5× 仍不够；
   需要动态状态下界与触发器可达性剪枝。
-- **10×11（8-6A）**：71 个可用格使其跳过 CSP，P1 不适用；20s 直接 DFS
-  无候选且搜索未完成，是本轮仍未达成的目标。
+- **10×11（8-6A）的最优性证明**仍未完成，但“找到合法解”目标已由第六版 P8
+  达成：37 轨、64 步、首候选约 7.07ms。结果保持 `complete:false`，不能把 37
+  宣称为已证最小值。
 - 6×7-8-3A 原先在 CSP 内超时的问题已由 P1 消除：约 6.9s 得到并证明 17 轨
   最优解，不再列为当前慢题。
 - 历史 73 条细粒度规则单测仍缺失；跟随/排队/对穿三项新语义目前只有

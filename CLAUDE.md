@@ -28,13 +28,19 @@ Solver A/B controls for `test:puzzles`:
 CSP_TIMEBOX=on CSP_TIMEBOX_MS=5000 npm run test:puzzles
 CSP_PATH_BUDGET=100000 CSP_COMBINATION_BUDGET=5000000 npm run test:puzzles
 CSP_TIMEBOX=off npm run test:puzzles       # Disable only the shared P1 guard
+P8_BACKBONE=on npm run test:puzzles -- "10x11"
+P8_BACKBONE=off npm run test:puzzles -- "10x11"  # Disable the bounded P8 candidate seed
+P8_BACKBONE_MS=50 P8_BACKBONE_WORK_BUDGET=1000 npm run test:puzzles -- "10x11"
 DFS_MAX_ITERATIONS=15000000 npm run test:puzzles
 ```
 
 The Worker default is a conservative shared CSP budget of 5,000 ms, 100,000
 enumerated paths, and 5,000,000 combination iterations. `CSP_TIMEBOX=off`
 restores the pre-P1 comparison mode; legacy per-enumerator caps and the CSP
-beam width remain active.
+beam width remain active. Large puzzles may also try one bounded P8 structured-
+backbone candidate (default soft limit 50 ms / 1,000 work units);
+`P8_BACKBONE=off` disables it for A/B. P8 is heuristic,
+must pass `simulate()`, and never contributes a completeness proof.
 
 CI runs `npm ci && npm run check` on Node 20 and 22 via GitHub Actions.
 
@@ -113,18 +119,20 @@ Compatible field aliases handled on import: `goal_entry`/`goalEntry`, `max_steps
 
 **Changing Worker:** All messages must carry `requestId` via `postToMain()`. Verify old results can't leak after re-solve. Run `npm run build` to confirm module Worker bundling.
 
-`done` telemetry includes `cspMs`, `dfsMs`, `cspStats`, `dfsStats`,
+`done` telemetry includes `cspMs`, `p8Ms`, `dfsMs`, `cspStats`, `dfsStats`,
 `firstCandidateMs`, `finalCost`, `complete`, and `terminationReason`.
 `cspStats` distinguishes skipped CSP, guard aborts (`csp-time-budget`,
 `csp-path-budget`, `csp-combination-budget`), path/combination counts, and
 overflow. `dfsStats` reports nodes, deepest step/state, iteration-limit state,
 and whether DFS completed. `complete:false` means neither optimality nor
-unsolvability was proved, even if a legal candidate was found.
+unsolvability was proved, even if a legal candidate was found. P8 telemetry is
+nested under `cspStats.p8`; a P8 miss or non-applicable template always falls
+through to DFS.
 
 ## Current state and caveats
 
 - A new Git baseline is linked to `zoujack018/railbound-solver-Mac`; history from
   before the 2026-07-22 repository initialization is still unavailable.
-- Historical 73 fine-grained rule tests are missing (scripts were lost). Current fast coverage: 15 format tests, 10 solver soundness canaries, 2 forced CSP→DFS fallback protocol checks, plus the separately invoked per-puzzle Worker runner. See `test/SOLVER-REPORT.md` for solve pass/fail status.
+- Historical 73 fine-grained rule tests are missing (scripts were lost). Current fast coverage: 15 format tests, 10 solver soundness canaries, 2 forced CSP→DFS fallback checks, 5 P8 candidate/budget/fallback protocol checks, plus the separately invoked per-puzzle Worker runner. See `test/SOLVER-REPORT.md` for solve pass/fail status.
 - `railbound-solver-v3.jsx` is the largest tech debt: grid state, SVG rendering, solver orchestration, and playback all in one file.
 - Dev and preview servers bind to `127.0.0.1` only. Don't use `--host 0.0.0.0` on untrusted networks.

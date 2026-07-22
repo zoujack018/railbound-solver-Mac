@@ -57,6 +57,7 @@ function runCase(puzzle, budget, solverOptions = undefined) {
     let cspStats = null;
     let dfsStats = null;
     let cspMs = null;
+    let p8Ms = null;
     let dfsMs = null;
     let firstCandidateMs = null;
     let finalCost = null;
@@ -77,6 +78,7 @@ function runCase(puzzle, budget, solverOptions = undefined) {
         cspStats,
         dfsStats,
         cspMs,
+        p8Ms,
         dfsMs,
         firstCandidateMs,
         finalCost,
@@ -92,21 +94,29 @@ function runCase(puzzle, budget, solverOptions = undefined) {
       const elapsedMs = performance.now() - started;
       if (phase === "csp") {
         cspMs = Math.max(Number.isFinite(cspMs) ? cspMs : 0, elapsedMs);
+        p8Ms = 0;
+        dfsMs = 0;
+      } else if (phase === "p8") {
+        if (!Number.isFinite(cspMs)) cspMs = 0;
+        p8Ms = Math.max(Number.isFinite(p8Ms) ? p8Ms : 0, elapsedMs - cspMs);
         dfsMs = 0;
       } else if (phase === "dfs") {
         if (!Number.isFinite(cspMs)) cspMs = 0;
+        if (!Number.isFinite(p8Ms)) p8Ms = 0;
         dfsMs = Math.max(
           Number.isFinite(dfsMs) ? dfsMs : 0,
-          Math.max(0, elapsedMs - cspMs),
+          Math.max(0, elapsedMs - cspMs - p8Ms),
         );
       } else {
         if (!Number.isFinite(cspMs)) cspMs = 0;
+        if (!Number.isFinite(p8Ms)) p8Ms = 0;
         if (!Number.isFinite(dfsMs)) dfsMs = 0;
       }
       finish({ status: "timeout" });
     }, CASE_TIMEOUT_MS);
     worker.on("message", message => {
       if (Number.isFinite(message.cspMs)) cspMs = message.cspMs;
+      if (Number.isFinite(message.p8Ms)) p8Ms = message.p8Ms;
       if (Number.isFinite(message.dfsMs)) dfsMs = message.dfsMs;
       if (message.cspStats) cspStats = { ...(cspStats || {}), ...message.cspStats };
       if (message.dfsStats) dfsStats = { ...(dfsStats || {}), ...message.dfsStats };
@@ -132,7 +142,7 @@ function runCase(puzzle, budget, solverOptions = undefined) {
             : Math.round(performance.now() - started);
         }
         if (!best || cost < best.cost) {
-          best = { cost, steps: result.steps, simulateOk: true };
+          best = { cost, steps: result.steps, simulateOk: true, source: message.source, requestId: message.requestId };
           finalCost = cost;
         }
         return;
@@ -185,11 +195,13 @@ function describeMetrics(outcome) {
   return [
     `nodes=${nodes}`,
     `cspMs=${outcome.cspMs ?? "-"}`,
+    `p8Ms=${outcome.p8Ms ?? "-"}`,
     `dfsMs=${outcome.dfsMs ?? "-"}`,
     `cspPaths=${outcome.cspStats?.pathsEnumerated ?? "-"}`,
     `cspCombinations=${outcome.cspStats?.combinationIterations ?? "-"}`,
     `cspOverflow=${outcome.cspStats?.overflow ?? "-"}`,
     `cspAbort=${outcome.cspStats?.aborted ? outcome.cspStats.abortReason : "no"}`,
+    `p8=${outcome.cspStats?.p8?.terminationReason ?? "-"}`,
     `deepest=${deepest}`,
     `firstCandidateMs=${outcome.firstCandidateMs ?? "-"}`,
     `finalCost=${outcome.finalCost ?? "-"}`,
@@ -210,6 +222,79 @@ function judgeForcedTimebox(outcome, expectedAbortReason) {
   if (!outcome.best?.simulateOk || outcome.best.cost !== 9) return "DFS fallback 未返回经 simulate() 验证的 9 轨解";
   if (outcome.complete !== true || outcome.terminationReason !== "optimal-proven") {
     return `DFS fallback 未证明最优（complete=${outcome.complete === true}, terminationReason=${outcome.terminationReason || "missing"}）`;
+  }
+  return null;
+}
+
+function judgeP8Candidate(outcome) {
+  if (outcome.status === "error") return `Worker 错误：${outcome.error}`;
+  if (outcome.status === "timeout") return "P8 candidate protocol 超时";
+  if (outcome.candidateFailures.length) return "P8 发出了被权威 simulate() 拒绝的候选";
+  if (!outcome.best?.simulateOk || outcome.best.cost !== 37) return "P8 未返回经 simulate() 验证的 37 轨候选";
+  if (outcome.best.source !== "p8-structured-backbone" || outcome.best.requestId !== "canary") {
+    return "P8 候选来源或 requestId 不匹配";
+  }
+  if (outcome.cspStats?.p8?.simulateCalls !== 1 || outcome.cspStats?.p8?.candidateFound !== true) {
+    return "P8 内部 simulate() 门禁或候选统计缺失";
+  }
+  if (outcome.complete !== false || outcome.terminationReason !== "candidate-unproven-dfs-budget") {
+    return `启发式候选被误报为完备（complete=${outcome.complete === true}, terminationReason=${outcome.terminationReason || "missing"}）`;
+  }
+  return null;
+}
+
+function judgeP8DisabledFallback(outcome) {
+  if (outcome.status === "error") return `Worker 错误：${outcome.error}`;
+  if (outcome.status === "timeout") return "P8 disabled fallback 超时";
+  if (outcome.best) return "P8 关闭时仍出现结构化候选";
+  if (outcome.cspStats?.p8?.skipReason !== "disabled") return "P8 关闭状态未进入可观测统计";
+  if (!(outcome.dfsStats?.nodes > 0)) return "P8 关闭后 DFS 未接管";
+  if (outcome.complete !== false || outcome.terminationReason !== "dfs-iteration-budget") {
+    return `DFS 预算中断语义错误（complete=${outcome.complete === true}, terminationReason=${outcome.terminationReason || "missing"}）`;
+  }
+  return null;
+}
+
+function judgeP8OverBudgetFallback(outcome) {
+  if (outcome.status === "error") return `Worker 错误：${outcome.error}`;
+  if (outcome.status === "timeout") return "P8 over-budget fallback 超时";
+  if (outcome.best || outcome.candidateFailures.length) return "超预算 P8 布局不应发出 solution";
+  const p8 = outcome.cspStats?.p8;
+  if (p8?.generatedCost !== 37 || p8?.terminationReason !== "candidate-over-budget") {
+    return "P8 未在 Worker 内按 37>36 拒绝候选";
+  }
+  if (p8.simulateCalls !== 0 || p8.candidateFound !== false) return "超预算布局不应进入 simulate()/候选通道";
+  if (!(outcome.dfsStats?.nodes > 0)) return "P8 超预算后 DFS 未接管";
+  if (outcome.complete !== false || outcome.terminationReason !== "dfs-iteration-budget") {
+    return `P8 本地失败污染了顶层语义（complete=${outcome.complete === true}, terminationReason=${outcome.terminationReason || "missing"}）`;
+  }
+  return null;
+}
+
+function judgeP8NotApplicableFallback(outcome) {
+  if (outcome.status === "error") return `Worker 错误：${outcome.error}`;
+  if (outcome.status === "timeout") return "P8 not-applicable fallback 超时";
+  if (outcome.best || outcome.candidateFailures.length) return "不匹配模板的题不应出现 P8 候选";
+  const p8 = outcome.cspStats?.p8;
+  if (p8?.attempted !== true || p8?.applicable !== false || p8?.terminationReason !== "template-not-applicable") {
+    return "P8 不适用状态统计错误";
+  }
+  if (p8.simulateCalls !== 0 || !(outcome.dfsStats?.nodes > 0)) return "P8 不适用后未直接进入 DFS";
+  if (outcome.complete !== false || outcome.terminationReason !== "dfs-iteration-budget") {
+    return "P8 不适用原因污染了顶层完备性语义";
+  }
+  return null;
+}
+
+function judgeP8WorkBudgetFallback(outcome) {
+  if (outcome.status === "error") return `Worker 错误：${outcome.error}`;
+  if (outcome.status === "timeout") return "P8 work-budget fallback 超时";
+  if (outcome.best || outcome.candidateFailures.length) return "P8 工作预算中止后不应发出候选";
+  const p8 = outcome.cspStats?.p8;
+  if (p8?.truncated !== true || p8?.terminationReason !== "p8-work-budget") return "P8 工作预算中止统计错误";
+  if (p8.simulateCalls !== 0 || !(outcome.dfsStats?.nodes > 0)) return "P8 工作预算中止后 DFS 未接管";
+  if (outcome.complete !== false || outcome.terminationReason !== "dfs-iteration-budget") {
+    return "P8 工作预算原因污染了顶层完备性语义";
   }
   return null;
 }
@@ -255,4 +340,31 @@ for (const forcedCase of forcedCases) {
 }
 console.log(`\n═══════════ Protocol checks: ${forcedCases.length - protocolFailed} passed, ${protocolFailed} failed ═══════════\n`);
 failed += protocolFailed;
+
+console.log("P8 structured-backbone protocols: 5\n");
+const p8Puzzle = loadPuzzle("测试/关卡-10x11-20260722-8-6A.json");
+const p8NearNeighbor = loadPuzzle("测试/关卡-8x8-20260722-8-5B.json");
+const p8Cases = [
+  { label: "enabled candidate", options: { p8: { enabled: true }, dfsMaxIterations: 1 }, judge: judgeP8Candidate },
+  { label: "disabled fallback", options: { p8: { enabled: false }, dfsMaxIterations: 1 }, judge: judgeP8DisabledFallback },
+  { label: "over-budget fallback", options: { p8: { enabled: true }, dfsMaxIterations: 1 }, budget: 36, judge: judgeP8OverBudgetFallback },
+  { label: "work-budget fallback", options: { p8: { enabled: true, maxWorkUnits: 1 }, dfsMaxIterations: 1 }, judge: judgeP8WorkBudgetFallback },
+  { label: "near-neighbor not-applicable", puzzle: p8NearNeighbor, options: { p8: { enabled: true }, dfsMaxIterations: 1 }, judge: judgeP8NotApplicableFallback },
+];
+let p8ProtocolFailed = 0;
+for (const p8Case of p8Cases) {
+  const p8Started = performance.now();
+  const p8Outcome = await runCase(p8Case.puzzle || p8Puzzle, p8Case.budget || 37, p8Case.options);
+  const p8Elapsed = Math.round(performance.now() - p8Started);
+  const p8Problem = p8Case.judge(p8Outcome);
+  const p8Label = p8Case.puzzle ? "8×8" : "10×11";
+  if (p8Problem) {
+    p8ProtocolFailed += 1;
+    console.error(`  ✗ ${p8Label} ${p8Case.label} · ${p8Problem} · ${describeMetrics(p8Outcome)} · ${p8Elapsed}ms`);
+  } else {
+    console.log(`  ✓ ${p8Label} ${p8Case.label} · ${describeMetrics(p8Outcome)} · ${p8Elapsed}ms`);
+  }
+}
+console.log(`\n═══════════ P8 protocols: ${p8Cases.length - p8ProtocolFailed} passed, ${p8ProtocolFailed} failed ═══════════\n`);
+failed += p8ProtocolFailed;
 process.exit(failed ? 1 : 0);

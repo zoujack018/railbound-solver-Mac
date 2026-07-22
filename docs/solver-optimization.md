@@ -191,18 +191,32 @@ BFS 距离场，placed 变化时局部失效或容忍过期）。
 再拼接（段间衔接 = 端口 + 到达时间约束）。段数少、每段短，桶不易溢出。
 验证：7×7-8-5A 的 CSP 是否能产出候选；与 P1 时间盒配合。
 
-10×11-8-6A 的一次性原型补充了一个重要实施约束：不能先把每车两段做完整
-笛卡尔积再合并四车。固定 50,000 工作单元中，23,529 用于段展开、26,471
-用于 car1 的行程配对/端口合并，尚未建立 car2 域，更没有完整布局或
-`simulate()` 调用。该路径必须报告 `generator-degenerate-no-full-layout` 与
-`complete:false`，不能写 template exhausted。
+10×11-8-6A 的首版一次性原型证明了一个实施反例：先把每车两段做完整笛卡尔积
+再合并四车，在固定 50,000 工作单元内连完整布局和 `simulate()` 调用都到不了，
+只能报告 `generator-degenerate-no-full-layout` + `complete:false`。随后取得并人工
+转录公开 v3.04 解图，再用本仓库权威 `simulate()` 验证为 37 轨、64 步。该证据
+推翻了首版的 terminal-only 与固定 `N/S/N/S` 入口假设：四车都以入口 N 到达同一
+AutoSwitch；被分流的车走共享回路返回 N，回路重复次数由全局 Auto 相位和车辆
+交错自然产生。
 
-后续 P8 原型应改成终点漏斗优先的增量合并：反向枚举 platform→AutoSwitch
-段，先合并北侧 car3→car1、再合并南侧 car2→car4，逐格维护可支持全部
-entry→exit usage 的轨型域；然后才接 start→platform 段。站台固定直轨的入口
-W/E 都要保留，长度窗口由实际段长产生。每次段配对、轨型合并和完整叶都必须
-进入同一个工作预算；`fullLeaves===0` 只能说明生成器退化。该专项仍是可能丢解
-的候选生成器，失败不得参与 `search-exhausted`，成功候选仍须经过 `simulate()`。
+继续尝试“八条独立 segment”与“先枚举任意 anchor、再搜索 connector”的通用
+原型，在 500,000 工作单元内仍分别停在第三条路径和 start attachment，均为
+0 完整叶、0 次 `simulate()`。本轮因此只落地一个更窄、可回退的 P8 子项：
+**结构化主干候选 seed**。其参数化 route topology 明确来自上述已验证公开布局的
+启发，不是一般化 P8 枚举器。它仅在大型关卡满足四车、四站台、单 AutoSwitch、
+对齐起点/站台和特定相对 ownership/间距谓词时适用；从当前 puzzle 的相对坐标
+构造共享 backbone、起点 T 合流和 Auto delay loop，再以逐格 entry→exit usage
+交集选择轨型。代码不读取关卡文件名、公开图或已知 placed/cost。
+
+P8 是有意不完备的模板，不是剪枝也不是无解证明。每次只产生至多一个完整叶，
+该叶必须先过 Worker 内 `simulate()` 才能发出，调用方还会二次复核；不适用、
+构造冲突、超轨道预算、模拟拒绝或异常全部可靠进入原 DFS。其统计位于
+`cspStats.p8`，包括 applicability、cycle family、route edges、usage merges、
+full leaves、模拟次数、生成成本与终止原因。可用
+`solverOptions.p8={enabled,maxMs,maxWorkUnits}` 配置（默认 50ms / 1,000 工作单元），
+或以 `P8_BACKBONE=off` 完全关闭。无论 P8 是否找到
+候选，只有后续健全 DFS 完整走完才允许顶层 `complete:true`；否则候选保持
+`candidate-unproven-*` + `complete:false`。
 
 ### P9 多 Worker 组合策略（portfolio）
 

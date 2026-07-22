@@ -39,6 +39,9 @@ Worker 的 P1 CSP 时间盒默认开启，并在全部 CSP slack 轮次之间共
 | CSP 墙钟 | 5,000 ms | `CSP_TIMEBOX_MS` |
 | 已枚举 CSP 路径 | 100,000 | `CSP_PATH_BUDGET` |
 | CSP 组合迭代 | 5,000,000 | `CSP_COMBINATION_BUDGET` |
+| P8 结构化主干候选 | `true` | `P8_BACKBONE`（`on` / `off`） |
+| P8 软墙钟 | 50 ms | `P8_BACKBONE_MS` |
+| P8 工作单元 | 1,000 | `P8_BACKBONE_WORK_BUDGET` |
 | DFS 迭代 | 15,000,000 | `DFS_MAX_ITERATIONS` |
 
 直接调用 Worker 时，对应消息配置为：
@@ -55,6 +58,7 @@ worker.postMessage({
       maxPaths: 100000,
       maxCombinations: 5000000,
     },
+    p8: { enabled: true, maxMs: 50, maxWorkUnits: 1000 },
     dfsMaxIterations: 15000000,
   },
 });
@@ -69,6 +73,11 @@ npm run test:puzzles
 # 修改前基准：只关闭 P1 跨 slack 共享守卫
 CSP_TIMEBOX=off npm run test:puzzles
 
+# P8 结构化主干 seed 的同代码开/关对照
+P8_BACKBONE=on DFS_MAX_ITERATIONS=1 npm run test:puzzles -- "10x11"
+P8_BACKBONE=off DFS_MAX_ITERATIONS=1 npm run test:puzzles -- "10x11"
+P8_BACKBONE_WORK_BUDGET=1 DFS_MAX_ITERATIONS=1 npm run test:puzzles -- "10x11"
+
 # 定向压低某一预算，验证 CSP abort -> DFS fallback 协议
 CSP_PATH_BUDGET=1 npm run test:puzzles -- "4x8"
 CSP_COMBINATION_BUDGET=1 npm run test:puzzles -- "4x8"
@@ -77,6 +86,12 @@ CSP_COMBINATION_BUDGET=1 npm run test:puzzles -- "4x8"
 `CSP_TIMEBOX=off` 不移除原有的单次路径枚举上限、路径桶上限或 CSP beam width，
 因此它表示“P1 关闭”的可回退基准，而不是无限 CSP。环境变量预算必须是正整数；
 没有设置的字段使用 Worker 默认值。
+
+P8 是一次有界的候选模板，不是完备搜索：只在经典 CSP 因规模阈值跳过后尝试，
+并从当前 puzzle 的相对起点/站台/AutoSwitch 结构生成轨道 usage。候选在 Worker
+内先过 `simulate()`；不适用、生成冲突、超预算或模拟拒绝都记录在
+`cspStats.p8.terminationReason`，随后进入 DFS。P8 自身永远保持
+`complete:false`，不得产生 `search-exhausted`。
 
 GitHub Actions 会在 Node 20 和 22 上运行 `npm ci` 与 `npm run check`。
 
@@ -99,7 +114,8 @@ GitHub Actions 会在 Node 20 和 22 上运行 `npm ci` 与 `npm run check`。
 `test/puzzle-solver-tests.js` 通过 `test/solver-worker-node.js` 运行真实 Worker 搜索，并用
 `simulate()` 复核候选。20 秒/题的当前基线和未通过原因见 `test/SOLVER-REPORT.md`。
 
-逐题输出同时报告 `cspMs` / `dfsMs`、CSP 路径和组合计数/溢出、DFS 节点和最深
+逐题输出同时报告 `cspMs` / `p8Ms` / `dfsMs`、CSP 路径和组合计数/溢出、
+P8 pattern/usage/full-leaf/模拟计数、DFS 节点和最深
 步数、首候选时间、最终成本、`complete` 与 `terminationReason`。外层墙钟超时由
 执行器合成为 `complete:false` + `wall-clock-timeout`；找到候选后执行器仍等待
 `done`，以区分“当前候选”和“已证明最优”。

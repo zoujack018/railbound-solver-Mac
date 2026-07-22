@@ -79,11 +79,11 @@ helper-only 夹具的兼容能力。`test/format-adapter-tests.js` 会递归扫�
 
 一维测试棋盘现在允许使用 `1×N` 或 `N×1`。编辑器新建尺寸按钮仍以 2 为下限，这个放宽主要用于显示和复现规则夹具。
 
-### 本轮新增：求解测量与 P1 CSP 时间盒
+### 本轮新增：求解测量、P1 CSP 时间盒与 P8 结构化主干候选
 
 Worker 与逐题执行器现在把“找到候选”和“完成证明”分开报告。`done` 消息至少包含：
 
-- `cspMs`、`dfsMs`；
+- `cspMs`、`p8Ms`、`dfsMs`；
 - `cspStats`：路径迭代/枚举/保留数、逐车路径统计、组合迭代数、溢出状态、
   是否跳过或中止及其原因；
 - `dfsStats`：节点数、迭代上限、最深步数与状态、是否耗尽迭代预算、搜索是否完整；
@@ -100,6 +100,7 @@ solverOptions: {
     maxPaths: 100000,
     maxCombinations: 5000000,
   },
+  p8: { enabled: true, maxMs: 50, maxWorkUnits: 1000 },
 }
 ```
 
@@ -109,6 +110,12 @@ CSP 中止本身既不是无解结论，也不会单独决定整个 Worker 的 `
 beam 上限仍然生效）。详细配置和结果语义见
 [开发与测试](docs/development.md) 与
 [求解器性能优化](docs/solver-optimization.md)。
+
+P8 只在超过经典 CSP 规模阈值后尝试一次有界的四车/四站台/单 AutoSwitch
+结构模板。模板从当前 puzzle 的相对几何和端口 usage 推导铺轨，不读取文件名或
+已知答案；候选先在 Worker 内通过 `simulate()`，调用方再复核一次。它是可能漏解
+的快速候选 seed，永远不参与 `search-exhausted`：不适用或失败会进入原 DFS，
+成功后 DFS 未走完时仍是 `complete:false`。`P8_BACKBONE=off` 提供同代码回退基准。
 
 ## 3. 当前最重要的堵点
 
@@ -213,7 +220,7 @@ npm ci
 
 ```bash
 npm run dev       # http://127.0.0.1:5173/
-npm test          # 15 条格式断言 + 9 条搜索健全性金丝雀（全部亚秒级）
+npm test          # 15 条格式断言 + 10 条搜索健全性金丝雀（全部亚秒级）
 npm run test:canary  # 只跑金丝雀：已证最小值必须可解、最小值-1 必须完备无解
 npm run test:puzzles # 逐题运行 test/ 下全部 18 个 JSON
 npm run build     # Vite 生产构建和模块 Worker 打包
@@ -228,6 +235,9 @@ npm audit         # 依赖审计
 CSP_TIMEBOX=on CSP_TIMEBOX_MS=5000 npm run test:puzzles
 CSP_PATH_BUDGET=100000 CSP_COMBINATION_BUDGET=5000000 npm run test:puzzles
 CSP_TIMEBOX=off npm run test:puzzles  # 关闭 P1 共享时间盒，运行对照基准
+P8_BACKBONE=on npm run test:puzzles -- "10x11"
+P8_BACKBONE=off npm run test:puzzles -- "10x11"  # 关闭 P8 候选 seed
+P8_BACKBONE_MS=50 P8_BACKBONE_WORK_BUDGET=1000 npm run test:puzzles -- "10x11"
 DFS_MAX_ITERATIONS=15000000 npm run test:puzzles
 ```
 

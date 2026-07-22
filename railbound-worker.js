@@ -34,6 +34,11 @@ const DEFAULT_CSP_TIMEBOX = Object.freeze({
   maxPaths: 100000,
   maxCombinations: 5000000,
 });
+const DEFAULT_P8_BACKBONE = Object.freeze({
+  enabled: true,
+  maxMs: 50,
+  maxWorkUnits: 1000,
+});
 const DEFAULT_DFS_MAX_ITERATIONS = 15000000;
 
 function elapsedMs(startedAt) {
@@ -52,6 +57,39 @@ function normalizeCspTimebox(raw = {}) {
     maxMs: finiteBudget(value.maxMs, DEFAULT_CSP_TIMEBOX.maxMs),
     maxPaths: finiteBudget(value.maxPaths, DEFAULT_CSP_TIMEBOX.maxPaths),
     maxCombinations: finiteBudget(value.maxCombinations, DEFAULT_CSP_TIMEBOX.maxCombinations),
+  };
+}
+
+function normalizeP8Backbone(raw = {}) {
+  const value = raw && typeof raw === "object" ? raw : {};
+  return {
+    enabled: value.enabled !== false,
+    maxMs: finiteBudget(value.maxMs, DEFAULT_P8_BACKBONE.maxMs),
+    maxWorkUnits: finiteBudget(value.maxWorkUnits, DEFAULT_P8_BACKBONE.maxWorkUnits),
+  };
+}
+
+function createP8Stats(config) {
+  return {
+    enabled: config.enabled,
+    config: { ...config },
+    attempted: false,
+    applicable: false,
+    skipped: false,
+    skipReason: null,
+    cycleFamilies: 0,
+    layoutAttempts: 0,
+    routeEdges: 0,
+    usageMerges: 0,
+    fullLeaves: 0,
+    workUnits: 0,
+    simulateCalls: 0,
+    candidateFound: false,
+    generatedCost: null,
+    elapsedMs: 0,
+    complete: false,
+    truncated: false,
+    terminationReason: "not-run",
   };
 }
 
@@ -192,6 +230,282 @@ function emitCandidate(solution, telemetry, source) {
   const candidateMs = elapsedMs(telemetry.startedAt);
   if (telemetry.firstCandidateMs === null) telemetry.firstCandidateMs = candidateMs;
   postToMain({ type: "solution", solution, candidateMs, source });
+}
+
+/* P8 bounded pattern seed for one large four-platform/four-car funnel family.
+   Its parameterized route topology was inspired by an externally verified
+   layout, so this is deliberately a narrow pattern library entry, not a
+   general P8 enumerator. It matches relative puzzle structure and embeds no
+   file name, absolute board coordinate, literal placed track, or known cost.
+   It can never prove completeness; every materialized layout is accepted only
+   after authoritative simulate(). */
+function p8Line(a, b) {
+  const dx = Math.sign(b[0] - a[0]), dy = Math.sign(b[1] - a[1]);
+  if (dx && dy) return null;
+  const out = [[a[0], a[1]]];
+  let x = a[0], y = a[1];
+  while (x !== b[0] || y !== b[1]) {
+    x += dx; y += dy; out.push([x, y]);
+  }
+  return out;
+}
+
+function p8Chain(...points) {
+  const out = [];
+  for (let i = 0; i + 1 < points.length; i++) {
+    const segment = p8Line(points[i], points[i + 1]);
+    if (!segment) return null;
+    out.push(...(i ? segment.slice(1) : segment));
+  }
+  return out;
+}
+
+function p8Append(base, suffix) {
+  if (!base?.length || !suffix?.length) return null;
+  const end = base[base.length - 1], start = suffix[0];
+  if (end[0] !== start[0] || end[1] !== start[1]) return null;
+  return [...base, ...suffix.slice(1)];
+}
+
+function p8PlatformTarget(platform) {
+  const dir = platform.dir || platform.facing || platform.direction || "E";
+  if (!DELTA[dir]) return null;
+  return {
+    car: String(platform.car ?? platform.carName ?? platform.name ?? platform.demand ?? ""),
+    x: platform.target?.x ?? platform.x + DELTA[dir][0],
+    y: platform.target?.y ?? platform.y + DELTA[dir][1],
+  };
+}
+
+function deriveP8BackboneTemplate(pz) {
+  const reject = reason => ({ applicable: false, reason });
+  const cars = (pz.cars || []).filter(car => !isZeroCar(car)).sort((a, b) => a.y - b.y || a.x - b.x);
+  const targets = (pz.platforms || []).map(p8PlatformTarget);
+  const autos = pz.autoSwitches || pz.auto_switches || [];
+  if (cars.length !== 4 || targets.length !== 4 || targets.some(target => !target) || autos.length !== 1) {
+    return reject("requires-four-cars-platforms-and-one-auto");
+  }
+  targets.sort((a, b) => a.y - b.y || a.x - b.x);
+  const points = [
+    ...cars.map(car => [car.x, car.y]),
+    ...targets.map(target => [target.x, target.y]),
+    ...autos.map(auto => [auto.x, auto.y]),
+    pz.goal,
+  ];
+  if (points.some(point => !Array.isArray(point) || point.length < 2
+      || !Number.isInteger(point[0]) || !Number.isInteger(point[1])
+      || point[0] < 0 || point[0] >= pz.width || point[1] < 0 || point[1] >= pz.height)) {
+    return reject("invalid-or-out-of-bounds-coordinates");
+  }
+  if (new Set(cars.map(car => car.x)).size !== 1 || new Set(targets.map(target => target.x)).size !== 1) {
+    return reject("requires-aligned-starts-and-platform-targets");
+  }
+  if (new Set(cars.map(car => car.y)).size !== 4 || new Set(targets.map(target => target.y)).size !== 4) {
+    return reject("requires-distinct-start-and-platform-rows");
+  }
+  if (!cars.every(car => car.entry === "W")) return reject("requires-west-entry-starts");
+  if ((pz.tunnels || []).length || (pz.triggers || []).length || (pz.barriers || []).length
+      || (pz.tswitches || []).length || (pz.tsw_triggers || pz.tswTriggers || []).length) {
+    return reject("unsupported-dynamic-or-tunnel-features");
+  }
+
+  const [c0, c1, c2, c3] = cars;
+  const [t0, t1, t2, t3] = targets;
+  const sx = c0.x, px = t0.x, auto = autos[0];
+  const goalEntry = pz.goalEntry || pz.goal_entry;
+  const goalExit = OPPOSITE[goalEntry];
+  const autoMap = buildAutoSwitchMap([auto]);
+  const autoSwitch = autoMap[pk(auto.x, auto.y)];
+  if (!autoSwitch || !goalExit) return reject("invalid-auto-or-goal");
+
+  const cycleFamilies = [];
+  const autoTracks = [autoSwitch.track, autoSwitch.pair];
+  for (const directEntry of ALL_DIRS) {
+    const exits = autoTracks.map(track => exitPort(track, directEntry));
+    for (let directPhase = 0; directPhase < exits.length; directPhase++) {
+      const divertPhase = 1 - directPhase;
+      if (exits[directPhase] === goalExit && exits[divertPhase] && exits[divertPhase] !== goalExit) {
+        cycleFamilies.push({ directEntry, directPhase, divertPhase, divertExit: exits[divertPhase] });
+      }
+    }
+  }
+  const family = cycleFamilies.find(value => value.directEntry === "N" && value.divertExit === "S");
+  if (!family) return reject("no-canonical-auto-cycle");
+  if (auto.x + DELTA[goalExit][0] !== pz.goal[0] || auto.y + DELTA[goalExit][1] !== pz.goal[1]) {
+    return reject("auto-not-adjacent-to-goal");
+  }
+
+  const expectedOwners = [c3, c1, c2, c0].map(car => String(car.name));
+  if (targets.some((target, index) => target.car !== expectedOwners[index])) {
+    return reject("platform-ownership-pattern-mismatch");
+  }
+  if (!(c0.y === t0.y + 1 && c1.y === t1.y && c2.y === t2.y && c3.y === t3.y - 1)) {
+    return reject("platform-row-pattern-mismatch");
+  }
+  if (!(t2.y - t1.y === 2 && c3.y - c2.y === 2)) return reject("row-spacing-pattern-mismatch");
+  if (!(px - sx === 4 && auto.x - px === 4 && auto.y === t1.y + 1 && auto.y === t2.y - 1)) {
+    return reject("column-or-funnel-pattern-mismatch");
+  }
+
+  const left = sx + 1, center = sx + 2, platformLeft = px - 1;
+  const platformRight = px + 1, funnelLeft = auto.x - 1;
+  const upperGap = t1.y + 1, lowerGap = t2.y + 1;
+  const lower = p8Chain(
+    [left, t1.y], [left, upperGap], [center, upperGap], [center, t2.y], [left, t2.y],
+    [left, lowerGap], [center, lowerGap], [center, t3.y], [platformRight, t3.y],
+    [platformRight, c3.y], [platformLeft, c3.y], [platformLeft, t2.y], [funnelLeft, t2.y],
+    [funnelLeft, t1.y], [auto.x, t1.y], [auto.x, auto.y],
+  );
+  const topTour = p8Chain(
+    [left, t1.y], [platformLeft, t1.y], [platformLeft, t0.y], [platformRight, t0.y],
+    [platformRight, t1.y], [left, t1.y],
+  );
+  const prefixes = [
+    p8Chain([sx, c0.y], [platformLeft, c0.y], [platformLeft, t0.y], [platformRight, t0.y], [platformRight, t1.y], [left, t1.y]),
+    p8Chain([sx, c1.y], [platformLeft, c1.y], [platformLeft, t0.y], [platformRight, t0.y], [platformRight, t1.y], [left, t1.y]),
+    p8Chain([sx, c2.y], [center, c2.y], [center, upperGap], [left, upperGap], [left, t1.y]),
+    p8Chain([sx, c3.y], [left, c3.y], [left, c2.y], [center, c2.y], [center, upperGap], [left, upperGap], [left, t1.y]),
+  ];
+  const loop = p8Chain(
+    [auto.x, auto.y], [auto.x, lowerGap], [funnelLeft, lowerGap],
+    [funnelLeft, t1.y], [auto.x, t1.y], [auto.x, auto.y],
+  );
+  if (!lower || !topTour || prefixes.some(prefix => !prefix) || !loop) return reject("route-construction-failed");
+  const routes = new Map([
+    [String(c0.name), p8Append(prefixes[0], lower)],
+    [String(c1.name), p8Append(prefixes[1], lower)],
+    [String(c2.name), p8Append(p8Append(prefixes[2], topTour), lower)],
+    [String(c3.name), p8Append(p8Append(prefixes[3], topTour), lower)],
+  ]);
+  if ([...routes.values()].some(route => !route)) return reject("route-merge-failed");
+  return { applicable: true, cars, routes, loop, auto, family, cycleFamilies: cycleFamilies.length };
+}
+
+function p8Direction(a, b) {
+  const dx = b[0] - a[0], dy = b[1] - a[1];
+  for (const dir of ALL_DIRS) if (DELTA[dir][0] === dx && DELTA[dir][1] === dy) return dir;
+  return null;
+}
+
+function addP8Trace(usages, coordinates, initialEntry, auto) {
+  let entry = initialEntry;
+  for (let i = 0; i + 1 < coordinates.length; i++) {
+    const [x, y] = coordinates[i], exit = p8Direction(coordinates[i], coordinates[i + 1]);
+    if (!exit) return false;
+    const k = pk(x, y);
+    if (x !== auto.x || y !== auto.y) {
+      const list = usages.get(k) || [];
+      if (!list.some(value => value.entry === entry && value.exit === exit)) list.push({ entry, exit });
+      usages.set(k, list);
+    }
+    entry = OPPOSITE[exit];
+  }
+  return true;
+}
+
+function solveStructuredBackboneP8(pz, maxCost, config, stats) {
+  const startedAt = performance.now();
+  stats.attempted = true;
+  function stopForBudget(reason) {
+    stats.truncated = true;
+    stats.truncationReason = reason;
+    stats.terminationReason = reason;
+    return null;
+  }
+  function consume(count) {
+    stats.workUnits += count;
+    if (config.enabled && stats.workUnits > config.maxWorkUnits) return stopForBudget("p8-work-budget");
+    if (config.enabled && elapsedMs(startedAt) >= config.maxMs) return stopForBudget("p8-time-budget");
+    return true;
+  }
+  try {
+    const derived = deriveP8BackboneTemplate(pz);
+    if (!derived.applicable) {
+      stats.skipped = true;
+      stats.skipReason = derived.reason;
+      stats.terminationReason = "template-not-applicable";
+      return null;
+    }
+    stats.applicable = true;
+    stats.cycleFamilies = derived.cycleFamilies;
+    stats.layoutAttempts += 1;
+    const routeEdges = [...derived.routes.values()].reduce((sum, route) => sum + route.length - 1, 0)
+      + derived.loop.length - 1;
+    stats.routeEdges = routeEdges;
+    if (!consume(routeEdges)) return null;
+
+    const blanks = new Set(pz.blanks.map(([x, y]) => pk(x, y)));
+    const usable = new Set([...blanks, ...Object.keys(pz.fixed || {}), pk(derived.auto.x, derived.auto.y)]);
+    const usages = new Map();
+    for (const car of derived.cars) {
+      if (!addP8Trace(usages, derived.routes.get(String(car.name)), car.entry, derived.auto)) {
+        stats.terminationReason = "trace-construction-failed";
+        return null;
+      }
+    }
+    if (!addP8Trace(usages, derived.loop, derived.family.directEntry, derived.auto)) {
+      stats.terminationReason = "loop-construction-failed";
+      return null;
+    }
+    stats.usageMerges = [...usages.values()].reduce((sum, requirements) => sum + requirements.length, 0);
+    if (!consume(stats.usageMerges)) return null;
+
+    const placed = {};
+    for (const [k, requirements] of usages) {
+      if (!consume(1)) return null;
+      if (!usable.has(k)) {
+        stats.terminationReason = "template-cell-unavailable";
+        return null;
+      }
+      if (pz.fixed[k]) {
+        if (!requirements.every(({ entry, exit }) => exitPort(pz.fixed[k], entry) === exit)) {
+          stats.terminationReason = "fixed-track-conflict";
+          return null;
+        }
+        continue;
+      }
+      if (!blanks.has(k)) {
+        stats.terminationReason = "template-cell-not-placeable";
+        return null;
+      }
+      const options = TRACK_NAMES.filter(track =>
+        requirements.every(({ entry, exit }) => exitPort(track, entry) === exit));
+      const usedPorts = new Set(requirements.flatMap(({ entry, exit }) => [entry, exit]));
+      const choice = options.find(track => !track.startsWith("T_"))
+        || options.find(track => Object.keys(TRACKS[track]).every(port => usedPorts.has(port)));
+      if (!choice) {
+        stats.terminationReason = "track-domain-empty";
+        return null;
+      }
+      placed[k] = choice;
+    }
+    stats.fullLeaves += 1;
+
+    const cost = Object.keys(placed).length;
+    stats.generatedCost = cost;
+    if (Number.isFinite(maxCost) && cost > maxCost) {
+      stats.terminationReason = "candidate-over-budget";
+      return null;
+    }
+    if (!consume(1)) return null;
+    stats.simulateCalls += 1;
+    const result = simulate(pz, placed);
+    if (!result.ok) {
+      stats.simulateFailure = result.detail?.errorCode || result.reason || "unknown";
+      stats.terminationReason = "template-candidate-rejected";
+      return null;
+    }
+    stats.candidateFound = true;
+    stats.steps = result.steps;
+    stats.terminationReason = "candidate-unproven-structured-backbone";
+    return { ...placed, __cost: cost };
+  } catch (error) {
+    stats.error = error instanceof Error ? error.message : String(error);
+    stats.terminationReason = "template-error";
+    return null;
+  } finally {
+    stats.elapsedMs = elapsedMs(startedAt);
+  }
 }
 
 // ═══════════ Search helpers ═══════════
@@ -1080,6 +1394,7 @@ function solveDFS(pz, maxSol, minTracks, budget, seed, bs, meta, telemetry, maxI
         phase: "dfs",
         iters: 500000,
         cspMs: telemetry.cspMs || 0,
+        p8Ms: telemetry.p8Ms || 0,
         dfsMs: telemetry.dfsStartedAt ? elapsedMs(telemetry.dfsStartedAt) : (telemetry.dfsMs || 0),
         dfsInfo: progressStats,
         dfsStats: progressStats,
@@ -1340,6 +1655,7 @@ function solveDFS(pz, maxSol, minTracks, budget, seed, bs, meta, telemetry, maxI
     phase: "dfs",
     iters: 0,
     cspMs: telemetry.cspMs || 0,
+    p8Ms: telemetry.p8Ms || 0,
     dfsMs: telemetry.dfsStartedAt ? elapsedMs(telemetry.dfsStartedAt) : (telemetry.dfsMs || 0),
     dfsInfo: finalStats,
     dfsStats: finalStats,
@@ -1372,6 +1688,7 @@ self.onmessage = function (e) {
     cspStartedAt: null,
     dfsStartedAt: null,
     cspMs: 0,
+    p8Ms: 0,
     dfsMs: 0,
   };
   const minTracks = pz._minTracks !== false;
@@ -1381,8 +1698,10 @@ self.onmessage = function (e) {
   const fpz = { ...pz, blanks: useful };
   const features = puzzleHasDynamicState(pz);
   const cspGuard = createCspGuard(solverOptions.cspTimebox, telemetry);
+  const p8Config = normalizeP8Backbone(solverOptions.p8 || DEFAULT_P8_BACKBONE);
+  cspGuard.stats.p8 = createP8Stats(p8Config);
   const dfsMaxIterations = finiteBudget(solverOptions.dfsMaxIterations, DEFAULT_DFS_MAX_ITERATIONS);
-  let cspMs = 0, dfsMs = 0;
+  let cspMs = 0, p8Ms = 0, dfsMs = 0;
 
   function emptyDfsStats(reason = "not-run") {
     return {
@@ -1421,6 +1740,7 @@ self.onmessage = function (e) {
       pruned,
       alternates: accepted,
       cspMs,
+      p8Ms,
       dfsMs,
       cspStats: cspGuard.snapshot(),
       dfsStats,
@@ -1443,6 +1763,7 @@ self.onmessage = function (e) {
       phase: "dfs",
       iters: 0,
       cspMs,
+      p8Ms,
       dfsMs,
       cspStats: cspGuard.snapshot(),
       dfsStats: emptyDfsStats("running"),
@@ -1471,6 +1792,9 @@ self.onmessage = function (e) {
      collision detection. Final validation uses simulate() + zeroSafetyLookahead(). */
 
   if (useful.length <= 45 && pz.cars.length <= 8) {
+    cspGuard.stats.p8.skipped = true;
+    cspGuard.stats.p8.skipReason = p8Config.enabled ? "classic-csp-route" : "disabled";
+    cspGuard.stats.p8.terminationReason = cspGuard.stats.p8.skipReason;
     /* Global triggers can flip remote state, which static CSP cannot model.
        Auto-switches are local state, so CSP still runs and simulate validates. */
     if (features.cspUnsafe) {
@@ -1532,7 +1856,48 @@ self.onmessage = function (e) {
   }
 
   markCspSkipped("size-threshold");
-  postToMain({ type: "progress", phase: "dfs", iters: 0, cspInfo: "CSP skipped: puzzle size threshold", cspMs, dfsMs, cspStats: cspGuard.snapshot() });
-  const dfsResult = runDfs(budget);
-  finishAfterDfs(dfsResult.solutions.length > 0 ? "dfs(skip-csp)" : "no-solution", "CSP skipped: puzzle size threshold", [], dfsResult);
+  let p8Candidate = null;
+  if (!p8Config.enabled) {
+    cspGuard.stats.p8.skipped = true;
+    cspGuard.stats.p8.skipReason = "disabled";
+    cspGuard.stats.p8.terminationReason = "disabled";
+  } else {
+    postToMain({
+      type: "progress",
+      phase: "p8",
+      iters: 0,
+      cspInfo: "CSP skipped: puzzle size threshold; P8 structured backbone candidate seed",
+      cspMs,
+      p8Ms,
+      dfsMs,
+      cspStats: cspGuard.snapshot(),
+    });
+    const p8StartedAt = performance.now();
+    p8Candidate = solveStructuredBackboneP8(pz, budget, p8Config, cspGuard.stats.p8);
+    p8Ms += elapsedMs(p8StartedAt);
+    telemetry.p8Ms = p8Ms;
+    if (p8Candidate) {
+      emitCandidate(p8Candidate, telemetry, "p8-structured-backbone");
+      cspGuard.stats.p8.firstCandidateMs = telemetry.firstCandidateMs;
+    }
+  }
+  const p8Info = p8Candidate
+    ? "P8 structured backbone produced a simulate()-validated candidate"
+    : "P8 structured backbone: " + cspGuard.stats.p8.terminationReason;
+  postToMain({
+    type: "progress",
+    phase: "dfs",
+    iters: 0,
+    cspInfo: "CSP skipped: puzzle size threshold; " + p8Info,
+    cspMs,
+    p8Ms,
+    dfsMs,
+    cspStats: cspGuard.snapshot(),
+  });
+  const dfsBudget = p8Candidate ? Math.min(budget, p8Candidate.__cost) : budget;
+  const dfsResult = runDfs(dfsBudget);
+  const method = p8Candidate
+    ? (dfsResult.solutions.length > 0 ? "p8+dfs" : "p8+dfs(no-improve)")
+    : (dfsResult.solutions.length > 0 ? "dfs(skip-csp)" : "no-solution");
+  finishAfterDfs(method, "CSP skipped: puzzle size threshold; " + p8Info, p8Candidate ? [p8Candidate] : [], dfsResult);
 };
