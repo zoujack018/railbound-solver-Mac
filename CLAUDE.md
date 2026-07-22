@@ -16,7 +16,7 @@ npm ci                     # Install from lockfile
 npm run dev                # Dev server at http://127.0.0.1:5173/
 npm test                   # Format assertions + 5×5 solver regression
 npm run test:format        # Only format/adapter tests
-npm run test:puzzles       # All 15 puzzles (20s/puzzle default, set PUZZLE_TIMEOUT_MS to adjust)
+npm run test:puzzles       # All 16 puzzles (20s/puzzle default, set PUZZLE_TIMEOUT_MS to adjust)
 npm run build              # Vite production build (includes module Worker bundling)
 npm run check              # test + build (CI gate)
 npm run preview            # Preview production build at 127.0.0.1

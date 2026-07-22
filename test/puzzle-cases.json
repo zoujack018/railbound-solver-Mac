@@ -25,6 +25,11 @@
       "note": "16 轨解存在但 DFS 需要约 2-3 分钟（单 Worker、seed 0）；CSP 会先给出 17 轨超限解。缩短耗时属于后续搜索优化。"
     },
     {
+      "file": "测试/普通/关卡-6x7-20260722-8-5A.json",
+      "maxTracks": null,
+      "note": "新增普通关卡；当前单 Worker、seed 0 基线为 28 轨、27 步。"
+    },
+    {
       "file": "测试/关卡-7x4-20260722-5-3A.json",
       "maxTracks": null
     },

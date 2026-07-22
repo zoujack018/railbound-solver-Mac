@@ -40,10 +40,10 @@ const fixtureFiles = fixturePaths.map(filePath => ({
 
 console.log("\n[Format 1] Current puzzle corpus recognition");
 const documents = fixturePaths.map(filePath => parsePuzzleDocument(fs.readFileSync(filePath, "utf8")));
-assert(fixtureFiles.length === 15, "All 15 current JSON puzzle cases are discovered recursively");
+assert(fixtureFiles.length === 16, "All 16 current JSON puzzle cases are discovered recursively");
 assert(documents.every(document => document.puzzle), "Every current case is a strictly loadable puzzle");
 assert(documents.filter(document => document.isFixture).length === 3, "Three scratch cases retain their fixture envelopes");
-assert(documents.filter(document => !document.isFixture).length === 12, "Twelve 测试/ cases remain portable Puzzle documents");
+assert(documents.filter(document => !document.isFixture).length === 13, "Thirteen 测试/ cases remain portable Puzzle documents");
 
 const oneDimensionalFixture = JSON.stringify({
   id: "one_dimensional_autoswitch",

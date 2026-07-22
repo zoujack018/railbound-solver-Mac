@@ -22,7 +22,7 @@ npm run preview
 - `npm ci`：严格按 `package-lock.json` 重建依赖。
 - `npm run dev`：只监听 `127.0.0.1:5173`。
 - `npm test`：运行 15 条格式回归和 5×5 快速求解回归。
-- `npm run test:puzzles`：逐题运行 `test/` 下 15 个 JSON；默认每题 20 秒，可用 `PUZZLE_TIMEOUT_MS` 调整。
+- `npm run test:puzzles`：逐题运行 `test/` 下 16 个 JSON；默认每题 20 秒，可用 `PUZZLE_TIMEOUT_MS` 调整。
 - `npm run check`：运行快速回归和生产构建；历史细粒度规则测试恢复前仍不是完整门禁。
 
 GitHub Actions 会在 Node 20 和 22 上运行 `npm ci` 与 `npm run check`。
@@ -42,7 +42,7 @@ GitHub Actions 会在 Node 20 和 22 上运行 `npm ci` 与 `npm run check`。
 
 ## 回归测试
 
-`test/format-adapter-tests.js` 递归覆盖当前 15 个 JSON 的解包、分类、严格载入和根目录扫描。
+`test/format-adapter-tests.js` 递归覆盖当前 16 个 JSON 的解包、分类、严格载入和根目录扫描。
 `test/puzzle-solver-tests.js` 通过 `test/solver-worker-node.js` 运行真实 Worker 搜索，并用
 `simulate()` 复核候选。20 秒/题的当前基线和未通过原因见 `test/SOLVER-REPORT.md`。
 
@@ -85,4 +85,5 @@ GitHub Actions 会在 Node 20 和 22 上运行 `npm ci` 与 `npm run check`。
 
 ## 版本控制注意
 
-当前移植目录可能来自不带 `.git` 历史的文件拷贝。初始化仓库或关联远端前，应先确认上游来源和是否需要保留提交历史，避免把移植目录误建为嵌套仓库。
+当前移植目录已于 2026-07-22 建立新的 Git 基线并关联
+`zoujack018/railbound-solver-Mac`，但初始化前的原始提交历史仍不可用。若找到旧上游或备份，先比较历史与文件来源，不要直接覆盖当前仓库。
