@@ -71,10 +71,11 @@ index.html → main.jsx → railbound-solver-v3.jsx (699 lines, main editor/orch
 - Auto-switches flip after a train leaves.
 - `simulate()` and `zeroSafetyLookahead()` share collision/signal logic but still duplicate per-car movement (known tech debt).
 
-### Following and queuing (rules corrected 2026-07-22, author-confirmed)
-- Trains may follow each other one cell apart — the old TAILING rule was wrong and has been removed (evidence: real-game track limits 9/11/16 were provably unreachable with it, exactly reachable without it).
-- A train whose target cell is occupied by a non-moving train (parked, waiting, barrier-blocked, queued) waits in place; queuing cascades. Movement resolves in three phases: intended moves → fixpoint demotion → signals fire only for trains that actually moved.
-- Adjacent trains swapping cells in the same step is still allowed (open question — the real game likely crashes; no current fixture depends on it).
+### Collision semantics (rules corrected 2026-07-22, author-confirmed)
+- Trains may follow each other one cell apart while both are MOVING — the old TAILING rule was wrong and has been removed (evidence: real-game track limits 9 and 11 were provably unreachable with it, exactly reachable without it).
+- A stationary train (pickup wait, barrier-blocked, parked zero) is a WALL: moving into its cell is a CELL_COLLISION. There is NO anticipatory queuing — a queue mechanic was briefly implemented and then reverted after in-game testing (8×8-8-5B: car 4 rear-ending waiting car 3 crashes). Solutions must keep spacing via timing/routing. Regression fixture: test/scratch_test_rearend_4x2.json.
+- Adjacent trains swapping cells through the same edge in one step is a SWAP_COLLISION (confirmed via 关卡-7x7-20260722-8-5A). Shared `detectSwapCollision()` in railbound-rules.js is used by simulate, zero lookahead, DFS, and CSP quick-check. Position swaps via tunnels are NOT collisions (no physical crossing). Regression fixture: test/scratch_test_swap_3x3.json.
+- Movement resolves in three phases: intended moves → occupancy/swap collision checks → signals fire only for trains that actually moved.
 
 ### Platforms
 - Platform cells are not road; `dir` points to an adjacent road cell. The assigned car must reach that road cell to pick up passengers.

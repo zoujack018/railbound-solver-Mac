@@ -21,9 +21,13 @@ npm run preview
 
 - `npm ci`：严格按 `package-lock.json` 重建依赖。
 - `npm run dev`：只监听 `127.0.0.1:5173`。
-- `npm test`：运行 15 条格式回归和 5×5 快速求解回归。
-- `npm run test:puzzles`：逐题运行 `test/` 下 16 个 JSON；默认每题 20 秒，可用 `PUZZLE_TIMEOUT_MS` 调整。
+- `npm test`：运行 15 条格式回归和 9 条搜索健全性金丝雀（`test/canary-tests.js`，
+  已证最小轨道数必须可解、最小值减一必须完备无解；任何剪枝/规则改动的第一道门禁）。
+- `npm run test:canary`：只跑金丝雀。
+- `npm run test:puzzles`：逐题运行 `test/` 下 18 个 JSON；默认每题 20 秒，可用 `PUZZLE_TIMEOUT_MS` 调整，个别题在 `test/puzzle-cases.json` 中有独立预算。
 - `npm run check`：运行快速回归和生产构建；历史细粒度规则测试恢复前仍不是完整门禁。
+
+求解器性能优化的方法论与路线图见 [solver-optimization.md](solver-optimization.md)。
 
 GitHub Actions 会在 Node 20 和 22 上运行 `npm ci` 与 `npm run check`。
 
@@ -49,7 +53,7 @@ GitHub Actions 会在 Node 20 和 22 上运行 `npm ci` 与 `npm run check`。
 上一轮存在的 `test/solver-tests.js` 及若干专项脚本仍缺失。逐题求解回归已经恢复，
 但碰撞、机关、零号车分支和 Worker 取消协议等细粒度断言仍需从上游恢复或重建。
 
-恢复后的最低覆盖应重新包含：基础模拟和进站顺序、动态机关、零号车、碰撞/排队（跟随合法）、CSP/DFS 回退、剪枝、Puzzle 往返和 Worker request ID。
+恢复后的最低覆盖应重新包含：基础模拟和进站顺序、动态机关、零号车、碰撞语义（跟随合法、静止车=墙、对穿判撞）、CSP/DFS 回退、剪枝、Puzzle 往返和 Worker request ID。
 
 ## Puzzle 修改清单
 

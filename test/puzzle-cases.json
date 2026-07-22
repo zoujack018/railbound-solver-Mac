@@ -20,14 +20,20 @@
     },
     {
       "file": "测试/关卡-6x7-8-3A.json",
-      "maxTracks": 16,
-      "timeoutMs": 240000,
-      "note": "16 轨解存在但 DFS 需要约 2-3 分钟（单 Worker、seed 0）；CSP 会先给出 17 轨超限解。缩短耗时属于后续搜索优化。"
+      "maxTracks": 19,
+      "timeoutMs": 300000,
+      "note": "上限 19（作者 2026-07-22 修正，此前误记 16）。对穿禁令下最小 17 轨；曾找到的 16 轨解依赖第 27 步对穿，已被正确拒绝。单 Worker、seed 0 需要数分钟。"
     },
     {
-      "file": "测试/普通/关卡-6x7-20260722-8-5A.json",
+      "file": "测试/关卡-6x7-20260722-8-5A.json",
       "maxTracks": null,
-      "note": "新增普通关卡；当前单 Worker、seed 0 基线为 28 轨、27 步。"
+      "note": "新增普通关卡；当前单 Worker、seed 0 基线为 28 轨、27 步（对穿禁令前）。"
+    },
+    {
+      "file": "测试/关卡-7x7-20260722-8-5A.json",
+      "maxTracks": null,
+      "timeoutMs": 120000,
+      "note": "对穿碰撞的来源关卡：自变 T (5,3) 处 3 向下、4 向右对穿曾被误放行。单 Worker、seed 0 在对穿禁令前 60s 无候选；浏览器多 seed 可解。"
     },
     {
       "file": "测试/关卡-7x4-20260722-5-3A.json",
@@ -53,6 +59,11 @@
       "note": "静态 4 车组合题。有限 CSP 枚举失败后回退 DFS 仍预算耗尽；不能报告为无解。"
     },
     {
+      "file": "测试/关卡-8x8-20260722-8-5B.json",
+      "maxTracks": null,
+      "note": "静态 4 车 + 5 站台 + 49 可铺格。20s 内 CSP 路径枚举未完成（无 cspInfo），waypoint 路径爆炸的典型样本，对应优化方向 P1 时间盒 + P8 分段枚举（docs/solver-optimization.md）。"
+    },
+    {
       "file": "测试/关卡-8x9-20260722-6-9D.json",
       "maxTracks": null,
       "note": "4 颜色变轨 T + 1 自变 T + 全局触发器，时序状态爆炸，预算耗尽。"
@@ -73,6 +84,18 @@
       "file": "scratch_solve_8x8.json",
       "maxTracks": null,
       "note": "4 零号车 + 4 颜色变轨 T，距终点启发式无效，当前算法极限基准。"
+    },
+    {
+      "file": "scratch_test_rearend_4x2.json",
+      "maxTracks": null,
+      "hasSolution": false,
+      "note": "追撞回归夹具：车 2 第 2 步必然驶入接客等待中车 1 的格子，静止车=墙，预期 search-exhausted。"
+    },
+    {
+      "file": "scratch_test_swap_3x3.json",
+      "maxTracks": null,
+      "hasSolution": false,
+      "note": "对穿碰撞回归夹具：两车第 1 步必然对穿，铺轨无法避免，预期 search-exhausted。"
     },
     {
       "file": "scratch_test_autoswitch_6x4.json",

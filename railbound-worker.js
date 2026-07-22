@@ -10,7 +10,7 @@ import {
   effectiveTSwitchTrack, effectiveAutoSwitchTrack, effectiveTrackAt,
   tswitchTrackVariants, occupiedBarrierColors,
   buildPlatformState, platformPickupForCar, carNeedsPassengers, allPlatformsServed,
-  isZeroCar, requiredOrder, zeroSafetySteps, zeroSafetyLookahead,
+  isZeroCar, requiredOrder, zeroSafetySteps, zeroSafetyLookahead, detectSwapCollision,
   simulate, filterBlanks,
   blockedCellsForCar, carWaypoints,
   puzzleHasDynamicState,
@@ -467,7 +467,7 @@ function solveCSP(pz, maxCost, bs, meta) {
     let cars = pz.cars.map(c => ({ ...c, wait: c.wait || 0 }));
     for (let s = 1; s <= ms; s++) {
       const nxt = [], triggeredColors = [], tsTriggeredColors = [], autoUsedKeys = [], releaseTSLocks = new Set();
-      /* 排队机制（与权威 simulate 一致）：意向移动 -> 不动点降级 -> 移动者发信号 */
+      /* 三阶段推进（与权威 simulate 一致）：意向移动 -> 占格碰撞裁决 -> 移动者发信号 */
       const recs = [];
       for (const c of cars) {
         /* Parked zero car: stays put forever */
@@ -526,21 +526,7 @@ function solveCSP(pz, maxCost, bs, meta) {
         }
         recs.push({ stay: false, c, nx, ny, ne, usedTSLock, usedAutoSwitch, fromKey: k });
       }
-      /* 排队不动点 */
-      const stayCells = new Set(recs.filter(m => m.stay).map(m => pk(m.c.x, m.c.y)));
-      let qChanged = true;
-      while (qChanged) {
-        qChanged = false;
-        for (const m of recs) {
-          if (m.stay) continue;
-          if (stayCells.has(pk(m.nx, m.ny))) {
-            m.stay = true;
-            m.keep = { name: m.c.name, role: m.c.role, x: m.c.x, y: m.c.y, entry: m.c.entry, wait: 0, _queued: true };
-            stayCells.add(pk(m.c.x, m.c.y));
-            qChanged = true;
-          }
-        }
-      }
+      /* 静止车=墙：无排队降级，驶入不动车格子由占格检测判碰撞（作者实测） */
       for (const m of recs) {
         if (m.stay) { nxt.push(m.keep); continue; }
         const { c, nx, ny, ne, usedTSLock, usedAutoSwitch, fromKey } = m;
@@ -557,6 +543,7 @@ function solveCSP(pz, maxCost, bs, meta) {
         if (tm[k]) { const pkp = pk(tm[k].pair.x, tm[k].pair.y); if (occ.has(pkp)) return true; occ.add(pkp); }
       }
       /* 追尾判定已删除（作者确认）：跟随合法，追撞由排队与占格碰撞覆盖 */
+      if (detectSwapCollision(cars, nxt)) return true;
       const blocked = occupiedBarrierColors(nxt, barriers);
       cars = nxt;
       for (const name of releaseTSLocks) delete tsLocks[name];
@@ -800,6 +787,15 @@ function solveDFS(pz, maxSol, minTracks, budget, seed, bs, meta, maxIters = 1500
     }
     return ups;
   }
+  /* 热路径轨道查询：语义与 effectiveTrackAt 一致，但直接查 placed/fixed，
+     避免每车每步构造 { ...pz.fixed, ...placed } 合并对象 */
+  function effTrackAtDFS(k, tsTog, autoTog) {
+    if (_tswitchMap[k]) return effectiveTSwitchTrack(_tswitchMap[k], tsTog);
+    if (_autoSwitchMap[k]) return effectiveAutoSwitchTrack(_autoSwitchMap[k], autoTog, k);
+    const t = placed[k];
+    if (t !== undefined) return t;
+    return pz.fixed[k] !== undefined ? pz.fixed[k] : null;
+  }
 
   function dfs(cars, arrived, step, visited, toggled, tsToggled, autoToggled, tsLocks, servedPlatforms) {
     if (iters++ > MAX) return; if (iters % 500000 === 0) postToMain({ type: "progress", iters: 500000 });
@@ -914,7 +910,7 @@ function solveDFS(pz, maxSol, minTracks, budget, seed, bs, meta, maxIters = 1500
 
     const nxt = [], na = [...arrived], _trgd = [], _tsTrgd = [], _autoUsed = [], _releaseTSLocks = new Set();
     const _nServed = _hasPlatforms ? new Set(servedPlatforms) : servedPlatforms;
-    /* 排队机制（与权威 simulate 一致）：意向移动 -> 不动点降级 -> 移动者发信号 */
+    /* 三阶段推进（与权威 simulate 一致）：意向移动 -> 占格碰撞裁决 -> 移动者发信号 */
     const _recs = [];
     for (const c0 of cars) {
       const c = c0; const k = pk(c.x, c.y);
@@ -930,7 +926,7 @@ function solveDFS(pz, maxSol, minTracks, budget, seed, bs, meta, maxIters = 1500
       } else {
         /* Use effectiveTrackAt from Rule Layer — single source of truth */
         const _locked = tsLocks[c.name];
-        const t = _locked && _locked.k === k ? _locked.track : effectiveTrackAt(k, { ...pz.fixed, ...placed }, _tswitchMap, tsToggled, _autoSwitchMap, autoToggled);
+        const t = _locked && _locked.k === k ? _locked.track : effTrackAtDFS(k, tsToggled, autoToggled);
         _usedTSLock = !!(_locked && _locked.k === k);
         _usedAutoSwitch = !!_autoSwitchMap[k] && !_usedTSLock;
         /* No track or incompatible entry: always an error (zero cars need track too) */
@@ -970,7 +966,7 @@ function solveDFS(pz, maxSol, minTracks, budget, seed, bs, meta, maxIters = 1500
          已有轨且端口不匹配、又无法升级的格子只有停车世界。
          portBans 进入 visited 状态键，各世界独立推进。 */
       if (isZeroCar(c) && !tm[_nk]) {
-        const _nkTrack = effectiveTrackAt(_nk, { ...pz.fixed, ...placed }, _tswitchMap, tsToggled, _autoSwitchMap, autoToggled);
+        const _nkTrack = effTrackAtDFS(_nk, tsToggled, autoToggled);
         const _mismatch = !_nkTrack || !exitPort(_nkTrack, ne);
         const _unassignedBlank = bs.has(_nk) && !placed[_nk] && !pz.fixed[_nk] && !_tswitchMap[_nk] && !_autoSwitchMap[_nk];
         if (_mismatch && _unassignedBlank && !portBans[_nk]?.has(ne)) {
@@ -1011,21 +1007,7 @@ function solveDFS(pz, maxSol, minTracks, budget, seed, bs, meta, maxIters = 1500
       if (!cellCanAcceptDFS(nx, ny, ne, isZeroCar(c))) { visited.delete(sk); return; }
       _recs.push({ stay: false, c, nx, ny, ne, _usedTSLock, _usedAutoSwitch, fromKey: k });
     }
-    /* 排队不动点 */
-    const _stayCells = new Set(_recs.filter(m => m.stay).map(m => pk(m.c.x, m.c.y)));
-    let _qChanged = true;
-    while (_qChanged) {
-      _qChanged = false;
-      for (const m of _recs) {
-        if (m.stay) continue;
-        if (_stayCells.has(pk(m.nx, m.ny))) {
-          m.stay = true;
-          m.keep = { name: m.c.name, role: m.c.role, x: m.c.x, y: m.c.y, entry: m.c.entry, wait: 0, _queued: true };
-          _stayCells.add(pk(m.c.x, m.c.y));
-          _qChanged = true;
-        }
-      }
-    }
+    /* 静止车=墙：无排队降级，驶入不动车格子由占格检测判碰撞（作者实测） */
     for (const m of _recs) {
       if (m.stay) { nxt.push(m.keep); continue; }
       const { c, nx, ny, ne, _usedTSLock, _usedAutoSwitch, fromKey } = m;
@@ -1048,6 +1030,7 @@ function solveDFS(pz, maxSol, minTracks, budget, seed, bs, meta, maxIters = 1500
       if (tm[k]) { const pkp = pk(tm[k].pair.x, tm[k].pair.y); if (occ.has(pkp)) { visited.delete(sk); return; } occ.add(pkp); }
     }
     /* 追尾判定已删除（作者确认）：跟随合法，追撞由排队与占格碰撞覆盖 */
+    if (detectSwapCollision(cars, nxt)) { visited.delete(sk); return; }
 
     const _blocked = occupiedBarrierColors(nxt, _barMap);
     const _nt = _hasBars && _trgd.length ? { ...toggled } : toggled;

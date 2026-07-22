@@ -1,0 +1,35 @@
+{
+  "id": "scratch_test_rearend_4x2",
+  "name": "Ramming a waiting car is a collision",
+  "category": "1. 碰撞判定",
+  "description": "车 1 在 (2,0) 接客等待 2 步（站台 P1 指向该格），车 2 紧随其后，第 2 步必然驶入等待中车 1 的格子。静止车就是墙（作者实测：8×8-8-5B 中 4 追撞接客等待的 3 = 撞车，游戏无预判性排队），无可铺格可改变时序，因此本关无解。回归目的：防止'排队降级'类机制被再次引入。",
+  "puzzle": {
+    "formatVersion": 1,
+    "width": 4,
+    "height": 2,
+    "fixed": {
+      "2,0": "-"
+    },
+    "blanks": [],
+    "cars": [
+      { "name": "1", "x": 1, "y": 0, "entry": "W" },
+      { "name": "2", "x": 0, "y": 0, "entry": "W" }
+    ],
+    "goal": [3, 0],
+    "goal_entry": "W",
+    "order": ["1", "2"],
+    "max_steps": 50,
+    "tunnels": [],
+    "triggers": [],
+    "barriers": [],
+    "tsw_triggers": [],
+    "tswitches": [],
+    "autoSwitches": [],
+    "platforms": [
+      { "x": 2, "y": 1, "dir": "N", "car": "1" }
+    ]
+  },
+  "expected": {
+    "hasSolution": false
+  }
+}
