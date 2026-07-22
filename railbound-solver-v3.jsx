@@ -50,7 +50,7 @@ export default function App() {
   const [tunnelColor, setTunnelColor] = useState(TUNNEL_COLORS[0]);
   const [barrierColor, setBarrierColor] = useState(BARRIER_COLORS[0]), [barrierInitState, setBarrierInitState] = useState("closed");
   const [barrierTrack, setBarrierTrack] = useState("|");
-  const [gateMode, setGateMode] = useState("trigger");
+  const [gateMode, setGateMode] = useState("fixed");
   const [tswTriggerTrack, setTswTriggerTrack] = useState("|");
   const [tswitchTrack, setTswitchTrack] = useState("T_NE_S");
   const [autoSwitchTrack, setAutoSwitchTrack] = useState("T_NE_S");
@@ -101,9 +101,9 @@ export default function App() {
       const g = { ...p };
       if (tool === "empty") g[k] = { t: "empty" };
       else if (tool === "blank") g[k] = { t: "blank" };
-      else if (tool === "fixed") g[k] = { t: "fixed", track: trkPick };
-      else if (tool === "gate") {
-        if (gateMode === "trigger") {
+      else if (tool === "fixed") {
+        if (gateMode === "fixed") g[k] = { t: "fixed", track: trkPick };
+        else if (gateMode === "trigger") {
           const allTriggerTracks = [...BASIC_TRACKS, ...T_TRACKS];
           if (p[k]?.t === "trigger" && p[k].color === barrierColor) {
             const seq = allTriggerTracks;
@@ -168,7 +168,7 @@ export default function App() {
   function handleEnter(x, y) {
     if (!isDragging) return;
     if (dragMode === 'left') {
-      if (['blank', 'empty', 'fixed'].includes(tool)) click(x, y);
+      if (['blank', 'empty'].includes(tool) || (tool === 'fixed' && gateMode === 'fixed')) click(x, y);
     } else if (dragMode === 'right') {
       rclick({}, x, y);
     }
@@ -414,14 +414,13 @@ export default function App() {
 
   /* ═══════ Tool definitions ═══════ */
   const TOOLS = [
-    ["empty", "✕", "清除"],
-    ["blank", "◻", "铺轨区"],
-    ["fixed", "═", "固定轨"],
-    ["car", "■", "起点"],
-    ["goal", "◉", "终点"],
-    ["platform", "▣", "站台"],
-    ["tunnel", "⧆", "隧道"],
-    ["gate", "⚡", "机关"],
+    { id: "car", icon: "■", label: "起点" },
+    { id: "goal", icon: "◉", label: "终点" },
+    { id: "blank", icon: "◻", label: "铺轨区" },
+    { id: "empty", icon: "✕", label: "清除" },
+    { id: "fixed", icon: "═ ⚡", label: "固定轨 / 机关", wide: true },
+    { id: "platform", icon: "▣", label: "站台" },
+    { id: "tunnel", icon: "⧆", label: "隧道" },
   ];
 
   return (<div style={{ background: bg, minHeight: "100vh", color: tx, fontFamily: "'JetBrains Mono','Fira Code','SF Mono',monospace", fontSize: 12 }}>
@@ -434,20 +433,13 @@ export default function App() {
       <div style={{ display: "flex", gap: 12, alignItems: "flex-start", flexWrap: "wrap" }}>
         <div style={{ width: 210, flexShrink: 0, display: "flex", flexDirection: "column", gap: 7 }}>
           <Bx t="网格"><div style={{ display: "flex", gap: 6, alignItems: "center" }}><Stp v={W} s={v => resize(v, H)} mn={2} mx={12} /><span style={{ color: dm2 }}>×</span><Stp v={H} s={v => resize(W, v)} mn={2} mx={12} /></div></Bx>
-          <Bx t="工具"><div style={{ display: "grid", gridTemplateColumns: "repeat(4, minmax(0, 1fr))", gap: 3 }}>
-            {TOOLS.map(([id, ic, lb]) =>
-              <button key={id} title={lb} onClick={() => { setTool(id); setDirPick(null); setMsg(""); }} style={{ display: "flex", minWidth: 0, minHeight: 43, flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 2, padding: "3px 1px", background: tool === id ? "#2e2818" : "transparent", border: `1px solid ${tool === id ? hi : bd}`, borderRadius: 3, color: tool === id ? hi : tx, cursor: "pointer", fontSize: 9, fontFamily: "inherit", whiteSpace: "nowrap" }}><span style={{ textAlign: "center", fontSize: 14, lineHeight: 1 }}>{ic}</span>{lb}</button>)}
+          <Bx t="工具"><div style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: 4 }}>
+            {TOOLS.map(({ id, icon, label, wide }) =>
+              <button key={id} title={label} onClick={() => { setTool(id); setDirPick(null); setMsg(""); }} style={{ gridColumn: wide ? "1 / -1" : undefined, display: "flex", minWidth: 0, minHeight: 46, flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 3, padding: "5px 3px", background: tool === id ? "#2e2818" : "transparent", border: `1px solid ${tool === id ? hi : bd}`, borderRadius: 3, color: tool === id ? hi : tx, cursor: "pointer", fontSize: 10, fontFamily: "inherit", whiteSpace: "nowrap" }}><span style={{ textAlign: "center", fontSize: 15, lineHeight: 1 }}>{icon}</span>{label}</button>)}
           </div>
 
             {tool === "blank" && <div style={{ marginTop: 8 }}>
               <button onClick={doBlankAll} style={{ width: "100%", padding: "5px 7px", background: "#241f14", border: `1px solid ${bd}`, color: tx, borderRadius: 3, cursor: "pointer", fontSize: 11, fontFamily: "inherit" }}>全部空地设为可铺设</button>
-            </div>}
-
-            {/* ─── Fixed: grouped track picker ─── */}
-            {tool === "fixed" && <div style={{ marginTop: 8 }}>
-              <TrackGroup label="直线" tracks={trackGroups.straights} pick={trkPick} onPick={setTrkPick} />
-              <TrackGroup label="弯道" tracks={trackGroups.curves} pick={trkPick} onPick={setTrkPick} columns={2} />
-              <TrackGroup label="三头" tracks={trackGroups.tees} pick={trkPick} onPick={setTrkPick} columns={4} />
             </div>}
 
             {/* ─── Car: facing direction only ─── */}
@@ -492,11 +484,12 @@ export default function App() {
               <div style={{ fontSize: 9, color: dm2, marginTop: 4, lineHeight: 1.4 }}>选择火车从哪一侧进入隧道 · 每色最多2个</div>
             </div>}
 
-            {/* ─── Gate: merged trigger + barrier ─── */}
-            {tool === "gate" && <div style={{ marginTop: 8 }}>
+            {/* ─── Fixed track + mechanisms: all are track-backed cell types ─── */}
+            {tool === "fixed" && <div style={{ marginTop: 8 }}>
               <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 4, marginBottom: 7 }}>
-                {[["trigger", "◇ 触发器"], ["barrier", "▮ 关卡"], ["tswitch", "T 变轨T"], ["autoswitch", "A 自变T"]].map(([m, lb]) =>
+                {[["fixed", "═ 普通固定轨"], ["trigger", "◇ 触发器"], ["barrier", "▮ 关卡"], ["tswitch", "T 变轨T"], ["autoswitch", "A 自变T"]].map(([m, lb]) =>
                   <button key={m} onClick={() => setGateMode(m)} style={{
+                    gridColumn: m === "fixed" ? "1 / -1" : undefined,
                     minHeight: 32, fontSize: 11, fontFamily: "inherit", cursor: "pointer",
                     background: gateMode === m ? "#2e2818" : pnl,
                     color: gateMode === m ? hi : dm,
@@ -504,10 +497,15 @@ export default function App() {
                     borderRadius: 3,
                   }}>{lb}</button>)}
               </div>
-              {gateMode !== "autoswitch" && <>
+              {gateMode !== "fixed" && gateMode !== "autoswitch" && <>
                 <div style={{ fontSize: 10, color: dm, marginBottom: 3 }}>颜色</div>
                 <div style={{ display: "flex", gap: 3 }}>{BARRIER_COLORS.map(c => <button key={c} onClick={() => setBarrierColor(c)} style={{ width: 24, height: 24, borderRadius: 12, background: c, border: `2px solid ${barrierColor === c ? "#fff" : "transparent"}`, cursor: "pointer", boxShadow: barrierColor === c ? `0 0 6px ${c}` : "none" }} />)}</div>
               </>}
+              {gateMode === "fixed" && <div style={{ marginTop: 8 }}>
+                <TrackGroup label="直线" tracks={trackGroups.straights} pick={trkPick} onPick={setTrkPick} />
+                <TrackGroup label="弯道" tracks={trackGroups.curves} pick={trkPick} onPick={setTrkPick} columns={2} />
+                <TrackGroup label="三头" tracks={trackGroups.tees} pick={trkPick} onPick={setTrkPick} columns={4} />
+              </div>}
               {gateMode === "barrier" && <>
                 <div style={{ fontSize: 10, color: dm, marginBottom: 3, marginTop: 6 }}>初始状态</div>
                 <div style={{ display: "flex", gap: 2 }}>{[["closed", "🔒 关闭"], ["open", "🔓 打开"]].map(([v, lb]) =>
@@ -542,7 +540,7 @@ export default function App() {
                 </div>
               </div>}
               <div style={{ fontSize: 9, color: dm2, marginTop: 5, lineHeight: 1.4 }}>
-                {gateMode === "trigger" ? "触发器：车经过时切换同色关卡和变轨T" : gateMode === "barrier" ? "关卡：阻断/开放轨道通行" : gateMode === "tswitch" ? "变轨T轨：被同色触发器切换" : "自变T轨：无需触发器，经过后自动切换"}
+                {gateMode === "fixed" ? "普通固定轨：直接铺设不可被求解器修改的轨道" : gateMode === "trigger" ? "触发器：车经过时切换同色关卡和变轨T" : gateMode === "barrier" ? "关卡：阻断/开放轨道通行" : gateMode === "tswitch" ? "变轨T轨：被同色触发器切换" : "自变T轨：无需触发器，经过后自动切换"}
                 {gateMode === "trigger" ? " · 再点同色按底轨列表轮换" : gateMode === "barrier" ? " · 再点同色应用当前底轨" : ""}
               </div>
             </div>}
@@ -630,19 +628,26 @@ export default function App() {
               </g>;
             }))}
             {dirPick && (() => {
-              const sx = dirPick.x * CL + 1, sy = dirPick.y * CL + 1;
+              const pickerSize = 98, buttonSize = 32;
+              const boardWidth = W * CL + 2, boardHeight = H * CL + 2;
+              const targetCenterX = dirPick.x * CL + CL / 2 + 1;
+              const targetCenterY = dirPick.y * CL + CL / 2 + 1;
+              const sx = Math.min(Math.max(targetCenterX - pickerSize / 2, 2), boardWidth - pickerSize - 2);
+              const sy = Math.min(Math.max(targetCenterY - pickerSize / 2, 2), boardHeight - pickerSize - 2);
               const opts = [
-                { d: "N", x: CL / 2 - 10, y: 4 },
-                { d: "W", x: 5, y: CL / 2 - 10 },
-                { d: "E", x: CL - 25, y: CL / 2 - 10 },
-                { d: "S", x: CL / 2 - 10, y: CL - 25 },
+                { d: "N", x: 33, y: 4 },
+                { d: "W", x: 4, y: 33 },
+                { d: "E", x: 62, y: 33 },
+                { d: "S", x: 33, y: 62 },
               ];
+              const centerLabel = dirPick.tool === "car" ? "方向" : dirPick.tool === "platform" ? "道路" : "入口";
               return <g transform={`translate(${sx},${sy})`}>
-                <rect x={2} y={2} width={CL - 4} height={CL - 4} rx={5} fill="rgba(18,16,14,0.94)" stroke={hi} strokeWidth={1.4} />
-                {(dirPick.tool === "goal" || dirPick.tool === "tunnel") && <text x={CL / 2} y={CL / 2 + 1} textAnchor="middle" dominantBaseline="middle" fill={dm} fontSize={8}>入口</text>}
+                <rect x={0} y={0} width={pickerSize} height={pickerSize} rx={8} fill="rgba(18,16,14,0.97)" stroke={hi} strokeWidth={1.6} />
+                <circle cx={pickerSize / 2} cy={pickerSize / 2} r={13} fill="#17140f" stroke={bd} strokeWidth={1} />
+                <text x={pickerSize / 2} y={pickerSize / 2 + 1} textAnchor="middle" dominantBaseline="middle" fill={dm} fontSize={9}>{centerLabel}</text>
                 {opts.map(o => <g key={o.d} onMouseDown={e => { e.stopPropagation(); applyPickedDirection(o.d); }} style={{ cursor: "pointer" }}>
-                  <rect x={o.x} y={o.y} width={20} height={20} rx={3} fill="#241f14" stroke={bd} strokeWidth={1} />
-                  <text x={o.x + 10} y={o.y + 11} textAnchor="middle" dominantBaseline="middle" fill={hi} fontSize={13} fontWeight={800}>{DA[directionGlyphDirection(dirPick.tool, o.d)]}</text>
+                  <rect x={o.x} y={o.y} width={buttonSize} height={buttonSize} rx={6} fill="#2a2317" stroke={hi} strokeWidth={1.2} />
+                  <text x={o.x + buttonSize / 2} y={o.y + buttonSize / 2 + 1} textAnchor="middle" dominantBaseline="middle" fill={hi} fontSize={20} fontWeight={800}>{DA[directionGlyphDirection(dirPick.tool, o.d)]}</text>
                 </g>)}
               </g>;
             })()}
