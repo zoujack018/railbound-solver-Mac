@@ -1,6 +1,6 @@
 # Test 关卡求解报告
 
-更新日期：2026-07-22（第七版：P12 正名、执行器 portfolio 与 Barrier 基准）
+更新日期：2026-07-23（第八版：bounded portfolio proof grace）
 
 ## 结论
 
@@ -17,10 +17,11 @@ seed 0、默认每题 20 秒（6×7-8-3A 单独 300 秒、7×7-8-5A 单独 120 �
 7×7-8-7A=20；
 二者的证据边界见后文。
 
-第七版不改上述历史快照的统计口径。本轮唯一新增性能优化是逐题执行器
+第七版不改上述历史快照的统计口径，其唯一新增性能优化是逐题执行器
 `PUZZLE_WORKERS=1..16` portfolio；原 bounded pattern seed 正名为 P12，以及
-候选消息补齐 `p12SeedMs` / source，属于协议与测量修正。10×11 应记为
-`solved(p12-seed)`，关闭 P12 后的有机首候选和最优性证明仍未解决。
+候选消息补齐 `p12SeedMs` / source，属于协议与测量修正。第八版本轮唯一性能
+优化是 bounded portfolio proof grace；没有叠加异构 CSP/DFS 角色、P5 或 P7。
+10×11 应记为 `solved(p12-seed)`，关闭 P12 后的有机首候选和最优性证明仍未解决。
 
 ## 第五版：测量仪表与 `complete` 语义
 
@@ -351,14 +352,14 @@ N>1 时使用与浏览器一致的 seed 序列：index 0 为 0，之后为
   时间分开；Worker-local 候选时钟另行保留。取消线程的阶段时间按最后 phase
   快照外推并标记 `phaseTimesExact:false`，节点及部分计数仍是下界。
 
-当前快速门禁由 15 条格式断言、portfolio 契约脚本（覆盖 seed、来源标签、正例
+第七版当时的快速门禁由 15 条格式断言、portfolio 契约脚本（覆盖 seed、来源标签、正例
 快停、负例证明与冲突聚合）、10 条金丝雀、2 条 P1 fallback 和 5 条 P12
 candidate/budget/fallback 检查组成。历史 73 条细粒度规则脚本仍然缺失，未恢复、
 也没有在当前 `npm test` 中执行。
 
 ### 7×7-8-5A 同代码 A/B
 
-以下为当前 HEAD、本机单次运行；两边规则、预算和 Worker 代码相同，只改变
+以下为第七版 HEAD、本机单次运行；两边规则、预算和 Worker 代码相同，只改变
 `PUZZLE_WORKERS`。
 
 | 配置 | 总墙钟 | 首候选 | CSP / DFS | 节点 | 候选 | winner | complete / 原因 |
@@ -396,8 +397,8 @@ AutoSwitch 或 zero train，CSP 因动态机关不适用。它不进入快速 ca
 
 ### 本轮边界与下一步
 
-本轮唯一新增性能优化是 portfolio。P12 正名、候选消息补充 `p12SeedMs` / phase /
-source 和记分板来源标签是协议/测量修正，不是第二个性能优化。下一步仍坚持每轮
+第七版唯一新增性能优化是 portfolio。P12 正名、候选消息补充 `p12SeedMs` / phase /
+source 和记分板来源标签是协议/测量修正，不是第二个性能优化。后续仍坚持每轮
 单变量：
 
 1. Barrier P5②触发器/门必需性或 P7 成本下界，分别用 8-7A budget19 节点数衡量；
@@ -406,6 +407,85 @@ source 和记分板来源标签是协议/测量修正，不是第二个性能优
 
 P4 旧结果只否定 naive string-key TT；P5 旧结果只适用于 10×11 P5①。二者都不能
 被扩写为 P10 或 Barrier P5②的负结论。
+
+## 第八版：bounded portfolio proof grace（本轮唯一性能优化）
+
+### 动机与协议
+
+第七版的正例 fast-stop 在首个 `solution` 通过权威 `simulate()` 后终止全部
+Worker，连 winner 也没有机会发送随后可能已经很接近的 `done/optimal-proven`。
+这个方向是保守且健全的，但会让 N>1 小题丢失原本只差少量工作即可取得的证明。
+
+第八版只改变这一项：首候选取得所有权后仍立即取消 losers，但让 winner 在有界
+proof grace 内继续。
+
+- `PUZZLE_PROOF_GRACE_MS` 默认 100ms，接受非负整数；`0` 完整回退到第七版的
+  立即停止行为。
+- effective grace 为 `min(configured, timeout - elapsed - 10ms)`；最后 10ms
+  留作墙钟 margin，若没有余量则不启动宽限。
+- portfolio 分类器先检查同证明域、同成本，且没有 `overLimit` /
+  `candidateFailures` 污点的 `optimal-proven`，再执行 fast-candidate 降级。
+- 同域但成本不一致的最优证明先报告 `portfolio-proof-mismatch`；即使处于
+  fast-candidate 路径也不会把契约矛盾隐藏成普通未证明候选。
+- 宽限内取得上述证明时返回 `complete:true / optimal-proven`；winner 完成但未
+  证明或宽限耗尽时仍为 `complete:false / portfolio-first-valid-candidate`。
+- 候选与完备无解证据同时出现仍是 `portfolio-contract-conflict`，不会为了保留
+  候选而吞掉冲突。
+- 负例不进入 proof grace，仍等待同域 `complete:true / search-exhausted`。
+
+遥测把 configured、effective、actual wait 与 outcome 分开，字段分别为
+`proofGraceMs`、`proofGraceEffectiveMs`、`proofGraceWaitMs` 和
+`proofGraceOutcome`。配置 100ms 不代表一定等待 100ms：winner 若提前完成证明，
+actual wait 应只记录真实等待；靠近墙钟时 effective 也可能小于 configured。
+
+### 4×8、N=8：五轮中位数
+
+两边使用相同代码、相同 Worker 数和题目预算，只改变
+`PUZZLE_PROOF_GRACE_MS`。以下是各五轮的代表中位数：
+
+| 配置 | 首候选 | 总墙钟 | actual grace wait | 成本 | complete | 结果 |
+|---|---:|---:|---:|---:|---|---|
+| grace=0 | ≈143.72ms | ≈145ms | 0ms | 9 | false | portfolio-first-valid-candidate |
+| 默认 grace=100ms | ≈138.30ms | ≈153ms | ≈13.76ms | 9 | true | optimal-proven |
+
+首候选的约 5ms 反向差异属于并发启动噪声，不计作性能收益。可归因结论是：默认
+宽限没有机械等待满 100ms，而是以约 13.76ms 中位实际等待，让 winner 完成并
+保留了同域同成本的 9 轨最优性证明。
+
+### 7×7-8-5A、N=8：两组顺序 A/B
+
+为检查慢题回退，按 grace=0 → grace=100ms 的固定顺序运行两组：
+
+| 轮次 | grace=0：首候选 / 墙钟 / 成本 | grace=100：首候选 / 墙钟 / actual wait / 成本 | complete / 结果 |
+|---|---|---|---|
+| 1 | 5,433 / 5,440ms / 26 | 5,443 / 5,550ms / ≈101ms / 23 | false / portfolio-first-valid-candidate |
+| 2 | 5,474 / 5,480ms / 26 | 5,455 / 5,560ms / ≈101ms / 23 | false / portfolio-first-valid-candidate |
+
+首候选仍在约 5.43–5.47 秒，默认宽限将总墙钟增加约一个有界窗口；两轮都没有
+得到最优证明。23 轨只是 winner 在这两次额外约 100ms 搜索中观察到的更好
+incumbent，不能写成最小值、证明能力提升、剪枝收益或稳定的候选质量保证。
+确定性 CSP 仍会在 N=8 下复制；第八版没有实施异构 CSP/DFS 角色，也没有实施
+P5/P7，因此不得把任何这类潜在收益归入本轮。
+
+### 快速门禁与验收
+
+`npm test` 现在在 portfolio 纯分类器测试之外运行真实 Worker 集成门禁：
+
+1. 4×8、N=8、grace=0 保持 `complete:false` /
+   `portfolio-first-valid-candidate`，证明关闭开关可回退。
+2. 4×8、N=8 的 proof-retained 配置保持成本 9，并返回
+   `complete:true` / `optimal-proven`。
+3. 7×5 多候选题保证同一 winner 在宽限内继续拥有候选权，并最终返回
+   `complete:true` / `optimal-proven`，防止第二个候选把 winner 误取消。
+4. swap、N=4 仍返回 `complete:true` / `search-exhausted`，负例聚合不受正例
+   proof grace 影响。
+
+纯契约测试另覆盖有效匹配证明优先于 `fastCandidate`、墙钟 margin 计算以及
+候选/无解冲突降级。其余 15 条格式断言、10 条金丝雀、2 条 P1 fallback 和
+5 条 P12 协议检查保持在同一快速门禁内；历史 73 条细粒度规则脚本仍未恢复。
+
+本轮只修 proof retention 这一处性能/证明权衡。异构 portfolio、Barrier P5②、
+P7 和真正 P8 均未实现，后续必须分别作为单变量 A/B。
 
 ## 规则语义现状（均经作者确认）
 
@@ -485,9 +565,10 @@ DFS 移动阶段原每车每步以 `{ ...pz.fixed, ...placed }` 展开构造合�
 
 ## 未解决项
 
-- **7×7-8-5A**：当前单 Worker 在 77,978ms / 15M DFS 节点无候选；N=8
-  portfolio 约 5.45 秒找到 26 轨、95 步候选。它解决了执行器的快速找解路径，
-  但 `complete:false`，且单 Worker 有机搜索与证明能力没有改善。
+- **7×7-8-5A**：当前单 Worker 基线在 77,978ms / 15M DFS 节点无候选；N=8、
+  grace=0 约 5.45 秒找到 26 轨、95 步候选。第八版默认 100ms grace 的两次顺序
+  A/B 观察到 23 轨候选，但仍为 `complete:false`；它不是最小性证明，也不保证
+  候选质量会稳定改善。单 Worker 有机搜索与证明能力没有改善。
 - **7×7-8-7A**：已证明当前规则下最小 20（budget19 约36.1秒/10,199,936
   节点完备穷尽；20轨候选约1.0秒）。作为 Barrier 慢基准保留，不进快速 canary。
 - **7×8（8-7）**：4 Barrier + 颜色触发器，20s 超时。

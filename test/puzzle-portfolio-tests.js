@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import {
+  boundedProofGraceMs,
   classifyPortfolioEvidence,
   normalizeCandidateSources,
   placedTrackCost,
@@ -7,6 +8,9 @@ import {
   solvedStatusLabel,
 } from "./puzzle-portfolio.js";
 
+assert.equal(boundedProofGraceMs(100, 100, 1000), 100);
+assert.equal(boundedProofGraceMs(100, 950, 1000), 40);
+assert.equal(boundedProofGraceMs(100, 995, 1000), 0);
 assert.deepEqual(Array.from({ length: 8 }, (_, index) => portfolioSeed(index)), [
   0, 7950, 15869, 23788, 31707, 39626, 47545, 55464,
 ]);
@@ -79,6 +83,17 @@ const optimal = {
   terminationReason: "optimal-proven",
 };
 assert.equal(classifyPortfolioEvidence([candidate, optimal]).complete, true);
+assert.deepEqual(classifyPortfolioEvidence([candidate, optimal], { fastCandidate: true }), {
+  status: "solved",
+  complete: true,
+  terminationReason: "optimal-proven",
+  bestResult: candidate,
+  proofResult: optimal,
+});
+assert.equal(
+  classifyPortfolioEvidence([candidate, optimal, exhaustion], { fastCandidate: true }).terminationReason,
+  "portfolio-contract-conflict",
+);
 assert.equal(classifyPortfolioEvidence([
   candidate,
   { ...optimal, overLimit: [{ reportedCost: 10, maxTracks: 9 }] },
@@ -87,8 +102,19 @@ assert.equal(classifyPortfolioEvidence([
   { ...candidate, proofScopeKey: "scope-b" },
   { ...optimal, proofScopeKey: "scope-a" },
 ], { proofScopeKey: "scope-a" }).complete, false);
+assert.equal(classifyPortfolioEvidence([
+  { ...candidate, proofScopeKey: "scope-b" },
+  { ...optimal, proofScopeKey: "scope-a" },
+]).terminationReason, "candidate-unproven-portfolio");
 assert.equal(
   classifyPortfolioEvidence([candidate, { ...optimal, best: { cost: 10 }, finalCost: 10 }]).terminationReason,
+  "portfolio-proof-mismatch",
+);
+assert.equal(
+  classifyPortfolioEvidence([
+    candidate,
+    { ...optimal, best: { cost: 10 }, finalCost: 10 },
+  ], { fastCandidate: true }).terminationReason,
   "portfolio-proof-mismatch",
 );
 assert.deepEqual(classifyPortfolioEvidence([timeout]), {

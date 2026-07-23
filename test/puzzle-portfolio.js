@@ -1,5 +1,13 @@
 export const MAX_PUZZLE_WORKERS = 16;
 
+export function boundedProofGraceMs(configuredMs, elapsedMs, timeoutMs, marginMs = 10) {
+  const configured = Number.isFinite(configuredMs) ? Math.max(0, configuredMs) : 0;
+  const elapsed = Number.isFinite(elapsedMs) ? Math.max(0, elapsedMs) : 0;
+  const timeout = Number.isFinite(timeoutMs) ? Math.max(0, timeoutMs) : 0;
+  const margin = Number.isFinite(marginMs) ? Math.max(0, marginMs) : 0;
+  return Math.min(configured, Math.max(0, timeout - elapsed - margin));
+}
+
 export function placedTrackCost(solution) {
   return Object.keys(solution || {}).filter(key => key !== "__cost").length;
 }
@@ -80,19 +88,13 @@ export function classifyPortfolioEvidence(results, { fastCandidate = false, proo
         proofResult: exhaustionProofs[0],
       };
     }
-    if (fastCandidate) {
-      return {
-        status: "solved",
-        complete: false,
-        terminationReason: "portfolio-first-valid-candidate",
-        bestResult,
-        proofResult: null,
-      };
-    }
     const bestScopeEligible = proofScopeKey == null || bestResult.proofScopeKey === proofScopeKey;
-    const matchingProof = bestScopeEligible
-      ? optimalProofs.find(result => result.finalCost === bestResult.best.cost)
-      : null;
+    const sharesBestScope = result => proofScopeKey != null
+      || result?.proofScopeKey === bestResult.proofScopeKey;
+    const relevantOptimalProofs = bestScopeEligible
+      ? optimalProofs.filter(sharesBestScope)
+      : [];
+    const matchingProof = relevantOptimalProofs.find(result => result.finalCost === bestResult.best.cost);
     if (matchingProof) {
       return {
         status: "solved",
@@ -102,8 +104,29 @@ export function classifyPortfolioEvidence(results, { fastCandidate = false, proo
         proofResult: matchingProof,
       };
     }
-    const mismatchedProof = optimalProofs[0] || proofEligibleResults.find(result =>
-      result?.complete === true && result?.terminationReason === "optimal-proven");
+    const costMismatchedProof = relevantOptimalProofs.find(result => result.finalCost !== bestResult.best.cost);
+    if (costMismatchedProof) {
+      return {
+        status: "solved",
+        complete: false,
+        terminationReason: "portfolio-proof-mismatch",
+        bestResult,
+        proofResult: costMismatchedProof,
+      };
+    }
+    if (fastCandidate) {
+      return {
+        status: "solved",
+        complete: false,
+        terminationReason: "portfolio-first-valid-candidate",
+        bestResult,
+        proofResult: null,
+      };
+    }
+    const mismatchedProof = bestScopeEligible ? proofEligibleResults.find(result =>
+      sharesBestScope(result)
+      && result?.complete === true
+      && result?.terminationReason === "optimal-proven") : null;
     return {
       status: "solved",
       complete: false,

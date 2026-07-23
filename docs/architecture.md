@@ -114,8 +114,12 @@ Vite 在构建时将 Worker 打成独立模块资源。旧函数名 `createWorke
    整条搜索链路才可能设置 `complete:true`。
 7. Worker 发送候选解；主线程和逐题执行器都用权威 `simulate()` 再次验证。
 8. 浏览器 UI 聚合自己的多 Worker 结果。Node 逐题执行器默认只跑一个 Worker；
-   `PUZZLE_WORKERS=2..16` 才启用多 seed portfolio。正例遇到首个权威合法候选即
-   快停，其结果固定为 `complete:false`；负例必须继续等待同一证明域的完备证据。
+   `PUZZLE_WORKERS=2..16` 才启用多 seed portfolio。正例遇到首个权威合法候选后
+   立即取消 losers，winner 则在 bounded proof grace 内继续；同域同成本的有效
+   `optimal-proven` 可升级为 `complete:true`，否则仍为 `complete:false`。负例不走
+   宽限路径，必须继续等待同一证明域的完备证据。
+   同域但成本冲突的最优证明会先报告 `portfolio-proof-mismatch`，不被 fast-stop
+   状态掩盖。
 
 一个未找到候选的 Worker 只有同时满足 `complete:true` 和
 `terminationReason:"search-exhausted"`，才能声明在当前健全搜索边界内完备无解。
@@ -149,12 +153,21 @@ P12 是公开解拓扑启发的专用候选模板，不是路线图中的 P8。�
 8×8-8-5B waypoint/CSP 分段枚举。canonical Worker 配置入口为
 `solverOptions.p12Seed`。
 
-portfolio 顶层协议不会继承任意 Worker 的证明字段：正例快停合成为
-`portfolio-first-valid-candidate` + `complete:false`；负例只有收到
-`search-exhausted` + `complete:true` 才能证明无解。报告必须把 portfolio 墙钟
-与 `Σobserved+estimated` 的 CSP/P12/DFS 时间和节点分开；取消线程的阶段时间按
-最后 phase 快照外推并标记 `phaseTimesExact:false`，节点及部分计数仍是下界。
-runner 首候选/墙钟包含 Worker 启动，Worker-local 候选时钟另行保留。
+portfolio 顶层协议不会继承任意 Worker 的证明字段。正例首候选由权威
+`simulate()` 复核后取得 winner 所有权，losers 立即取消；winner 默认继续最多
+100ms，可用 `PUZZLE_PROOF_GRACE_MS=0` 回退到第七版立即停止。effective grace
+不会超过“题目剩余墙钟 - 10ms margin”。分类器先检查同证明域、同最终成本、且
+没有 over-limit / candidate-failure 污点的 `optimal-proven`，再考虑将 fast
+candidate 降级为 `portfolio-first-valid-candidate` + `complete:false`。候选与无解
+证明同时存在仍是契约冲突，不会选边。负例只有收到 `search-exhausted` +
+`complete:true` 才能证明无解。
+
+报告必须把 portfolio 墙钟与 `Σobserved+estimated` 的 CSP/P12/DFS 时间和节点
+分开；取消线程的阶段时间按最后 phase 快照外推并标记 `phaseTimesExact:false`，
+节点及部分计数仍是下界。runner 首候选/墙钟包含 Worker 启动，Worker-local
+候选时钟另行保留。proof grace 另报 configured (`proofGraceMs`)、effective
+(`proofGraceEffectiveMs`)、actual wait (`proofGraceWaitMs`) 与 outcome
+(`proofGraceOutcome`)；不能用配置值代替实际等待。
 
 `dfsStats` 记录节点/迭代数、上限、最深步数及当时状态、迭代预算是否耗尽、
 候选数量、`searchComplete` 和 DFS 自身的终止原因。顶层终止原因按以下方式解释：
@@ -167,7 +180,7 @@ runner 首候选/墙钟包含 Worker 启动，Worker-local 候选时钟另行保
 | `dfs-iteration-budget` | `false` | DFS 迭代预算耗尽且无候选 |
 | `candidate-unproven-dfs-budget` | `false` | 已有候选，但 DFS 迭代预算耗尽 |
 | `candidate-unproven-early-stop` | `false` | 已有候选，但搜索因候选数量策略提前停止 |
-| `portfolio-first-valid-candidate` | `false` | N>1 正例的首个权威合法候选快停；未证明最优 |
+| `portfolio-first-valid-candidate` | `false` | N>1 正例已有权威合法候选，但 proof grace 内未取得有效最优证明 |
 | `wall-clock-timeout` | `false` | 逐题执行器墙钟超时并终止 Worker；不是 Worker 的完备结论 |
 
 CSP 是否正常完成不会单独决定 `complete`：CSP 中止后若 DFS 完整走完，最终仍可
@@ -192,14 +205,20 @@ CSP 是否正常完成不会单独决定 `complete`：CSP 中止后若 DFS 完�
 - `simulate()` 与 `zeroSafetyLookahead()` 仍有部分单车移动逻辑重复；碰撞和世界状态推进已统一。
 - 测试使用轻量自制断言器，尚未引入覆盖率与浏览器级 Worker 测试框架。
 - JSON 逐题 Worker 执行器已经重建；当前快速门禁为 15 条格式断言、portfolio
-  契约脚本、10 条金丝雀、2 条 fallback 与 5 条 P12 协议检查。上一轮 73 条
-  细粒度规则测试仍缺失，不能写成已经恢复。
+  纯契约脚本、portfolio 集成脚本（grace=0、证明保留、winner 多候选、N=4
+  swap）、10 条金丝雀、2 条 fallback 与 5 条 P12 协议检查。上一轮 73 条细粒度
+  规则测试仍缺失，不能写成已经恢复。
 - 浏览器仍按硬件并发度（上限 16）调度；逐题执行器则以
-  `PUZZLE_WORKERS=1..16` 显式控制并默认 1。7×7-8-5A 的 N=8 首候选实测约
-  5.45 秒（26 轨/95 步、winner seed 55464），但 `complete:false`；两次代表跑的
-  Σobserved+estimated CSP 约 40.0 秒、DFS 约 3.2–3.4 秒，不能和墙钟混为一谈。
+  `PUZZLE_WORKERS=1..16` 显式控制并默认 1。7×7-8-5A 的 N=8、grace=0 基线
+  首候选实测约 5.45 秒（26 轨/95 步、winner seed 55464），但
+  `complete:false`；两次代表跑的 Σobserved+estimated CSP 约 40.0 秒、DFS 约
+  3.2–3.4 秒，不能和墙钟混为一谈。第八版默认 100ms grace 的两次顺序 A/B
+  仍约 5.44–5.46 秒取得首候选，墙钟约 5.55–5.56 秒、实际等待约 101ms；观察到
+  23 轨候选但没有证明，不能把候选质量变化写成算法保证。
 - 7×7-8-7A 是 Barrier 慢基准：34 blanks、6 barriers、3 triggers，无平台、
   AutoSwitch 或零号车；19 轨在 10,199,936 节点/约 36.1 秒完整穷尽，20 轨
   当前约 1.0 秒得到 38 步候选，因此最小值为 20。它不进入快速 canary。
-- 当前这一轮唯一新增性能优化是执行器 portfolio。P12 正名和候选消息仪表属于
-  协议/测量修正。后续每轮仍只选一个变量：Barrier P5②/P7、真正 P8、P10 Zobrist。
+- 第七版唯一新增性能优化是执行器 portfolio；第八版本轮唯一优化是 bounded
+  portfolio proof grace。未同时实施异构 CSP/DFS 角色、P5 或 P7。P12 正名和
+  候选消息仪表属于协议/测量修正。后续每轮仍只选一个变量：Barrier P5②/P7、
+  真正 P8、P10 Zobrist。

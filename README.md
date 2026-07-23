@@ -1,6 +1,6 @@
 # Railbound 求解器与编辑器
 
-> P2 交接基线，更新于 2026-07-22。
+> P2 交接基线，更新于 2026-07-23。
 >
 > 这份 README 不只介绍如何启动项目，也记录 P0/P1 移植过程、当前代码边界、已知风险、测试缺口和下一轮对话的推荐执行顺序。后续接手者应先阅读“当前最重要的堵点”和“P2 路线图”，不要直接开始大规模重构。
 
@@ -79,7 +79,7 @@ helper-only 夹具的兼容能力。`test/format-adapter-tests.js` 会递归扫�
 
 一维测试棋盘现在允许使用 `1×N` 或 `N×1`。编辑器新建尺寸按钮仍以 2 为下限，这个放宽主要用于显示和复现规则夹具。
 
-### 本轮新增：求解测量、P1 CSP 时间盒、P12 候选 seed 与执行器 portfolio
+### 求解测量、P1 CSP 时间盒、P12 候选 seed 与执行器 portfolio
 
 Worker 与逐题执行器现在把“找到候选”和“完成证明”分开报告。`done` 消息至少包含：
 
@@ -128,19 +128,28 @@ P12 明确受公开解拓扑启发，当前只匹配语料库中的 10×11-8-6A�
 的专用实现也是维护负担；若没有第二道语料命中，应重新评估保留价值。真正的
 P8 仍指 8×8-8-5B 的 waypoint/CSP 分段枚举，目前未实现。
 
-逐题执行器新增 `PUZZLE_WORKERS=1..16`。默认 `1` 完全保持原单 Worker 路径；
-正例在 `N>1` 时遇到首个权威合法候选即停止其余 Worker，诚实返回
-`complete:false` + `portfolio-first-valid-candidate`。负例不会使用快停，必须等待
-同一证明域内某个 Worker 返回 `complete:true` + `search-exhausted`。输出分别标注
-portfolio 墙钟与 `Σobserved+estimated` 阶段时间/节点。取消线程的阶段时间按最后
-phase 快照外推，并明确标记 `phaseTimesExact:false`；节点及部分计数仍只是下界。
-runner 的首候选/墙钟统一包含 Worker 启动，Worker-local 候选时钟另行保留。
-当前 HEAD 的 7×7-8-5A A/B：`N=1` 在 77,978ms 内运行 CSP 4,911.13ms、
-DFS 73,048.59ms 和 15,000,000 节点仍无候选；`N=8` 的两次代表跑均在约
-5.45 秒首候选/总墙钟找到 26 轨、95 步候选（winner index 7、seed 55464、source
-`dfs`，至少观测 43,327 节点；Σobserved+estimated CSP≈40.0 秒、DFS≈3.2–3.4 秒），仍为
-`complete:false`。收益来自 seed 覆盖并以 CPU 换延迟：确定性 CSP 被复制约八份，
-不能称作剪枝或证明能力提升。
+逐题执行器支持 `PUZZLE_WORKERS=1..16`。默认 `1` 完全保持原单 Worker 路径。
+N>1 正例的首个候选必须先通过权威 `simulate()`；随后立即取消 losers，但 winner
+可在有界证明宽限内继续搜索。`PUZZLE_PROOF_GRACE_MS` 默认 100ms，设为 `0` 可
+回退到第七版的立即停止行为。effective grace 取配置值与“距题目墙钟尚余时间减
+10ms margin”的较小者。同证明域、同成本且没有候选失败/超限证据的
+`optimal-proven` 优先于 fast-candidate 降级；宽限未取得证明时仍返回
+`complete:false` + `portfolio-first-valid-candidate`。负例不进入宽限，必须等待
+同一证明域内某个 Worker 返回 `complete:true` + `search-exhausted`。
+
+输出分别标注 portfolio 墙钟与 `Σobserved+estimated` 阶段时间/节点，并报告
+proof grace 的 configured / effective / actual wait / outcome。取消线程的阶段时间按
+最后 phase 快照外推，并明确标记 `phaseTimesExact:false`；节点及部分计数仍只是
+下界。runner 的首候选/墙钟统一包含 Worker 启动，Worker-local 候选时钟另行保留。
+
+第七版 portfolio 基线中，7×7-8-5A 的 `N=1` 在 77,978ms、15,000,000 DFS 节点
+后仍无候选；`N=8`、grace=0 的代表跑约 5.45 秒找到 26 轨、95 步候选，仍为
+`complete:false`。第八版顺序 A/B 的两轮复现为：grace=0 首候选
+5,433/5,474ms、墙钟 5,440/5,480ms、成本 26；默认 100ms 宽限首候选
+5,443/5,455ms、墙钟 5,550/5,560ms、实际等待约 101ms，并在这两轮观察到成本 23，
+但仍是 `complete:false`。成本改善只是这两次额外搜索窗口中的观察值，不构成
+最优性证明或今后运行保证。portfolio 收益仍是 seed 覆盖并以 CPU 换延迟，不能
+称作剪枝；本轮也没有实施异构 CSP、P5 或 P7。
 
 另将 7×7-8-7A 固定为 Barrier 慢基准：它有 34 个 blank、6 个 Barrier、3 个
 trigger，没有平台、AutoSwitch 或零号车。19 轨预算在 10,199,936 节点、约
@@ -148,8 +157,10 @@ trigger，没有平台、AutoSwitch 或零号车。19 轨预算在 10,199,936 �
 最小值为 20。v3.02 游戏截图中该 20 轨布局完成时库存为 0，支持题面库存 20，
 但这不是开发者逐关文字声明，证据强度需保留此限定。该题不进入快速 canary。
 
-本轮只有执行器 portfolio 属于新增性能优化；P12 正名与候选消息遥测补齐属于
-协议/测量修正。后续仍按单变量推进 Barrier P5②/P7、真正 P8、P10 Zobrist。
+第七版只有执行器 portfolio 属于新增性能优化；第八版唯一性能改动是 bounded
+portfolio proof grace。P12 正名与候选消息遥测补齐属于协议/测量修正。后续仍按
+单变量推进 Barrier P5②/P7、真正 P8、P10 Zobrist；异构 CSP/DFS portfolio 也必须
+另起一轮，不能混入 proof-grace 收益。
 P4 的旧负探针只否定 naive string-key TT；P5 的旧负探针只覆盖 10×11 P5①，
 都不能外推成 P10 或 Barrier P5②无效。
 
@@ -173,8 +184,9 @@ P4 的旧负探针只否定 naive string-key TT；P5 的旧负探针只覆盖 10
 - `test/solver-worker-node.js`：在 Node Worker Thread 中复用真实模块 Worker。
 - `test/puzzle-solver-tests.js`：递归运行逐题语料，逐候选调用权威 `simulate()` 复核，
   并为每题设置独立超时。
-- `npm test`：15 条格式断言、portfolio 契约脚本、10 条搜索金丝雀、2 条
-  CSP→DFS fallback 与 5 条 P12 协议检查。
+- `npm test`：15 条格式断言、portfolio 纯契约与集成脚本、10 条搜索金丝雀、
+  2 条 CSP→DFS fallback 与 5 条 P12 协议检查。portfolio 集成门禁覆盖
+  grace=0 回退、证明保留、winner 多候选所有权和 N=4 swap 负例聚合。
 - `npm run test:puzzles`：递归运行逐题语料；可用 `PUZZLE_TIMEOUT_MS` 调整单题预算，
   用 `PUZZLE_WORKERS=1..16` 选择单 Worker 或多 seed portfolio。
 
@@ -260,7 +272,7 @@ npm ci
 
 ```bash
 npm run dev       # http://127.0.0.1:5173/
-npm test          # 15 条格式 + portfolio 契约 + 10 金丝雀 + 2 fallback + 5 P12
+npm test          # 15 条格式 + portfolio 契约/集成 + 10 金丝雀 + 2 fallback + 5 P12
 npm run test:canary  # 只跑金丝雀：已证最小值必须可解、最小值-1 必须完备无解
 npm run test:puzzles # 递归运行逐题语料（清单文件会排除）
 npm run build     # Vite 生产构建和模块 Worker 打包
@@ -279,6 +291,8 @@ P12_PATTERN_SEED=on npm run test:puzzles -- "10x11"
 P12_PATTERN_SEED=off npm run test:puzzles -- "10x11"  # 关闭 P12 候选 seed
 P12_PATTERN_SEED_MS=50 P12_PATTERN_SEED_WORK_BUDGET=1000 npm run test:puzzles -- "10x11"
 PUZZLE_WORKERS=8 npm run test:puzzles -- "7x7-20260722-8-5A"
+PUZZLE_PROOF_GRACE_MS=0 PUZZLE_WORKERS=8 npm run test:puzzles -- "4x8" # 第七版快停回退
+PUZZLE_PROOF_GRACE_MS=100 PUZZLE_WORKERS=8 npm run test:puzzles -- "4x8"
 DFS_MAX_ITERATIONS=15000000 npm run test:puzzles
 ```
 
@@ -468,9 +482,12 @@ P2 拆分时不能只按视觉组件切文件，还应先抽出纯数据转换�
   完备无解；预算耗尽、墙钟超时和 `complete:false` 都只表示结果未定。
 
 Node 逐题执行器默认仍为单 Worker。`PUZZLE_WORKERS>1` 才启用 portfolio：正例以
-首个经 `simulate()` 复核的候选快停，负例继续等待完备证据。portfolio 的墙钟不等于
-各 Worker 工作量总和；报告中的阶段时间以 `Σobserved+estimated` 单独标出并携带
-`phaseTimesExact:false`，节点/部分计数按下界判读。
+首个经 `simulate()` 复核的候选取得 winner 所有权，立即取消 losers；winner 默认
+再获最多 100ms、且不侵占题目墙钟最后 10ms 的证明宽限。宽限内同域同成本的有效
+`optimal-proven` 可被保留，否则仍按未证明候选结束。负例继续等待完备证据。
+portfolio 的墙钟不等于各 Worker 工作量总和；报告中的阶段时间以
+`Σobserved+estimated` 单独标出并携带 `phaseTimesExact:false`，节点/部分计数按
+下界判读。
 
 ## 8. 运行时数据流
 
@@ -699,7 +716,7 @@ P2 不应以“文件拆开了”作为完成标准。建议同时满足：
 
 不要立刻重构模拟器。先阅读 test/SOLVER-REPORT.md，并继续查找上游/备份以恢复
 test/solver-tests.js 等历史细粒度规则测试。保留当前 15 条格式断言、portfolio
-契约、10 条金丝雀、2 条 fallback、5 条 P12 协议检查和 test:puzzles 的逐题
+契约与集成门禁、10 条金丝雀、2 条 fallback、5 条 P12 协议检查和 test:puzzles 的逐题
 权威复核。
 
 在完整测试和 Git/上游来源问题解决后，再按 README 的 P2.1、P2.2 顺序抽取 editor model/reducer 和统一世界 stepper。所有规则改动必须由 simulate() 回归验证；不要把测试夹具的宽松预览契约混入正式 Puzzle v1 校验。

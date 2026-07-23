@@ -21,9 +21,11 @@ npm run preview
 
 - `npm ci`：严格按 `package-lock.json` 重建依赖。
 - `npm run dev`：只监听 `127.0.0.1:5173`。
-- `npm test`：运行 15 条格式回归、portfolio 契约脚本、10 条搜索健全性金丝雀、
-  2 条 CSP→DFS fallback 与 5 条 P12 协议检查；已证最小轨道数必须可解、
-  最小值减一必须完备无解，是任何剪枝/规则改动的第一道门禁。
+- `npm test`：运行 15 条格式回归、portfolio 纯契约与集成脚本、10 条搜索健全性
+  金丝雀、2 条 CSP→DFS fallback 与 5 条 P12 协议检查；portfolio 集成脚本覆盖
+  grace=0 回退、证明保留、winner 连续候选所有权和 N=4 swap 负例聚合。已证
+  最小轨道数必须可解、最小值减一必须完备无解，是任何剪枝/规则改动的第一道
+  门禁。
 - `npm run test:canary`：只跑金丝雀。
 - `npm run test:puzzles`：递归运行逐题语料；默认每题 20 秒，可用
   `PUZZLE_TIMEOUT_MS` 调整，个别题在 `test/puzzle-cases.json` 中有独立预算；
@@ -47,6 +49,7 @@ Worker 的 P1 CSP 时间盒默认开启，并在全部 CSP slack 轮次之间共
 | P12 工作单元 | 1,000 | `P12_PATTERN_SEED_WORK_BUDGET` |
 | DFS 迭代 | 15,000,000 | `DFS_MAX_ITERATIONS` |
 | 逐题 Worker 数 | 1 | `PUZZLE_WORKERS`（1..16） |
+| N>1 winner 证明宽限 | 100 ms | `PUZZLE_PROOF_GRACE_MS`（≥0；0=关闭） |
 
 直接调用 Worker 时，对应消息配置为：
 
@@ -86,6 +89,10 @@ P12_PATTERN_SEED_WORK_BUDGET=1 DFS_MAX_ITERATIONS=1 npm run test:puzzles -- "10x
 PUZZLE_WORKERS=1 npm run test:puzzles -- "7x7-20260722-8-5A"
 PUZZLE_WORKERS=8 npm run test:puzzles -- "7x7-20260722-8-5A"
 
+# 第八版 bounded proof grace；0 是第七版立即停止的回退模式
+PUZZLE_WORKERS=8 PUZZLE_PROOF_GRACE_MS=0 npm run test:puzzles -- "4x8"
+PUZZLE_WORKERS=8 PUZZLE_PROOF_GRACE_MS=100 npm run test:puzzles -- "4x8"
+
 # 定向压低某一预算，验证 CSP abort -> DFS fallback 协议
 CSP_PATH_BUDGET=1 npm run test:puzzles -- "4x8"
 CSP_COMBINATION_BUDGET=1 npm run test:puzzles -- "4x8"
@@ -108,15 +115,24 @@ canonical 接口是 `solverOptions.p12Seed` 与上述 `P12_PATTERN_SEED*` 变量
 waypoint/CSP 分段枚举，目前未实现。
 
 `PUZZLE_WORKERS=1` 完全复用旧单 Worker 路径。`N>1` 的正例在第一个候选通过
-权威 `simulate()` 后终止其余 Worker，合成为 `complete:false` +
-`portfolio-first-valid-candidate`；它只改善找解延迟，不证明最优。负例不能快停，
-必须等待同一证明域的某个 Worker 给出 `complete:true` + `search-exhausted`。
+权威 `simulate()` 后立即取消 losers；winner 在 proof grace 内继续。默认配置为
+100ms，`PUZZLE_PROOF_GRACE_MS=0` 恢复第七版立即停止。effective grace 为配置值
+和“题目剩余墙钟减 10ms margin”中的较小值，避免证明窗口越过逐题墙钟。
+同证明域、同成本且没有 over-limit/candidate-failure 污点的 `optimal-proven`
+证据优先于 fast-candidate 分支；取得它时返回 `complete:true`，否则仍合成为
+`complete:false` + `portfolio-first-valid-candidate`。候选与完备无解证据冲突时
+继续防御性降级。负例不进入 proof grace，必须等待同一证明域的某个 Worker
+给出 `complete:true` + `search-exhausted`。
+
 portfolio 输出中的总墙钟与 `Σobserved+estimated` CSP/P12/DFS 时间、节点是不同
 指标；取消线程的阶段时间按最后 phase 快照外推，结果携带
 `phaseTimesExact:false`。节点及部分计数只能按已收到进度累计，因此仍是下界。
 runner 首候选/总墙钟统一包含 Worker 启动；Worker-local 候选时钟另行保留。
+proof grace 遥测分别记录 configured (`proofGraceMs`)、effective
+(`proofGraceEffectiveMs`)、actual (`proofGraceWaitMs`) 和 outcome
+(`proofGraceOutcome`)；报告时不可把 configured 误当 actual。
 
-当前 HEAD 的 7×7-8-5A 单次 A/B：N=1 的 CSP 4,911.13ms、DFS
+第七版 7×7-8-5A 单次 A/B：N=1 的 CSP 4,911.13ms、DFS
 73,048.59ms、15,000,000 节点，总计 77,978ms 无候选，以
 `complete:false` / `dfs-iteration-budget` 结束；N=8 的两次代表跑分别约为
 5,429/5,438ms 与 5,461/5,470ms（首候选/总墙钟），均找到 26 轨/95 步解，
@@ -126,6 +142,12 @@ phase 外推后的 Σobserved+estimated CSP 约 40.0 秒、DFS 约 3.2–3.4 秒
 改善，同时复制了确定性 CSP、总 CSP 工作约放大八倍，属于以 CPU 换延迟；不是
 剪枝收益，也不是证明能力提升。
 
+第八版 proof-grace 顺序 A/B 另跑两轮：grace=0 的首候选/墙钟分别为
+5,433/5,440ms 与 5,474/5,480ms，成本均为 26；默认 100ms 的首候选/墙钟分别为
+5,443/5,550ms 与 5,455/5,560ms，实际等待约 101ms，两轮观察到成本 23，但仍为
+`complete:false`。这个成本变化只是 winner 多跑约 100ms 时的观测，不是证明，
+也不保证其他运行会改善候选质量。
+
 Barrier 慢基准 7×7-8-7A 的结构为 34 blanks、6 barriers、3 triggers，无平台、
 AutoSwitch 或零号车。seed 0 在 19 轨预算下以 10,199,936 节点、约 36.1 秒
 完整穷尽；20 轨在当前 HEAD 约 1.0 秒得到 38 步合法候选（N=8 约 1.307 秒，
@@ -133,10 +155,12 @@ AutoSwitch 或零号车。seed 0 在 19 轨预算下以 10,199,936 节点、约 
 时剩余库存为 0，支持库存 20，但不是开发者逐关文字声明。该题只保留为慢基准，
 不加入快速 canary。
 
-本轮唯一新增性能优化是 portfolio。P12 正名和候选消息补齐遥测属于协议/测量
-修正。后续必须继续单变量：先分别验证 Barrier P5② 或 P7，再做真正 P8，最后
-按 profile 决定 P10 Zobrist。既有 P4 负探针只否定 naive string-key TT，不否定
-P10；既有 P5 负探针只覆盖 10×11 的 P5①，不覆盖尚未测试且仍优先的 Barrier P5②。
+第七版唯一新增性能优化是 portfolio；第八版本轮唯一优化是 bounded portfolio
+proof grace。没有同时实施异构 CSP/DFS 角色、P5 或 P7。P12 正名和候选消息补齐
+遥测属于协议/测量修正。后续必须继续单变量：先分别验证 Barrier P5② 或 P7，
+再做真正 P8，最后按 profile 决定 P10 Zobrist。既有 P4 负探针只否定 naive
+string-key TT，不否定 P10；既有 P5 负探针只覆盖 10×11 的 P5①，不覆盖尚未测试
+且仍优先的 Barrier P5②。
 
 GitHub Actions 会在 Node 20 和 22 上运行 `npm ci` 与 `npm run check`。
 
@@ -156,8 +180,11 @@ GitHub Actions 会在 Node 20 和 22 上运行 `npm ci` 与 `npm run check`。
 ## 回归测试
 
 `test/format-adapter-tests.js` 以 15 条断言覆盖解包、分类、严格载入和根目录扫描。
-`test/puzzle-portfolio-tests.js` 覆盖 seed 公式、候选来源标签、正例快停和负例证明
-聚合契约。
+`test/puzzle-portfolio-tests.js` 覆盖 seed 公式、候选来源标签、grace 墙钟边界、
+同域同成本最优证明优先级和负例/冲突聚合纯契约。
+`test/puzzle-portfolio-integration-tests.js` 运行真实 Worker，覆盖 grace=0 的立即
+停止回退、N>1 小题的证明保留、winner 在宽限内连续发出候选时所有权不丢失，
+以及 N=4 swap 的完备无解聚合。
 `test/puzzle-solver-tests.js` 通过 `test/solver-worker-node.js` 运行真实 Worker 搜索，并用
 `simulate()` 复核候选。20 秒/题的当前基线和未通过原因见 `test/SOLVER-REPORT.md`。
 
@@ -165,8 +192,8 @@ GitHub Actions 会在 Node 20 和 22 上运行 `npm ci` 与 `npm run check`。
 P12 pattern/usage/full-leaf/模拟计数、DFS 节点和最深
 步数、首候选时间、最终成本、`complete` 与 `terminationReason`。外层墙钟超时由
 执行器合成为 `complete:false` + `wall-clock-timeout`。单 Worker 找到候选后仍等待
-`done`，以区分“当前候选”和“已证明最优”；只有 N>1 正例 portfolio 使用上述
-首个合法候选快停契约。
+`done`，以区分“当前候选”和“已证明最优”；N>1 正例 portfolio 则在取得首个
+合法候选后取消 losers，只让 winner 进入上述 bounded proof grace。
 
 完备性判读必须使用顶层二元组：
 
@@ -179,8 +206,9 @@ P12 pattern/usage/full-leaf/模拟计数、DFS 节点和最深
 上一轮存在的 `test/solver-tests.js` 及若干专项脚本仍缺失。逐题求解回归已经恢复，
 但碰撞、机关、零号车分支和 Worker 取消协议等细粒度断言仍需从上游恢复或重建。
 
-当前可复现快速覆盖是：15 条格式断言、portfolio 契约脚本（覆盖其当前脚本内的
-种子/来源/证明聚合断言）、10 条金丝雀、2 条 P1 fallback 和 5 条 P12 协议检查。
+当前可复现快速覆盖是：15 条格式断言、portfolio 纯契约脚本、portfolio 集成脚本
+（grace=0、证明保留、winner 多候选、N=4 swap）、10 条金丝雀、2 条 P1
+fallback 和 5 条 P12 协议检查。
 历史“73 条”只是一份丢失脚本的旧记录，不得写成当前已经恢复或正在执行。
 
 恢复后的最低覆盖应重新包含：基础模拟和进站顺序、动态机关、零号车、碰撞语义（跟随合法、静止车=墙、对穿判撞）、CSP/DFS 回退、剪枝、Puzzle 往返和 Worker request ID。

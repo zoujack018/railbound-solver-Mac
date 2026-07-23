@@ -14,7 +14,7 @@ The app does four things: (1) grid-based level editing, (2) puzzle data validati
 nvm use                    # Node 20.19.0 (.nvmrc)
 npm ci                     # Install from lockfile
 npm run dev                # Dev server at http://127.0.0.1:5173/
-npm test                   # 15 format + portfolio contract + canary/protocol checks
+npm test                   # 15 format + portfolio contract/integration + canary/protocol checks
 npm run test:format        # Only format/adapter tests
 npm run test:puzzles       # Recursive per-puzzle runner (20s default; configurable)
 npm run build              # Vite production build (includes module Worker bundling)
@@ -32,6 +32,8 @@ P12_PATTERN_SEED=on npm run test:puzzles -- "10x11"
 P12_PATTERN_SEED=off npm run test:puzzles -- "10x11"  # Disable the bounded P12 seed
 P12_PATTERN_SEED_MS=50 P12_PATTERN_SEED_WORK_BUDGET=1000 npm run test:puzzles -- "10x11"
 PUZZLE_WORKERS=8 npm run test:puzzles -- "7x7-20260722-8-5A"
+PUZZLE_PROOF_GRACE_MS=0 PUZZLE_WORKERS=8 npm run test:puzzles -- "4x8"
+PUZZLE_PROOF_GRACE_MS=100 PUZZLE_WORKERS=8 npm run test:puzzles -- "4x8"
 DFS_MAX_ITERATIONS=15000000 npm run test:puzzles
 ```
 
@@ -46,14 +48,20 @@ message field is `solverOptions.p12Seed`. True P8 means the
 still-unimplemented waypoint/CSP segmented enumeration for 8×8-8-5B.
 
 `PUZZLE_WORKERS` accepts 1..16 and defaults to 1, preserving the old runner path.
-For a positive case, N>1 stops on the first authoritative legal candidate and
-returns `complete:false` / `portfolio-first-valid-candidate`. A negative case
-waits for `complete:true` / `search-exhausted` from the same proof domain. Keep
-portfolio wall time separate from summed worker phase times/nodes; cancelled
-worker phase times are extrapolated from their last phase snapshot and carry
+For a positive N>1 case, the first authoritative legal candidate immediately
+cancels loser Workers. The winner may continue for a bounded proof grace:
+`PUZZLE_PROOF_GRACE_MS` defaults to 100ms, while `0` restores the old immediate
+stop. Effective grace is capped at the remaining case wall-clock budget minus a
+10ms margin. A valid same-scope, same-cost `optimal-proven` result takes
+precedence over the fast-candidate fallback; otherwise return `complete:false` /
+`portfolio-first-valid-candidate`. Negative cases do not use the grace and wait
+for same-domain `complete:true` / `search-exhausted` evidence. Keep portfolio
+wall time separate from summed worker phase times/nodes; cancelled worker phase
+times are extrapolated from their last phase snapshot and carry
 `phaseTimesExact:false`, while nodes/partial counters remain lower bounds.
 Runner first-candidate/wall clocks include startup; Worker-local candidate time
-is retained separately.
+is retained separately. Grace telemetry exposes configured, effective, actual
+wait, and outcome fields.
 
 CI runs `npm ci && npm run check` on Node 20 and 22 via GitHub Actions.
 
@@ -143,13 +151,14 @@ nested under `cspStats.p12Seed`; a P12 miss or non-applicable template always fa
 through to DFS. P12 progress uses phase `p12-seed`; solution source is
 `p12-pattern-seed`.
 
-In the current optimization round, portfolio execution is the only new
-performance change. Renaming the old bounded seed to P12 and exposing its
-candidate telemetry are protocol/measurement corrections. Keep future work
-single-variable: Barrier P5② or P7, then true P8 segmented enumeration, then
-profile-driven P10 Zobrist/state encoding. The old P4 probe rejects only the
-naive string-key LRU, not Zobrist/P10; the old P5 negative result covers the
-10×11 P5① probe only, not Barrier P5②.
+The seventh optimization round added portfolio execution. The eighth round's
+only performance change is bounded portfolio proof grace. It does not include
+heterogeneous CSP/DFS roles, P5, or P7. Renaming the old bounded seed to P12 and
+exposing its candidate telemetry are protocol/measurement corrections. Keep
+future work single-variable: Barrier P5② or P7, then true P8 segmented
+enumeration, then profile-driven P10 Zobrist/state encoding. The old P4 probe
+rejects only the naive string-key LRU, not Zobrist/P10; the old P5 negative
+result covers the 10×11 P5① probe only, not Barrier P5②.
 
 ## Current state and caveats
 
@@ -157,21 +166,25 @@ naive string-key LRU, not Zobrist/P10; the old P5 negative result covers the
   before the 2026-07-22 repository initialization is still unavailable.
 - Historical 73 fine-grained rule tests are missing (scripts were lost); do not
   claim they were restored. Current fast coverage is 15 format assertions, the
-  portfolio contract script (seed/source/proof aggregation), 10 solver soundness
-  canaries, 2 forced CSP→DFS fallback checks, and 5 P12 candidate/budget/fallback
-  checks, plus the separately invoked per-puzzle runner.
+  portfolio pure contract script, portfolio integration checks (grace=0,
+  retained proof, repeated winner candidates, and N=4 swap aggregation), 10
+  solver soundness canaries, 2 forced CSP→DFS fallback checks, and 5 P12
+  candidate/budget/fallback checks, plus the separately invoked per-puzzle runner.
 - P12 currently matches only corpus case 10×11-8-6A. It produces a verified
   37-track/64-step candidate in a few milliseconds but remains `complete:false`;
   organic first-candidate search and optimality proof without P12 are unresolved.
   Score it as `solved(p12-seed)`. Its roughly 370 lines are explicit maintenance
   debt and should be reevaluated if no second corpus case matches.
-- Current-HEAD 7×7-8-5A A/B: N=1 uses 4,911.13ms CSP + 73,048.59ms DFS,
-  reaches 15,000,000 nodes in 77,978ms, and returns no candidate; N=8 finds a
-  26-track/95-step DFS candidate at about 5.45s first-candidate/wall time
-  (winner index 7, seed 55464), with >=43,327 observed nodes, estimated summed
-  CSP about 40.0s, and estimated summed DFS about 3.2–3.4s.
-  This is seed coverage trading CPU for latency—the deterministic CSP is copied
-  about eight times—not pruning or proof improvement.
+- Seventh-round 7×7-8-5A baseline: N=1 uses 4,911.13ms CSP + 73,048.59ms DFS,
+  reaches 15,000,000 nodes in 77,978ms, and returns no candidate; N=8 with
+  grace=0 finds a 26-track/95-step DFS candidate at about 5.45s. In the eighth
+  round's two sequential A/B pairs, grace=0 first/wall was 5,433/5,440ms and
+  5,474/5,480ms at cost 26; default 100ms grace first/wall was
+  5,443/5,550ms and 5,455/5,560ms, with about 101ms actual wait and observed
+  cost 23, still `complete:false`. That cost improvement is an observation, not
+  an optimality proof or repeatability guarantee. The portfolio remains seed
+  coverage trading CPU for latency—not pruning. No heterogeneous CSP, P5, or P7
+  change is part of this round.
 - 7×7-8-7A is a slow Barrier benchmark, not a fast canary: budget 19 exhausts
   completely at 10,199,936 nodes in about 36.1s; budget 20 finds a legal 38-step
   candidate in about 1.0s, proving minimum 20 under current rules. A v3.02 game

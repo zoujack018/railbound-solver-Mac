@@ -1,6 +1,6 @@
 # 求解器性能优化：方法论与路线图
 
-建立于 2026-07-22。适用对象：`railbound-worker.js`（CSP + DFS 搜索层）及其
+建立于 2026-07-22，更新于 2026-07-23。适用对象：`railbound-worker.js`（CSP + DFS 搜索层）及其
 调用的 `railbound-rules.js` 热路径。本文档回答三个问题：优化怎么做才不会
 破坏正确性；有哪些具体的剪枝/加速方向；每个阶段的验收目标是什么。
 
@@ -71,9 +71,10 @@
 组合迭代与溢出、DFS 节点与最深步数、`firstCandidateMs`、`finalCost`、
 `complete` 和 `terminationReason`。`progress` 提供分阶段快照，`solution` 提供
 `candidateMs` 与候选来源。逐题执行器不会在首候选出现时提前结束，而是继续等待
-`done`，并始终通过权威 `simulate()` 复核候选；唯一例外是显式
-`PUZZLE_WORKERS>1` 的正例 portfolio，它在首个权威合法候选后按协议快停，固定
-报告 `complete:false`。
+`done`，并始终通过权威 `simulate()` 复核候选；显式 `PUZZLE_WORKERS>1` 的正例
+portfolio 是受控例外：首个权威合法候选后立即取消 losers，winner 只在 bounded
+proof grace 内继续。同域同成本的有效 `optimal-proven` 可以保留；否则才降级为
+`complete:false`。`PUZZLE_PROOF_GRACE_MS=0` 可恢复第七版立即停止。
 
 停机原因的判读以 `complete` 为总闸门：
 
@@ -110,6 +111,13 @@ Worker-local 候选时钟另行保留。墙钟下降但估算总工作上升，�
 6. npm run test:puzzles 全量无回归
 7. 更新 SOLVER-REPORT.md 基线表；有新的已证最小值则同步金丝雀
 ```
+
+候选无证明时，把“预算阶梯探测”作为标准方法动作：若已有成本 C 的权威合法
+候选，在不改变规则或搜索语义的前提下，另跑 `maxTracks=C-1`（必要时继续更低档）
+的健全完整搜索。只有该预算覆盖的所有分支完整穷尽，才能与 C 成本候选合成最小性
+证明；预算耗尽、墙钟超时或任何启发式截断仍只能保持 `complete:false`。例如
+7×7-8-7A 的 20 轨候选配合 budget19 完整穷尽，才证明 min=20。这个步骤只是
+证据工作流模板，不是新剪枝、排序或性能实现，不计入任何单变量优化收益。
 
 ## 3. 待探索的剪枝与优化方向
 
@@ -256,13 +264,13 @@ P12 当前只匹配 corpus 中的 10×11-8-6A，约数毫秒内给出 37 轨、6
 
 ### P9 多 Worker 组合策略（portfolio，执行器已实现）
 
-实现：`PUZZLE_WORKERS=1..16`，默认 1 完全保留旧单 Worker 路径。N>1 的正例
-在首个候选通过权威 `simulate()` 后取消其余 Worker，返回 `complete:false` +
-`portfolio-first-valid-candidate`；负例等待同一证明域内某个 Worker 返回
-`complete:true` + `search-exhausted`。来源标签保留，P12 独占候选显示为
-`solved(p12-seed)`。纯聚合契约已有种子、来源、证明一致性与冲突测试。
+第七版基础实现：`PUZZLE_WORKERS=1..16`，默认 1 完全保留旧单 Worker 路径。
+当时 N>1 正例在首个候选通过权威 `simulate()` 后取消所有 Worker，直接返回
+`complete:false` + `portfolio-first-valid-candidate`；负例等待同一证明域内某个
+Worker 返回 `complete:true` + `search-exhausted`。来源标签保留，P12 独占候选
+显示为 `solved(p12-seed)`。纯聚合契约已有种子、来源、证明一致性与冲突测试。
 
-当前 HEAD 对 7×7-8-5A 的同代码单次 A/B：
+第七版 HEAD 对 7×7-8-5A 的同代码单次 A/B：
 
 | 配置 | 墙钟 / 首候选 | CSP / DFS 工作 | 节点 | 候选 | complete / 原因 |
 |---|---:|---:|---:|---|---|
@@ -275,8 +283,45 @@ P12 当前只匹配 corpus 中的 10×11-8-6A，约数毫秒内给出 37 轨、6
 最后已观测下界，不能与单 Worker 15M 精确终值作剪枝比率比较；本实验不证明
 节点下降、节点率提升、最优性或无解能力提升。
 
+#### 第八版：bounded portfolio proof grace（本轮唯一优化）
+
+问题：第七版收到 `solution` 后连 winner 也立即终止，小题即使只差十几毫秒就能
+完成同域最优性证明，也必然被降级为未证明候选。第八版只修这一处权衡：首候选
+仍立即取消 losers，但 winner 可继续一个很短的证明窗口。
+
+- `PUZZLE_PROOF_GRACE_MS` 默认 100ms；设为 `0` 完全回退到第七版行为。
+- effective grace = `min(configured, timeout - elapsed - 10ms)`，保留 10ms 墙钟
+  margin；没有可用余量时不启动宽限。
+- 纯分类器先匹配同证明域、同成本且无 over-limit/candidate-failure 污点的
+  `optimal-proven`，再处理 `fastCandidate`；候选与无解证明冲突仍防御性降级。
+- 遥测分开记录 configured / effective / actual wait / outcome，对应
+  `proofGraceMs`、`proofGraceEffectiveMs`、`proofGraceWaitMs`、
+  `proofGraceOutcome`。不能用 configured 代替实际墙钟成本。
+
+4×8、N=8 的同机五轮代表中位数：
+
+| 配置 | 首候选 | 总墙钟 | actual grace wait | 成本 | complete / 原因 |
+|---|---:|---:|---:|---:|---|
+| grace=0 | ≈143.72ms | ≈145ms | 0ms | 9 | false / portfolio-first-valid-candidate |
+| 默认 grace=100ms | ≈138.30ms | ≈153ms | ≈13.76ms | 9 | true / optimal-proven |
+
+首候选差异属于运行噪声；可归因收益是用约 13.76ms 实际等待保留了已经接近完成的
+9 轨最优证明，而不是配置值所写的整整 100ms。
+
+7×7-8-5A 按 off→on 顺序做了两组 A/B：
+
+| 轮次 | grace=0：首候选 / 墙钟 / 成本 | grace=100：首候选 / 墙钟 / actual wait / 成本 | complete |
+|---|---|---|---|
+| 1 | 5,433 / 5,440ms / 26 | 5,443 / 5,550ms / ≈101ms / 23 | false → false |
+| 2 | 5,474 / 5,480ms / 26 | 5,455 / 5,560ms / ≈101ms / 23 | false → false |
+
+慢题没有在宽限内取得证明；额外墙钟与 actual wait 相符。两次观察到 23 轨候选，
+只说明 winner 在这两次额外搜索窗口内改善了 incumbent，不能写成最优性证明、
+剪枝收益或未来运行的候选质量保证。本轮没有实施异构 CSP/DFS 角色、P5 或 P7，
+因此也不把八份确定性 CSP 的重复工作归入本轮收益。
+
 尚未实现的 P9② 是 Worker 间策略差异化（不同 slack、CSP/DFS 起手和排序），
-必须另起单变量实验，不能混进当前 portfolio 收益。
+必须另起单变量实验，不能混进 proof-grace 收益。
 
 ### P10 工程层（在剪枝收益榨干后再做）
 
@@ -304,27 +349,30 @@ P12 当前只匹配 corpus 中的 10×11-8-6A，约数毫秒内给出 37 轨、6
 3. **本轮已落地：只实施 P9① 执行器 portfolio**。7×7-8-5A 在
    `PUZZLE_WORKERS=8` 下约 5.45 秒得到候选；P12 正名及候选遥测补齐只是
    协议/测量修正，不计为本轮第二项性能优化。
-4. P12 当前仅命中一个 corpus 关卡；若后续没有第二命中，重新评估约 370 行
+4. **第八版已落地：只实施 bounded portfolio proof grace**。4×8、N=8 用约
+   13.76ms 中位实际等待保留最优证明；7×7-8-5A 只增加有界等待，仍未证明最优。
+   异构 CSP、P5、P7 均不属于该轮。
+5. P12 当前仅命中一个 corpus 关卡；若后续没有第二命中，重新评估约 370 行
    专用实现的维护价值。
 
 ### 中期
 
-5. **每轮单变量**验证 Barrier P5② 或 P7；先用 7×7-8-7A 的 budget19
+6. **每轮单变量**验证 Barrier P5② 或 P7；先用 7×7-8-7A 的 budget19
    10,199,936 节点证明跑作稳定基准，再看节点数而非仅墙钟。P5② 尚未测试，
    既有 10×11 P5①负结果不得外推。
-6. P2 代价迭代加深作为可选"证明模式"。
+7. P2 代价迭代加深作为可选"证明模式"。
    验收：6×7 min-17 证明 < 120s；新的已证最小值进金丝雀（目标把 6×7=17、
    scratch 7×7、9×9 等逐个钉死）。
-7. **真正 P8** CSP 分段枚举，首先针对 8×8-8-5B waypoint/站台爆炸；CSP
+8. **真正 P8** CSP 分段枚举，首先针对 8×8-8-5B waypoint/站台爆炸；CSP
    admission 如需改变必须作为另一轮单变量，不与枚举器同时归因。
 
 ### 长期
 
-8. 8×9-6-9D 与同级动态题：在 P5②③ 与 P7 分别量化后再做组合实验，建立"离线预算（5–10 分钟）
+9. 8×9-6-9D 与同级动态题：在 P5②③ 与 P7 分别量化后再做组合实验，建立"离线预算（5–10 分钟）
    下可解/不可解"的诚实基准。
-9. P10 Zobrist/紧凑状态编码按 profile 结果推进；P4 的 naive string-key LRU
+10. P10 Zobrist/紧凑状态编码按 profile 结果推进；P4 的 naive string-key LRU
    负结果不构成否定。
-10. 每轮优化后更新 `test/SOLVER-REPORT.md` 基线表；金丝雀表随已证最小值
+11. 每轮优化后更新 `test/SOLVER-REPORT.md` 基线表；金丝雀表随已证最小值
    扩充。最终愿景：全部逐题语料在默认预算内 solved 或有已证 search-exhausted，
    不存在长期 timeout 项。
 

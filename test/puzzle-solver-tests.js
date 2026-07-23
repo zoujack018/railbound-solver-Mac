@@ -7,6 +7,7 @@ import { normalizePuzzle } from "../puzzle-io.js";
 import { isPuzzleManifestFileName, PUZZLE_TEST_MANIFEST } from "../puzzle-library.js";
 import { simulate } from "../railbound-rules.js";
 import {
+  boundedProofGraceMs,
   classifyPortfolioEvidence,
   MAX_PUZZLE_WORKERS,
   normalizeCandidateSources,
@@ -19,6 +20,8 @@ const TEST_DIR = fileURLToPath(new URL("./", import.meta.url));
 const WORKER_URL = pathToFileURL(path.join(TEST_DIR, "solver-worker-node.js"));
 const defaultTimeoutMs = positiveInteger(process.env.PUZZLE_TIMEOUT_MS, 20_000);
 const puzzleWorkers = Math.min(positiveInteger(process.env.PUZZLE_WORKERS, 1), MAX_PUZZLE_WORKERS);
+const portfolioProofGraceMs = nonNegativeInteger(process.env.PUZZLE_PROOF_GRACE_MS, 100);
+const PORTFOLIO_PROOF_GRACE_MARGIN_MS = 10;
 const requestedPattern = process.argv.slice(2).join(" ");
 
 /* 结果分类（测试契约）：
@@ -34,6 +37,12 @@ const requestedPattern = process.argv.slice(2).join(" ");
 function positiveInteger(value, fallback) {
   const parsed = Number.parseInt(value, 10);
   return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function nonNegativeInteger(value, fallback) {
+  if (value == null || value === "") return fallback;
+  const parsed = Number.parseInt(value, 10);
+  return Number.isInteger(parsed) && parsed >= 0 ? parsed : fallback;
 }
 
 function optionalPositiveInteger(value) {
@@ -154,6 +163,7 @@ async function solveWorkerSession(testCase, {
   workerIndex = 0,
   signal = null,
   stopOnValidCandidate = false,
+  proofGraceMs = 0,
   onValidCandidate = null,
   proofScopeKey = null,
 } = {}) {
@@ -168,6 +178,10 @@ async function solveWorkerSession(testCase, {
   let reportedIterations = 0;
   let lastCspInfo = "";
   let phaseObservedAt = null;
+  let proofGraceTimer = null;
+  let proofGraceStartedAt = null;
+  let proofGraceEffectiveMs = 0;
+  let proofGraceOutcome = "not-entered";
   const telemetry = {
     cspMs: null,
     p12SeedMs: null,
@@ -223,15 +237,35 @@ async function solveWorkerSession(testCase, {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      clearTimeout(proofGraceTimer);
       if (signal && onAbort) signal.removeEventListener("abort", onAbort);
       worker.removeAllListeners("message");
-      const elapsedMs = performance.now() - started;
+      const finishedAt = performance.now();
+      const elapsedMs = finishedAt - started;
+      const resolvedComplete = typeof result.complete === "boolean" ? result.complete : telemetry.complete;
+      const resolvedTerminationReason = result.terminationReason || telemetry.terminationReason;
+      let resolvedProofGraceOutcome = proofGraceOutcome;
+      if (proofGraceOutcome === "running") {
+        if (resolvedComplete === true && resolvedTerminationReason === "optimal-proven") {
+          resolvedProofGraceOutcome = "optimal-proven";
+        } else if (resolvedTerminationReason === "wall-clock-timeout") {
+          resolvedProofGraceOutcome = "wall-clock-timeout";
+        } else if (resolvedTerminationReason === "candidate-unproven-worker-error") {
+          resolvedProofGraceOutcome = "worker-error";
+        } else if (resolvedTerminationReason === "candidate-unproven-worker-exit") {
+          resolvedProofGraceOutcome = "worker-exit";
+        } else {
+          resolvedProofGraceOutcome = "worker-finished-unproven";
+        }
+      }
       let resolvedCspMs = telemetry.cspMs;
       let resolvedP12SeedMs = telemetry.p12SeedMs;
       let resolvedDfsMs = telemetry.dfsMs;
       const forcedStop = result.terminationReason === "wall-clock-timeout"
         || result.terminationReason === "portfolio-cancelled"
         || result.terminationReason === "portfolio-first-valid-candidate"
+        || result.terminationReason === "candidate-unproven-worker-error"
+        || result.terminationReason === "candidate-unproven-worker-exit"
         || result.status === "error";
       if (forcedStop) {
         const phaseTailMs = Number.isFinite(phaseObservedAt)
@@ -254,6 +288,11 @@ async function solveWorkerSession(testCase, {
         dfsMs: resolvedDfsMs,
         timingExact: !forcedStop,
         timingEstimated: forcedStop && Number.isFinite(phaseObservedAt),
+        proofGraceMs,
+        proofGraceEffectiveMs,
+        proofGraceWaitMs: proofGraceStartedAt == null ? 0 : finishedAt - proofGraceStartedAt,
+        proofGraceOutcome: resolvedProofGraceOutcome,
+        proofGraceExpired: resolvedProofGraceOutcome === "expired",
         cspStatsKnown: telemetry.cspStats != null,
         dfsStatsKnown: telemetry.dfsStats != null,
         ...result,
@@ -338,24 +377,62 @@ async function solveWorkerSession(testCase, {
         } else if (cost === best.cost) {
           best.sources = normalizeCandidateSources([...(best.sources || []), source]);
         }
-        if (typeof onValidCandidate === "function") {
-          onValidCandidate({
-            workerIndex,
-            seed,
-            cost,
-            steps: result.steps,
-            placed,
-            source,
-          });
-        }
+        const ownsFastCandidate = typeof onValidCandidate !== "function" || onValidCandidate({
+          workerIndex,
+          seed,
+          cost,
+          steps: result.steps,
+          placed,
+          source,
+        }) !== false;
+        if (settled) return;
         if (stopOnValidCandidate) {
-          finish({
+          if (!ownsFastCandidate) {
+            finish({
+              status: "cancelled",
+              method: "portfolio-cancelled",
+              reason: "另一个 Worker 已先取得首候选所有权，当前 Worker 被取消",
+              complete: false,
+              terminationReason: "portfolio-cancelled",
+            });
+            return;
+          }
+          const finishWithoutProof = () => finish({
             status: "solved",
             method: "portfolio-first-valid",
-            reason: "多种子组合找到首个合法候选；已提前停止，未证明最优",
+            reason: proofGraceOutcome === "expired"
+              ? `多种子组合找到首个合法候选；${proofGraceEffectiveMs}ms 证明宽限耗尽，未证明最优`
+              : (proofGraceOutcome === "wall-margin"
+                  ? "多种子组合找到首个合法候选；墙钟余量不足以启动证明宽限，未证明最优"
+                  : "多种子组合找到首个合法候选；已提前停止，未证明最优"),
             complete: false,
             terminationReason: "portfolio-first-valid-candidate",
           });
+          if (proofGraceMs > 0) {
+            if (proofGraceTimer == null) {
+              const graceStartedAt = performance.now();
+              proofGraceEffectiveMs = boundedProofGraceMs(
+                proofGraceMs,
+                graceStartedAt - started,
+                testCase.timeoutMs,
+                PORTFOLIO_PROOF_GRACE_MARGIN_MS,
+              );
+              if (proofGraceEffectiveMs > 0) {
+                proofGraceStartedAt = graceStartedAt;
+                proofGraceOutcome = "running";
+                proofGraceTimer = setTimeout(() => {
+                  proofGraceOutcome = "expired";
+                  finishWithoutProof();
+                }, proofGraceEffectiveMs);
+              } else {
+                proofGraceOutcome = "wall-margin";
+                finishWithoutProof();
+              }
+            }
+          } else {
+            proofGraceOutcome = "disabled";
+            finishWithoutProof();
+          }
           return;
         }
         /* Do not finish on the first candidate. The authoritative runner keeps
@@ -427,19 +504,31 @@ async function solveWorkerSession(testCase, {
         });
       }
     });
-    worker.on("error", error => finish({
-      status: "error",
-      reason: error.stack || error.message,
-      complete: false,
-      terminationReason: "worker-error",
-    }));
-    worker.on("exit", code => {
-      if (!settled && code !== 0) finish({
-        status: "error",
-        reason: `Worker 异常退出 (${code})`,
+    worker.on("error", error => {
+      const retainGraceCandidate = Boolean(best && proofGraceStartedAt != null);
+      finish({
+        status: retainGraceCandidate ? "solved" : "error",
+        method: retainGraceCandidate ? "validated-candidate" : undefined,
+        reason: retainGraceCandidate
+          ? `已保留合法候选，但 Worker 在证明宽限内异常：${error.message}`
+          : (error.stack || error.message),
         complete: false,
-        terminationReason: "worker-exit",
+        terminationReason: retainGraceCandidate ? "candidate-unproven-worker-error" : "worker-error",
       });
+    });
+    worker.on("exit", code => {
+      if (!settled && code !== 0) {
+        const retainGraceCandidate = Boolean(best && proofGraceStartedAt != null);
+        finish({
+          status: retainGraceCandidate ? "solved" : "error",
+          method: retainGraceCandidate ? "validated-candidate" : undefined,
+          reason: retainGraceCandidate
+            ? `已保留合法候选，但 Worker 在证明宽限内异常退出 (${code})`
+            : `Worker 异常退出 (${code})`,
+          complete: false,
+          terminationReason: retainGraceCandidate ? "candidate-unproven-worker-exit" : "worker-exit",
+        });
+      }
     });
 
     if (!settled) {
@@ -493,6 +582,11 @@ function aggregatePortfolioTelemetry(results, wallMs, firstCandidateWallMs) {
     p12SeedTermination: result.cspStats?.p12Seed?.terminationReason || null,
     timingExact: result.timingExact === true,
     timingEstimated: result.timingEstimated === true,
+    proofGraceMs: result.proofGraceMs ?? 0,
+    proofGraceEffectiveMs: result.proofGraceEffectiveMs ?? 0,
+    proofGraceWaitMs: result.proofGraceWaitMs ?? 0,
+    proofGraceOutcome: result.proofGraceOutcome || "not-entered",
+    proofGraceExpired: result.proofGraceExpired === true,
     cspStatsKnown: result.cspStatsKnown === true,
     dfsStatsKnown: result.dfsStatsKnown === true,
   }));
@@ -508,7 +602,9 @@ function aggregatePortfolioTelemetry(results, wallMs, firstCandidateWallMs) {
   }
   const totalNodesObserved = finiteSum(workerStats.map(worker => worker.nodes)) ?? 0;
   const cancelledWorkers = workerStats.filter(worker => worker.status === "cancelled").length;
-  const erroredWorkers = workerStats.filter(worker => worker.status === "error").length;
+  const erroredWorkers = workerStats.filter(worker => worker.status === "error"
+    || worker.terminationReason === "candidate-unproven-worker-error"
+    || worker.terminationReason === "candidate-unproven-worker-exit").length;
   const estimatedTimingWorkers = workerStats.filter(worker => worker.timingEstimated).length;
   const unknownTimingWorkers = workerStats.filter(worker =>
     !worker.timingExact && !worker.timingEstimated).length;
@@ -564,12 +660,31 @@ function aggregatePortfolioTelemetry(results, wallMs, firstCandidateWallMs) {
   };
 }
 
-function portfolioReason(evidence, workerCount) {
+function portfolioReason(evidence, workerCount, portfolioStats = null) {
   switch (evidence.terminationReason) {
-    case "portfolio-first-valid-candidate":
+    case "portfolio-first-valid-candidate": {
+      if (portfolioStats?.proofGraceExpired) {
+        return `${workerCount} Worker 多种子组合找到合法候选；${portfolioStats.proofGraceEffectiveMs}ms 证明宽限耗尽，未证明最优`;
+      }
+      if (portfolioStats?.proofGraceOutcome === "wall-margin") {
+        return `${workerCount} Worker 多种子组合找到合法候选；墙钟余量不足以启动证明宽限，未证明最优`;
+      }
+      if (portfolioStats?.proofGraceOutcome === "wall-clock-timeout") {
+        return `${workerCount} Worker 多种子组合找到合法候选；证明宽限被墙钟截止，未证明最优`;
+      }
+      if (portfolioStats?.proofGraceOutcome === "worker-finished-unproven") {
+        return `${workerCount} Worker 多种子组合找到合法候选；winner 在证明宽限内自行结束但未完成证明`;
+      }
+      if (portfolioStats?.proofGraceOutcome === "worker-error"
+        || portfolioStats?.proofGraceOutcome === "worker-exit") {
+        return `${workerCount} Worker 多种子组合找到合法候选；winner 在证明宽限内异常终止，候选保留但未证明最优`;
+      }
       return `${workerCount} Worker 多种子组合找到首个合法候选；已提前停止，未证明最优`;
+    }
     case "optimal-proven":
-      return "至少一个同证明域 Worker 找到候选并证明最优";
+      return portfolioStats?.proofGraceWaitMs > 0
+        ? `winner 在 ${Math.round(portfolioStats.proofGraceWaitMs * 100) / 100}ms 证明宽限内完成同域最优性证明`
+        : "至少一个同证明域 Worker 找到候选并证明最优";
     case "search-exhausted":
       return "至少一个同证明域 Worker 完整走完搜索且无候选";
     case "portfolio-contract-conflict":
@@ -607,8 +722,9 @@ async function solveCase(testCase) {
     signal: controller.signal,
     stopOnValidCandidate: testCase.hasSolution !== false,
     proofScopeKey,
+    proofGraceMs: portfolioProofGraceMs,
     onValidCandidate: candidate => {
-      if (firstCandidate) return;
+      if (firstCandidate) return firstCandidate.workerIndex === candidate.workerIndex;
       firstCandidate = {
         ...candidate,
         wallMs: performance.now() - portfolioStarted,
@@ -618,6 +734,7 @@ async function solveCase(testCase) {
           if (index !== workerIndex) controllers[index].abort();
         }
       }
+      return true;
     },
   }));
   const results = await Promise.all(sessionPromises);
@@ -646,11 +763,17 @@ async function solveCase(testCase) {
   telemetry.portfolioStats.winningSource = winningSource;
   telemetry.portfolioStats.proofWorkerIndex = proofWorkerIndex;
   telemetry.portfolioStats.proofScopeKey = proofScopeKey;
+  telemetry.portfolioStats.proofGraceMs = portfolioProofGraceMs;
+  telemetry.portfolioStats.proofGraceEffectiveMs = finiteMax(results.map(result => result.proofGraceEffectiveMs)) ?? 0;
+  telemetry.portfolioStats.proofGraceWaitMs = finiteMax(results.map(result => result.proofGraceWaitMs)) ?? 0;
+  telemetry.portfolioStats.proofGraceOutcome = results.find(result =>
+    result.proofGraceOutcome && result.proofGraceOutcome !== "not-entered")?.proofGraceOutcome || "not-entered";
+  telemetry.portfolioStats.proofGraceExpired = telemetry.portfolioStats.proofGraceOutcome === "expired";
 
   return {
     status: evidence.status,
     method: `portfolio(${puzzleWorkers})`,
-    reason: portfolioReason(evidence, puzzleWorkers),
+    reason: portfolioReason(evidence, puzzleWorkers, telemetry.portfolioStats),
     complete: evidence.complete,
     terminationReason: evidence.terminationReason,
     best,
@@ -714,6 +837,8 @@ function describeTelemetry(result) {
       `portfolioWallMs=${metric(portfolio.wallMs)}`,
       `workers=${portfolio.workerCount}`,
       `phaseTimesExact=${portfolio.phaseTimesExact}`,
+      `proofGraceMs(actual/effective/configured)=${metric(portfolio.proofGraceWaitMs)}/${metric(portfolio.proofGraceEffectiveMs)}/${portfolio.proofGraceMs}`,
+      `proofGraceOutcome=${portfolio.proofGraceOutcome}`,
       `cspStatsKnown=${portfolio.cspStatsKnownWorkers}/${portfolio.workerCount}`,
       `winner=${portfolio.winningWorkerIndex ?? "-"}/${portfolio.winningSeed ?? "-"}/${portfolio.winningSource || "-"}`,
     ] : []),
@@ -751,6 +876,7 @@ function describePortfolioWorkers(result) {
     `cost=${metric(worker.bestCost)}`,
     `source=${worker.sources.join("+") || "-"}`,
     `timing=${worker.timingExact ? "exact" : (worker.timingEstimated ? "estimated" : "unknown")}`,
+    `grace=${metric(worker.proofGraceWaitMs)}/${metric(worker.proofGraceEffectiveMs)}/${worker.proofGraceMs}ms:${worker.proofGraceOutcome}`,
     `complete=${worker.complete}`,
     `reason=${worker.terminationReason}`,
   ].join("/")).join(" | ");
@@ -771,7 +897,7 @@ if (!selectedFiles.length) {
   process.exit(2);
 }
 
-console.log(`\nPuzzle solver cases: ${selectedFiles.length} (default timeout ${defaultTimeoutMs}ms each, workers ${puzzleWorkers})`);
+console.log(`\nPuzzle solver cases: ${selectedFiles.length} (default timeout ${defaultTimeoutMs}ms each, workers ${puzzleWorkers}, proof grace ${puzzleWorkers > 1 ? portfolioProofGraceMs : 0}ms)`);
 console.log(`Solver options: ${Object.keys(solverOptions).length ? JSON.stringify(solverOptions) : "Worker defaults"}\n`);
 const results = [];
 for (const filePath of selectedFiles) {
