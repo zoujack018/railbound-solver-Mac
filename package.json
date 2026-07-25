@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite --host 127.0.0.1",
-    "test": "node test/format-adapter-tests.js && node test/puzzle-portfolio-tests.js && node test/puzzle-portfolio-integration-tests.js && node test/canary-tests.js",
+    "test": "node test/format-adapter-tests.js && node test/puzzle-portfolio-tests.js && node test/puzzle-portfolio-state-machine-tests.js && node test/puzzle-portfolio-integration-tests.js && node test/canary-tests.js",
     "test:canary": "node test/canary-tests.js",
     "test:format": "node test/format-adapter-tests.js",
     "test:puzzles": "node test/puzzle-solver-tests.js",

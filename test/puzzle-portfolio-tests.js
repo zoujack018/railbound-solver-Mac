@@ -6,7 +6,7 @@ import {
   placedTrackCost,
   portfolioSeed,
   solvedStatusLabel,
-} from "./puzzle-portfolio.js";
+} from "../solver/portfolio-evidence.js";
 
 assert.equal(boundedProofGraceMs(100, 100, 1000), 100);
 assert.equal(boundedProofGraceMs(100, 950, 1000), 40);

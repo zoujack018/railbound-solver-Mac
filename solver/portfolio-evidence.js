@@ -35,6 +35,55 @@ export function solvedStatusLabel(result) {
   return `solved(mixed:${display.join("+")})`;
 }
 
+/* ═══════════ Proof scope ═══════════
+   A completeness proof only transfers between Workers that searched the same
+   domain. The scope key is the canonical identity of that domain: the same data
+   must always produce the same string regardless of property insertion order,
+   and any search-domain parameter change must produce a different one. Seeds
+   only reorder exploration, so they must never enter the key. */
+
+const PROOF_SCOPE_FIELDS = ["maxTracksHint", "minTracks", "requestId", "solverOptions"];
+
+function isPlainObject(value) {
+  if (value === null || typeof value !== "object") return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+function canonicalize(value, path) {
+  if (value === null) return "null";
+  const type = typeof value;
+  if (type === "string") return JSON.stringify(value);
+  if (type === "boolean") return value ? "true" : "false";
+  if (type === "number") {
+    if (!Number.isFinite(value)) {
+      throw new TypeError(`proof scope value at ${path} must be a finite number, received: ${value}`);
+    }
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map((item, index) => canonicalize(item, `${path}[${index}]`)).join(",")}]`;
+  }
+  if (isPlainObject(value)) {
+    return `{${Object.keys(value).sort()
+      .map(key => `${JSON.stringify(key)}:${canonicalize(value[key], `${path}.${key}`)}`)
+      .join(",")}}`;
+  }
+  const described = type === "object" ? Object.prototype.toString.call(value) : type;
+  throw new TypeError(`proof scope value at ${path} is not serializable: ${described}`);
+}
+
+export function createProofScopeKey(scope) {
+  if (!isPlainObject(scope)) {
+    throw new TypeError(`proof scope must be a plain object, received: ${scope === null ? "null" : typeof scope}`);
+  }
+  /* Only the declared search-domain fields are read, so a stray `seed` or
+     `workerIndex` on the caller's object can never widen the scope. */
+  return `{${PROOF_SCOPE_FIELDS
+    .map(field => `${JSON.stringify(field)}:${canonicalize(scope[field], field)}`)
+    .join(",")}}`;
+}
+
 function hasValidExhaustionProof(result) {
   return result?.status === "search-exhausted"
     && result.complete === true

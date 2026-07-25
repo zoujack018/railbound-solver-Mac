@@ -5,6 +5,8 @@ import {
   simulate, forwardReachable, backwardReachable, filterBlanks
 } from "./railbound-logic.js";
 import { createSolverWorkerUrl } from "./railbound-worker-code.js";
+import { createProofScopeKey, portfolioSeed } from "./solver/portfolio-evidence.js";
+import { createPortfolioState, reducePortfolioEvent } from "./solver/portfolio-state-machine.js";
 import { normalizePuzzle } from "./puzzle-io.js";
 import PuzzleLibraryDialog from "./PuzzleLibraryDialog.jsx";
 import { DEFAULT_GRID_HEIGHT, DEFAULT_GRID_WIDTH, directionGlyphDirection, straightTrackForDirection } from "./editor-helpers.js";
@@ -28,6 +30,24 @@ const DA = { N: "↑", E: "→", S: "↓", W: "←" };
 const CC = ["#c45c3a", "#3a7cc4", "#8c5cbf", "#c4a43a", "#3ac4a4", "#c43a8c"];
 const ZERO_CAR_COLOR = "#aeb6c2";
 const CL = 52;
+/* Bounded window the first winning Worker keeps searching for an optimality
+   proof after every loser has been cancelled. */
+const BROWSER_PROOF_GRACE_MS = 100;
+const TERMINATION_LABELS = {
+  "portfolio-first-valid-candidate": "组合首个合法候选，未获最优性证明",
+  "portfolio-contract-conflict": "合法候选与完备无解声明冲突，完备性已撤销",
+  "portfolio-proof-mismatch": "最优证明成本与权威候选不一致",
+  "candidate-unproven-portfolio": "组合内没有 Worker 证明该候选最优",
+  "portfolio-incomplete": "搜索未完备",
+  "dfs-iteration-budget": "DFS 迭代预算耗尽",
+  "candidate-unproven-dfs-budget": "DFS 迭代预算耗尽",
+  "candidate-unproven-csp": "CSP 候选未证明",
+  "candidate-unproven-early-stop": "搜索提前停止",
+  "wall-clock-timeout": "墙钟超时",
+};
+function terminationLabel(reason) {
+  return TERMINATION_LABELS[reason] || reason || "搜索未完备";
+}
 function isZeroCarCell(c) { return c?.role === "zero" || String(c?.name) === "0"; }
 function carColor(c) { return isZeroCarCell(c) ? ZERO_CAR_COLOR : CC[(+c.name - 1) % CC.length]; }
 function carLabel(c) { return isZeroCarCell(c) ? "0" : String(c?.name ?? ""); }
@@ -65,6 +85,7 @@ export default function App() {
   const [libraryDialog, setLibraryDialog] = useState(null);
   const tr = useRef(null);
   const workersRef = useRef([]), workerUrlRef = useRef(null), solveRequestRef = useRef(0);
+  const proofGraceTimerRef = useRef(null);
 
   const trackGroups = useMemo(classifyTracks, []);
 
@@ -252,6 +273,7 @@ export default function App() {
   function getWorkerUrl() { if (!workerUrlRef.current) workerUrlRef.current = createSolverWorkerUrl(); return workerUrlRef.current; }
   function stopW() {
     solveRequestRef.current += 1;
+    if (proofGraceTimerRef.current != null) { clearTimeout(proofGraceTimerRef.current); proofGraceTimerRef.current = null; }
     workersRef.current.forEach(w => {
       w.onmessage = null; w.onerror = null; w.onmessageerror = null;
       try { w.terminate(); } catch { /* Worker may already be closed. */ }
@@ -266,49 +288,89 @@ export default function App() {
     const requestId = solveRequestRef.current;
     const { pruned } = filterBlanks(p);
     const nW = Math.min(navigator.hardwareConcurrency || 4, 16), t0 = performance.now();
-    let totalIters = 0, bestFound = null, done = 0, failures = 0, lastMethod = "?", lastInfo = "";
-    let provenOptimalCost = null, provenNoSolution = false;
-    const incompleteReasons = new Set();
+    let totalIters = 0, failures = 0, lastMethod = "?", lastInfo = "";
     const url = getWorkerUrl(), pf = { ...p, _minTracks: true }, workers = [], settled = new Set();
-    function terminationLabel(reason) {
-      return ({
-        "dfs-iteration-budget": "DFS 迭代预算耗尽",
-        "candidate-unproven-dfs-budget": "DFS 迭代预算耗尽",
-        "candidate-unproven-csp": "CSP 候选未证明",
-        "candidate-unproven-early-stop": "搜索提前停止",
-        "wall-clock-timeout": "墙钟超时",
-      })[reason] || reason || "搜索未完备";
+    /* Per-Worker candidates that already passed the authoritative main-thread
+       simulate(). A Worker's optimality proof is only honoured when it matches
+       one of these, never when it merely claims a cost. */
+    const validated = new Array(nW).fill(null);
+    const proofScopeKey = createProofScopeKey({
+      requestId,
+      maxTracksHint: maxTrk > 0 ? maxTrk : 0,
+      minTracks: true,
+      solverOptions: {},
+    });
+    /* A single Worker has no portfolio race, so it keeps the old behaviour of
+       running to completion instead of stopping on its own first candidate. */
+    let machine = createPortfolioState({
+      workerIds: Array.from({ length: nW }, (_, i) => i),
+      expectSolution: nW > 1,
+      proofScopeKey,
+      proofGraceMs: BROWSER_PROOF_GRACE_MS,
+    });
+
+    function dispatch(event) {
+      if (requestId !== solveRequestRef.current) return;
+      const outcome = reducePortfolioEvent(machine, event);
+      machine = outcome.state;
+      for (const effect of outcome.effects) applyEffect(effect);
     }
-    function finishWorker(w, payload = {}) {
-      if (requestId !== solveRequestRef.current || settled.has(w)) return;
-      settled.add(w); done++;
-      if (payload.failed) failures++;
-      lastMethod = payload.method || lastMethod;
-      lastInfo = payload.info || lastInfo;
-      if (payload.complete === true && payload.terminationReason === "optimal-proven" && Number.isFinite(payload.finalCost)) {
-        provenOptimalCost = provenOptimalCost === null ? payload.finalCost : Math.min(provenOptimalCost, payload.finalCost);
-      } else if (payload.complete === true && payload.terminationReason === "search-exhausted" && payload.finalCost == null) {
-        provenNoSolution = true;
-      } else if (!payload.failed) {
-        incompleteReasons.add(terminationLabel(payload.terminationReason));
-      }
+    function stopWorker(i) {
+      const w = workers[i];
+      if (!w || settled.has(i)) return;
+      settled.add(i);
       workersRef.current = workersRef.current.filter(ww => ww !== w);
       w.onmessage = null; w.onerror = null; w.onmessageerror = null;
       try { w.terminate(); } catch { /* Worker may already be closed. */ }
-      if (done < nW) return;
+    }
+    function applyEffect(effect) {
+      if (effect.type === "cancel-worker") { stopWorker(effect.workerId); return; }
+      if (effect.type === "publish-candidate") {
+        const shown = validated[effect.workerId];
+        if (!shown) return;
+        setSol({ placed: shown.placed, result: shown.result, puzzle: p }); setStep(0);
+        setMsg(`候选 ${(performance.now() - t0).toFixed(0)}ms · ${shown.result.steps}步 · ${shown.cost}轨 · 剪除${pruned}`);
+        return;
+      }
+      if (effect.type === "start-proof-grace") {
+        if (proofGraceTimerRef.current != null) clearTimeout(proofGraceTimerRef.current);
+        proofGraceTimerRef.current = setTimeout(() => {
+          proofGraceTimerRef.current = null;
+          dispatch({ type: "proof-grace-expired", workerId: effect.workerId, atMs: performance.now() - t0 });
+        }, effect.delayMs);
+        return;
+      }
+      if (effect.type === "finish") {
+        if (proofGraceTimerRef.current != null) { clearTimeout(proofGraceTimerRef.current); proofGraceTimerRef.current = null; }
+        reportEvidence(effect.evidence);
+      }
+    }
+    function reportEvidence(evidence) {
       const ms = (performance.now() - t0).toFixed(0);
-      const reasonText = [...incompleteReasons].join(" / ") || "当前候选尚未获得一致的最优性证明";
-      if (bestFound && provenOptimalCost === bestFound.__cost) setMsg(`✓ ${ms}ms · 已证最优${bestFound.__cost}轨 · ${lastMethod} · 剪除${pruned}${failures ? ` · ${failures}线程失败` : ""}`);
-      else if (bestFound) setMsg(`△ ${ms}ms · 候选${bestFound.__cost}轨 · 未获最优性证明 (${reasonText}) · 剪除${pruned}${failures ? ` · ${failures}线程失败` : ""}`);
-      else if (failures === nW) setMsg(`✕ 求解器启动失败 (${lastInfo || "Worker 未返回错误详情"})`);
-      else if (provenNoSolution) setMsg(`✕ 完备无解 (${ms}ms · ${lastMethod}${lastInfo ? " · " + lastInfo : ""}${failures ? ` · ${failures}线程失败` : ""})`);
-      else setMsg(`△ 未找到候选 · 搜索未完备 (${ms}ms · ${reasonText}${failures ? ` · ${failures}线程失败` : ""})`);
+      const cost = evidence.bestResult?.best?.cost ?? null;
+      const failTail = failures ? ` · ${failures}线程失败` : "";
+      if (evidence.complete === true && evidence.terminationReason === "optimal-proven") {
+        setMsg(`✓ ${ms}ms · 已证最优${cost}轨 · ${lastMethod} · 剪除${pruned}${failTail}`);
+      } else if (evidence.complete === true && evidence.terminationReason === "search-exhausted") {
+        setMsg(`✕ 完备无解 (${ms}ms · ${lastMethod}${lastInfo ? " · " + lastInfo : ""}${failTail})`);
+      } else if (cost != null) {
+        setMsg(`△ ${ms}ms · 候选${cost}轨 · 未获最优性证明 (${terminationLabel(evidence.terminationReason)}) · 剪除${pruned}${failTail}`);
+      } else if (failures === nW) {
+        setMsg(`✕ 求解器启动失败 (${lastInfo || "Worker 未返回错误详情"})`);
+      } else {
+        setMsg(`△ 未找到候选 · 搜索未完备 (${ms}ms · ${terminationLabel(evidence.terminationReason)}${failTail})`);
+      }
+    }
+    function settleWorker(i, event) {
+      if (requestId !== solveRequestRef.current || settled.has(i)) return;
+      stopWorker(i);
+      dispatch(event);
     }
     for (let i = 0; i < nW; i++) {
       const w = new Worker(url, { type: "module" });
       w.onmessage = (e) => {
         if (requestId !== solveRequestRef.current || e.data?.requestId !== requestId) return;
-        const { type, solution, cspInfo, info } = e.data;
+        const { type, solution, cspInfo } = e.data;
         if (type === "progress") {
           if (e.data.diagnosis) {
             const d = e.data.diagnosis;
@@ -322,33 +384,78 @@ export default function App() {
             let m = `求解中... ${nW}线程 · ${(totalIters / 1e6).toFixed(1)}M迭代 · ${el}s`;
             if (pruned) m += ` · 剪除${pruned}`; if (cspInfo) m += ` · ${cspInfo}`;
             if (e.data.info) m += ` · ${e.data.info}`;
-            if (bestFound) m += ` · 当前${bestFound.__cost}轨`; setMsg(m);
+            const current = machine.bestCandidate?.cost;
+            if (Number.isFinite(current)) m += ` · 当前${current}轨`; setMsg(m);
           }
         }
         if (type === "solution" && solution) {
           const cost = solution.__cost || 0;
-          if (!bestFound || cost < bestFound.__cost) {
-            const clean = {}; for (const [k, v] of Object.entries(solution)) if (k !== "__cost") clean[k] = v;
-            const r = simulate(p, clean);
-            if (!r.ok) {
-              setMsg(`跳过无效候选 ${cost}轨: ${r.reason} @${r.steps}步`);
-              return;
-            }
-            bestFound = solution;
-            setSol({ placed: clean, result: r, puzzle: p }); setStep(0);
-            setMsg(`候选 ${(performance.now() - t0).toFixed(0)}ms · ${r.steps}步 · ${cost}轨 · 继续找更优 · 剪除${pruned}`);
+          const known = machine.bestCandidate?.cost;
+          if (Number.isFinite(known) && cost >= known) return;
+          const clean = {}; for (const [k, v] of Object.entries(solution)) if (k !== "__cost") clean[k] = v;
+          const r = simulate(p, clean);
+          if (!r.ok) {
+            setMsg(`跳过无效候选 ${cost}轨: ${r.reason} @${r.steps}步`);
+            return;
           }
+          const sources = [e.data.source || "unknown-source"];
+          validated[i] = { cost, steps: r.steps, sources, placed: clean, result: r };
+          dispatch({
+            type: "valid-candidate",
+            workerId: i,
+            candidate: { cost, steps: r.steps, placed: clean, sources, seed: portfolioSeed(i) },
+            result: r,
+            atMs: performance.now() - t0,
+          });
         }
         if (type === "done") {
-          finishWorker(w, e.data);
+          lastMethod = e.data.method || lastMethod;
+          lastInfo = e.data.info || lastInfo;
+          const best = validated[i];
+          settleWorker(i, {
+            type: "worker-done",
+            workerId: i,
+            atMs: performance.now() - t0,
+            result: {
+              status: best
+                ? "solved"
+                : (e.data.complete === true && e.data.terminationReason === "search-exhausted" ? "search-exhausted" : "incomplete"),
+              complete: e.data.complete === true,
+              terminationReason: e.data.terminationReason || null,
+              finalCost: Number.isFinite(e.data.finalCost) ? e.data.finalCost : null,
+              best: best ? { cost: best.cost, sources: best.sources } : null,
+              candidateFailures: [],
+              overLimit: [],
+              proofScopeKey,
+              workerIndex: i,
+            },
+          });
         }
+      };
+      const failWorker = (method, info) => {
+        failures++;
+        lastMethod = method; lastInfo = info || lastInfo;
+        settleWorker(i, {
+          type: "worker-failed",
+          workerId: i,
+          atMs: performance.now() - t0,
+          result: {
+            status: "error",
+            complete: false,
+            terminationReason: "worker-error",
+            finalCost: null,
+            best: null,
+            proofScopeKey,
+            workerIndex: i,
+          },
+        });
       };
       w.onerror = (event) => {
         event.preventDefault?.();
-        finishWorker(w, { failed: true, method: "worker-error", info: event.message || "Worker 加载或执行失败" });
+        failWorker("worker-error", event.message || "Worker 加载或执行失败");
       };
-      w.onmessageerror = () => finishWorker(w, { failed: true, method: "message-error", info: "Worker 消息无法反序列化" });
-      w.postMessage({ type: "solve", requestId, puzzle: pf, seed: i === 0 ? 0 : (i * 7919 + 31), maxTracksHint: maxTrk > 0 ? maxTrk : 0 });
+      w.onmessageerror = () => failWorker("message-error", "Worker 消息无法反序列化");
+      w.postMessage({ type: "solve", requestId, puzzle: pf, seed: portfolioSeed(i), maxTracksHint: maxTrk > 0 ? maxTrk : 0 });
       workers.push(w);
     }
     workersRef.current = workers;

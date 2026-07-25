@@ -23,6 +23,7 @@ const immediate = runPortfolio("关卡-4x8-20260722-6-3A.json", {
 });
 assert.match(immediate, /complete=false/);
 assert.match(immediate, /terminationReason=portfolio-first-valid-candidate/);
+assert.match(immediate, /proofGraceOutcome=disabled/);
 
 const proofRetained = runPortfolio("关卡-4x8-20260722-6-3A.json", {
   PUZZLE_WORKERS: "8",
@@ -31,6 +32,14 @@ const proofRetained = runPortfolio("关卡-4x8-20260722-6-3A.json", {
 assert.match(proofRetained, /finalCost=9/);
 assert.match(proofRetained, /complete=true/);
 assert.match(proofRetained, /terminationReason=optimal-proven/);
+
+/* The proof scope is the identity of the searched domain. Seeds only reorder
+   exploration, so a seed inside the key would split otherwise shared proofs. */
+const proofScope = proofRetained.match(/proofScopeKey=(\{.*?\})/);
+assert.ok(proofScope, `proofScopeKey 未出现在组合遥测中：${proofRetained}`);
+assert.doesNotMatch(proofScope[1], /"seed"/);
+assert.match(proofScope[1], /"requestId":/);
+assert.match(proofScope[1], /"minTracks":/);
 
 const repeatedWinnerCandidate = runPortfolio("关卡-7x5-20260722-5-7.json", {
   PUZZLE_WORKERS: "8",
