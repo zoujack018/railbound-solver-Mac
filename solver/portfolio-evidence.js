@@ -189,14 +189,25 @@ function preferredIncompleteStatus(results) {
 /* Pure portfolio proof classifier. Worker-local telemetry and candidates enter
    as immutable evidence; no top-level proof field is inherited via object
    spread from an arbitrary worker. */
-export function classifyPortfolioEvidence(results, { fastCandidate = false, proofScopeKey = null } = {}) {
+export function classifyPortfolioEvidence(results, {
+  fastCandidate = false,
+  proofScopeKey = null,
+  authoritativeCandidate = null,
+} = {}) {
   const proofEligibleResults = proofScopeKey == null
     ? results
     : results.filter(result => result?.proofScopeKey === proofScopeKey);
+  /* Equal-cost candidates keep the caller's order: the sort is stable, so the
+     caller decides the tie-break by how it orders `results`. */
   const candidates = results
     .filter(result => result?.status === "solved" && result.best)
     .sort((a, b) => a.best.cost - b.best.cost);
-  const bestResult = candidates[0] || null;
+  /* When the caller holds a candidate the host already re-verified, that
+     candidate is the authority. A Worker's self-reported `best` must not become
+     the portfolio's answer by merely claiming a lower cost — including a
+     cancelled loser's candidate, which the orchestrator deliberately refused to
+     adopt. Worker proofs are then judged against the authoritative cost. */
+  const bestResult = authoritativeCandidate || candidates[0] || null;
   const exhaustionProofs = proofEligibleResults.filter(hasValidExhaustionProof);
   const optimalProofs = proofEligibleResults.filter(hasValidOptimalProof);
 

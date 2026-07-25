@@ -100,12 +100,22 @@ function candidateEvidenceResult(state) {
 
 function classify(state, fastCandidate) {
   const results = state.results.map(entry => entry.result).filter(Boolean);
-  const candidateEvidence = candidateEvidenceResult(state);
-  /* Put the host-verified candidate first so equal-cost Worker evidence can
-     prove it but cannot replace its placed layout as bestResult. */
-  return classifyPortfolioEvidence(candidateEvidence ? [candidateEvidence, ...results] : results, {
+  /* A candidate from a foreign search domain disqualifies every proof, so an
+     equal-cost tie between an in-domain and a foreign candidate must not be
+     decided by which Worker happened to finish first. The classifier's min-cost
+     sort is stable, so ordering in-domain evidence first makes the verdict a
+     function of the evidence alone. In-domain results keep their relative
+     order, so which Worker is credited with the proof is unchanged. */
+  const inScope = results.filter(result => result.proofScopeKey === state.proofScopeKey);
+  const foreign = results.filter(result => result.proofScopeKey !== state.proofScopeKey);
+  /* The host-verified candidate enters as the authoritative one, so no Worker's
+     self-reported `best` — not even a cheaper one from a cancelled loser whose
+     candidate this reducer refused to adopt — can replace it as bestResult or
+     shift the cost that proofs are checked against. */
+  return classifyPortfolioEvidence([...inScope, ...foreign], {
     fastCandidate,
     proofScopeKey: state.proofScopeKey,
+    authoritativeCandidate: candidateEvidenceResult(state),
   });
 }
 

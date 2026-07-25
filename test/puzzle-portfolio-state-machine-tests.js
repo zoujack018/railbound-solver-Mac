@@ -418,6 +418,76 @@ test("createProofScopeKey：非法值抛 TypeError", () => {
   assert.throws(() => createProofScopeKey("case-1"), TypeError);
 });
 
+/* ── Model-checker counterexample regressions (found by
+      test/puzzle-portfolio-model-tests.js) ── */
+
+/* CE-1: a Worker's own `done` payload carried a cheaper self-reported `best`
+   than the host-verified candidate, and the min-cost scan promoted it to
+   bestResult. Its self-consistent proof then raised complete=true at a cost the
+   portfolio had never published or verified. */
+test("CE-1. Worker 自报更低成本的 best 不得顶替主线程权威候选", () => {
+  const cheaperWorkerProof = {
+    status: "solved",
+    complete: true,
+    terminationReason: "optimal-proven",
+    finalCost: 7,
+    best: { cost: 7, sources: ["csp"], placed: { worker: "opt7" } },
+    candidateFailures: [],
+    overLimit: [],
+    proofScopeKey: "scope-a",
+    workerIndex: 0,
+  };
+  const start = createPortfolioState({
+    workerIds: [0],
+    expectSolution: true,
+    proofScopeKey: "scope-a",
+    proofGraceMs: 100,
+  });
+  const claimed = reduce(start, candidateEvent(0, 9)).state;
+  const { state } = reduce(claimed, doneEvent(0, cheaperWorkerProof));
+  assert.equal(state.phase, "finished");
+  assert.equal(state.finalEvidence.complete, false);
+  assert.equal(state.finalEvidence.terminationReason, "portfolio-proof-mismatch");
+  assert.equal(state.finalEvidence.bestResult.best.cost, 9, "bestResult 必须是主线程验证过的候选");
+  assert.deepEqual(state.finalEvidence.bestResult.best.placed, { "0,0": "-" });
+});
+
+/* CE-2: with two equal-cost Worker candidates and no host candidate, the
+   min-cost tie was broken by arrival order. When the foreign-scope one happened
+   to land first it became bestResult and disqualified the valid in-scope proof,
+   so the same evidence produced two different verdicts. */
+test("CE-2. 同成本候选的域外/域内先后顺序不得改变结论", () => {
+  const proof = (workerIndex, scope) => ({
+    status: "solved",
+    complete: true,
+    terminationReason: "optimal-proven",
+    finalCost: 7,
+    best: { cost: 7, sources: ["csp"], placed: { worker: "opt7" } },
+    candidateFailures: [],
+    overLimit: [],
+    proofScopeKey: scope,
+    workerIndex,
+  });
+  const run = order => {
+    let state = createPortfolioState({
+      workerIds: [0, 1],
+      expectSolution: true,
+      proofScopeKey: "scope-a",
+      proofGraceMs: 0,
+    });
+    for (const [workerId, scope] of order) {
+      state = reducePortfolioEvent(state, doneEvent(workerId, proof(workerId, scope))).state;
+    }
+    return state.finalEvidence;
+  };
+  const foreignFirst = run([[0, "scope-b"], [1, "scope-a"]]);
+  const localFirst = run([[0, "scope-a"], [1, "scope-b"]]);
+  assert.equal(foreignFirst.terminationReason, localFirst.terminationReason);
+  assert.equal(foreignFirst.complete, localFirst.complete);
+  assert.equal(foreignFirst.complete, true);
+  assert.equal(foreignFirst.terminationReason, "optimal-proven");
+});
+
 console.log(`\n═══════════ Portfolio state machine: ${passed} passed, ${failures.length} failed ═══════════`);
 if (failures.length) {
   for (const failure of failures) console.log(`  ✗ ${failure.name}\n      ${failure.message}`);
