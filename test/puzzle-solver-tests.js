@@ -10,11 +10,12 @@ import {
   boundedProofGraceMs,
   classifyPortfolioEvidence,
   createProofScopeKey,
+  inspectPortfolioCandidate,
   MAX_PUZZLE_WORKERS,
   normalizeCandidateSources,
-  placedTrackCost,
   portfolioSeed,
   solvedStatusLabel,
+  workerProofIssue,
 } from "../solver/portfolio-evidence.js";
 import { createPortfolioState, reducePortfolioEvent } from "../solver/portfolio-state-machine.js";
 
@@ -154,10 +155,6 @@ function loadCase(filePath, manifest) {
     note: meta.note || "",
     puzzle: normalizePuzzle(source),
   };
-}
-
-function cleanSolution(solution) {
-  return Object.fromEntries(Object.entries(solution || {}).filter(([key]) => key !== "__cost"));
 }
 
 /* One Worker session. It owns message decoding, authoritative candidate
@@ -346,29 +343,17 @@ async function solveWorkerSession(testCase, {
         return;
       }
       if (message.type === "solution" && message.solution) {
-        const reportedCost = message.solution.__cost;
         const source = normalizeCandidateSources(message.source)[0];
-        const placed = cleanSolution(message.solution);
-        const cost = placedTrackCost(placed);
+        const placed = Object.fromEntries(
+          Object.entries(message.solution).filter(([key]) => key !== "__cost"),
+        );
         const result = simulate(testCase.puzzle, placed);
-        if (!result.ok) {
-          candidateFailures.push({ reportedCost, actualCost: cost, reason: result.reason, detail: result.detail });
+        const inspected = inspectPortfolioCandidate(message.solution, result, testCase.maxTracks);
+        if (!inspected.accepted) {
+          (inspected.kind === "over-limit" ? overLimit : candidateFailures).push(inspected.issue);
           return;
         }
-        if (reportedCost !== cost) {
-          candidateFailures.push({
-            reportedCost,
-            actualCost: cost,
-            reason: "COST_MISMATCH",
-            detail: `Worker reported ${reportedCost}; authoritative placed-key count is ${cost}`,
-          });
-          return;
-        }
-        /* simulate() 通过但超过轨道上限：记录为超限解，绝不算通过。 */
-        if (testCase.maxTracks != null && cost > testCase.maxTracks) {
-          overLimit.push({ cost, steps: result.steps });
-          return;
-        }
+        const cost = inspected.actualCost;
         if (firstCandidateMs == null) {
           firstCandidateMs = performance.now() - started;
           if (Number.isFinite(message.candidateMs)) telemetry.workerFirstCandidateMs = message.candidateMs;
@@ -387,13 +372,8 @@ async function solveWorkerSession(testCase, {
         return;
       }
       if (message.type === "done") {
-        const proofMismatch = message.complete === true && (
-          candidateFailures.length > 0
-          || overLimit.length > 0
-          || (message.terminationReason === "optimal-proven"
-            ? (!best || message.finalCost !== best.cost)
-            : Boolean(best))
-        );
+        const proofIssue = workerProofIssue(message, { best, candidateFailures, overLimit });
+        const proofMismatch = proofIssue != null;
         if (best) {
           finish({
             status: "solved",
@@ -403,9 +383,7 @@ async function solveWorkerSession(testCase, {
               : (message.complete === true && message.terminationReason === "optimal-proven" ? "" : "找到合法候选，但未证明最优"),
             ...(proofMismatch ? {
               complete: false,
-              terminationReason: candidateFailures.length
-                ? "candidate-validation-failed"
-                : (overLimit.length ? "candidate-over-limit" : "candidate-unproven-early-stop"),
+              terminationReason: proofIssue,
             } : {}),
           });
           return;
@@ -443,9 +421,7 @@ async function solveWorkerSession(testCase, {
           alternateCount: message.alternates?.length || 0,
           ...(proofMismatch ? {
             complete: false,
-            terminationReason: candidateFailures.length
-              ? "candidate-validation-failed"
-              : (overLimit.length ? "candidate-over-limit" : "candidate-unproven-early-stop"),
+            terminationReason: proofIssue,
           } : {}),
         });
       }

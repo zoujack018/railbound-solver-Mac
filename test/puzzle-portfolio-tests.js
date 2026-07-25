@@ -2,10 +2,12 @@ import assert from "node:assert/strict";
 import {
   boundedProofGraceMs,
   classifyPortfolioEvidence,
+  inspectPortfolioCandidate,
   normalizeCandidateSources,
   placedTrackCost,
   portfolioSeed,
   solvedStatusLabel,
+  workerProofIssue,
 } from "../solver/portfolio-evidence.js";
 
 assert.equal(boundedProofGraceMs(100, 100, 1000), 100);
@@ -15,6 +17,52 @@ assert.deepEqual(Array.from({ length: 8 }, (_, index) => portfolioSeed(index)), 
   0, 7950, 15869, 23788, 31707, 39626, 47545, 55464,
 ]);
 assert.equal(placedTrackCost({ "0,0": "-", "1,0": "NE", __cost: 999 }), 2);
+assert.deepEqual(
+  inspectPortfolioCandidate({ "0,0": "-", __cost: 1 }, { ok: true, steps: 4 }, 1),
+  {
+    accepted: true,
+    kind: "valid",
+    placed: { "0,0": "-" },
+    reportedCost: 1,
+    actualCost: 1,
+    issue: null,
+  },
+);
+assert.equal(
+  inspectPortfolioCandidate({ "0,0": "-", __cost: 0 }, { ok: true, steps: 4 }, 1).issue.reason,
+  "COST_MISMATCH",
+);
+assert.equal(
+  inspectPortfolioCandidate({ "0,0": "-", __cost: 1 }, { ok: false, reason: "COLLISION" }, 1).kind,
+  "candidate-failed",
+);
+assert.equal(
+  inspectPortfolioCandidate({ "0,0": "-", __cost: 1 }, { ok: true, steps: 4 }, 0).accepted,
+  true,
+);
+assert.equal(
+  inspectPortfolioCandidate(
+    { "0,0": "-", "1,0": "-", __cost: 2 },
+    { ok: true, steps: 4 },
+    1,
+  ).kind,
+  "over-limit",
+);
+assert.equal(workerProofIssue({
+  complete: true,
+  terminationReason: "optimal-proven",
+  finalCost: 1,
+}, { best: { cost: 1 } }), null);
+assert.equal(workerProofIssue({
+  complete: true,
+  terminationReason: "optimal-proven",
+  finalCost: 1,
+}, { best: { cost: 1 }, candidateFailures: [{ reason: "COLLISION" }] }), "candidate-validation-failed");
+assert.equal(workerProofIssue({
+  complete: true,
+  terminationReason: "optimal-proven",
+  finalCost: 2,
+}, { best: { cost: 1 } }), "candidate-unproven-early-stop");
 assert.deepEqual(normalizeCandidateSources(["dfs", "dfs", "p12-pattern-seed"]), ["dfs", "p12-pattern-seed"]);
 assert.equal(solvedStatusLabel({ status: "solved", best: { sources: ["dfs"] } }), "solved");
 assert.equal(solvedStatusLabel({ status: "solved", best: { sources: ["p12-pattern-seed"] } }), "solved(p12-seed)");

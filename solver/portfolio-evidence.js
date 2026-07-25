@@ -12,6 +12,79 @@ export function placedTrackCost(solution) {
   return Object.keys(solution || {}).filter(key => key !== "__cost").length;
 }
 
+/* Both hosts must derive candidate cost from the placed tracks, not trust the
+   Worker's annotation. simulateResult is supplied by the host because this
+   module deliberately has no dependency on either rules runtime. */
+export function inspectPortfolioCandidate(solution, simulateResult, maxTracks = null) {
+  const placed = Object.fromEntries(
+    Object.entries(solution || {}).filter(([key]) => key !== "__cost"),
+  );
+  const reportedCost = solution?.__cost;
+  const actualCost = placedTrackCost(placed);
+  if (!simulateResult?.ok) {
+    return {
+      accepted: false,
+      kind: "candidate-failed",
+      placed,
+      reportedCost,
+      actualCost,
+      issue: {
+        reportedCost,
+        actualCost,
+        reason: simulateResult?.reason || "SIMULATION_FAILED",
+        detail: simulateResult?.detail,
+      },
+    };
+  }
+  if (reportedCost !== actualCost) {
+    return {
+      accepted: false,
+      kind: "candidate-failed",
+      placed,
+      reportedCost,
+      actualCost,
+      issue: {
+        reportedCost,
+        actualCost,
+        reason: "COST_MISMATCH",
+        detail: `Worker reported ${reportedCost}; authoritative placed-key count is ${actualCost}`,
+      },
+    };
+  }
+  if (Number.isFinite(maxTracks) && maxTracks > 0 && actualCost > maxTracks) {
+    return {
+      accepted: false,
+      kind: "over-limit",
+      placed,
+      reportedCost,
+      actualCost,
+      issue: { cost: actualCost, steps: simulateResult.steps, maxTracks },
+    };
+  }
+  return {
+    accepted: true,
+    kind: "valid",
+    placed,
+    reportedCost,
+    actualCost,
+    issue: null,
+  };
+}
+
+/* A complete claim is tainted by any rejected candidate, over-limit solution,
+   missing authoritative candidate, or cost disagreement. Keeping this check
+   shared prevents the browser and Node adapters from constructing different
+   proof evidence from the same Worker transcript. */
+export function workerProofIssue(message, { best = null, candidateFailures = [], overLimit = [] } = {}) {
+  if (message?.complete !== true) return null;
+  if (candidateFailures.length) return "candidate-validation-failed";
+  if (overLimit.length) return "candidate-over-limit";
+  if (message.terminationReason === "optimal-proven") {
+    return !best || message.finalCost !== best.cost ? "candidate-unproven-early-stop" : null;
+  }
+  return best ? "candidate-unproven-early-stop" : null;
+}
+
 export function portfolioSeed(workerIndex) {
   if (!Number.isInteger(workerIndex) || workerIndex < 0) {
     throw new Error(`workerIndex must be a non-negative integer, received: ${workerIndex}`);

@@ -322,6 +322,48 @@ test("16. worker-failed 参与最终分类，不提前声明无解", () => {
   assert.equal(second.state.finalEvidence.terminationReason, "search-exhausted");
 });
 
+test("17. 完备无解证明先到、候选后到：立即报告 contract conflict", () => {
+  const first = reduce(newState({ proofGraceMs: 0 }), doneEvent(0, exhaustionResult()));
+  assert.equal(first.state.phase, "running");
+  const second = reduce(first.state, candidateEvent(2, 9));
+  assert.equal(second.state.phase, "finished");
+  assert.equal(finishEffect(second.effects).evidence.complete, false);
+  assert.equal(finishEffect(second.effects).evidence.terminationReason, "portfolio-contract-conflict");
+  assert.ok(!effectTypes(second.effects).includes("start-proof-grace"));
+});
+
+test("18. 已结束 Worker 的迟到候选：负例组合不得接纳", () => {
+  const initial = createPortfolioState({
+    workerIds: [0, 1],
+    expectSolution: false,
+    proofScopeKey: "scope-a",
+    proofGraceMs: 0,
+  });
+  const first = reduce(initial, doneEvent(0, budgetResult()));
+  const late = reduce(first.state, candidateEvent(0, 3));
+  assert.deepEqual(late.effects, []);
+  assert.equal(late.state.bestCandidate, null);
+});
+
+test("19. 同成本 optimal proof 先到、候选后到：直接保留证明", () => {
+  const first = reduce(newState(), doneEvent(0, optimalResult(9)));
+  assert.equal(first.state.phase, "running");
+  const second = reduce(first.state, candidateEvent(2, 9));
+  assert.equal(second.state.phase, "finished");
+  assert.equal(finishEffect(second.effects).evidence.complete, true);
+  assert.equal(finishEffect(second.effects).evidence.terminationReason, "optimal-proven");
+  assert.deepEqual(finishEffect(second.effects).evidence.bestResult.best.placed, { "0,0": "-" });
+  assert.ok(!effectTypes(second.effects).includes("start-proof-grace"));
+});
+
+test("20. 不同证明域的 proof 先到：候选仍进入 grace", () => {
+  const first = reduce(newState(), doneEvent(0, exhaustionResult("scope-b")));
+  const second = reduce(first.state, candidateEvent(2, 9));
+  assert.equal(second.state.phase, "proof-grace");
+  assert.equal(second.state.finalEvidence, null);
+  assert.ok(effectTypes(second.effects).includes("start-proof-grace"));
+});
+
 test("createProofScopeKey：键序无关、数组保序、参数变化改 key、输入不变", () => {
   const a = {
     requestId: "测试/关卡-4x8.json",

@@ -5,7 +5,13 @@ import {
   simulate, forwardReachable, backwardReachable, filterBlanks
 } from "./railbound-logic.js";
 import { createSolverWorkerUrl } from "./railbound-worker-code.js";
-import { createProofScopeKey, portfolioSeed } from "./solver/portfolio-evidence.js";
+import {
+  createProofScopeKey,
+  inspectPortfolioCandidate,
+  normalizeCandidateSources,
+  portfolioSeed,
+  workerProofIssue,
+} from "./solver/portfolio-evidence.js";
 import { createPortfolioState, reducePortfolioEvent } from "./solver/portfolio-state-machine.js";
 import { normalizePuzzle } from "./puzzle-io.js";
 import PuzzleLibraryDialog from "./PuzzleLibraryDialog.jsx";
@@ -294,6 +300,8 @@ export default function App() {
        simulate(). A Worker's optimality proof is only honoured when it matches
        one of these, never when it merely claims a cost. */
     const validated = new Array(nW).fill(null);
+    const candidateFailures = Array.from({ length: nW }, () => []);
+    const overLimit = Array.from({ length: nW }, () => []);
     const proofScopeKey = createProofScopeKey({
       requestId,
       maxTracksHint: maxTrk > 0 ? maxTrk : 0,
@@ -389,16 +397,21 @@ export default function App() {
           }
         }
         if (type === "solution" && solution) {
-          const cost = solution.__cost || 0;
           const known = machine.bestCandidate?.cost;
-          if (Number.isFinite(known) && cost >= known) return;
           const clean = {}; for (const [k, v] of Object.entries(solution)) if (k !== "__cost") clean[k] = v;
           const r = simulate(p, clean);
-          if (!r.ok) {
-            setMsg(`跳过无效候选 ${cost}轨: ${r.reason} @${r.steps}步`);
+          const inspected = inspectPortfolioCandidate(solution, r, maxTrk);
+          if (!inspected.accepted) {
+            (inspected.kind === "over-limit" ? overLimit[i] : candidateFailures[i]).push(inspected.issue);
+            const reason = inspected.kind === "over-limit"
+              ? `超过上限 ${inspected.actualCost}>${maxTrk}`
+              : inspected.issue.reason;
+            setMsg(`跳过无效候选 ${inspected.actualCost}轨: ${reason}${Number.isFinite(r.steps) ? ` @${r.steps}步` : ""}`);
             return;
           }
-          const sources = [e.data.source || "unknown-source"];
+          const cost = inspected.actualCost;
+          if (Number.isFinite(known) && cost >= known) return;
+          const sources = normalizeCandidateSources(e.data.source);
           validated[i] = { cost, steps: r.steps, sources, placed: clean, result: r };
           dispatch({
             type: "valid-candidate",
@@ -412,20 +425,32 @@ export default function App() {
           lastMethod = e.data.method || lastMethod;
           lastInfo = e.data.info || lastInfo;
           const best = validated[i];
+          const proofIssue = workerProofIssue(e.data, {
+            best,
+            candidateFailures: candidateFailures[i],
+            overLimit: overLimit[i],
+          });
+          const status = best
+            ? "solved"
+            : (overLimit[i].length
+              ? "over-limit"
+              : (candidateFailures[i].length
+                ? "candidate-failed"
+                : (e.data.complete === true && e.data.terminationReason === "search-exhausted"
+                  ? "search-exhausted"
+                  : "incomplete")));
           settleWorker(i, {
             type: "worker-done",
             workerId: i,
             atMs: performance.now() - t0,
             result: {
-              status: best
-                ? "solved"
-                : (e.data.complete === true && e.data.terminationReason === "search-exhausted" ? "search-exhausted" : "incomplete"),
-              complete: e.data.complete === true,
-              terminationReason: e.data.terminationReason || null,
-              finalCost: Number.isFinite(e.data.finalCost) ? e.data.finalCost : null,
+              status,
+              complete: proofIssue == null && e.data.complete === true,
+              terminationReason: proofIssue || e.data.terminationReason || null,
+              finalCost: best?.cost ?? null,
               best: best ? { cost: best.cost, sources: best.sources } : null,
-              candidateFailures: [],
-              overLimit: [],
+              candidateFailures: candidateFailures[i],
+              overLimit: overLimit[i],
               proofScopeKey,
               workerIndex: i,
             },
@@ -433,6 +458,7 @@ export default function App() {
         }
       };
       const failWorker = (method, info) => {
+        if (settled.has(i)) return;
         failures++;
         lastMethod = method; lastInfo = info || lastInfo;
         settleWorker(i, {

@@ -101,7 +101,9 @@ function candidateEvidenceResult(state) {
 function classify(state, fastCandidate) {
   const results = state.results.map(entry => entry.result).filter(Boolean);
   const candidateEvidence = candidateEvidenceResult(state);
-  return classifyPortfolioEvidence(candidateEvidence ? [...results, candidateEvidence] : results, {
+  /* Put the host-verified candidate first so equal-cost Worker evidence can
+     prove it but cannot replace its placed layout as bestResult. */
+  return classifyPortfolioEvidence(candidateEvidence ? [candidateEvidence, ...results] : results, {
     fastCandidate,
     proofScopeKey: state.proofScopeKey,
   });
@@ -163,7 +165,10 @@ function reduceValidCandidate(state, event) {
 
   /* Negative cases never race: every Worker must finish before the portfolio
      may say anything about completeness. */
-  if (!state.expectSolution) return mergeCandidate(state, candidate);
+  if (!state.expectSolution) {
+    if (!state.activeWorkerIds.includes(event.workerId)) return inert(state);
+    return mergeCandidate(state, candidate);
+  }
 
   if (state.phase === "proof-grace") {
     /* A cancelled loser's in-flight candidate must not move the winner. */
@@ -186,6 +191,15 @@ function reduceValidCandidate(state, event) {
     { type: "publish-candidate", workerId: event.workerId, candidate },
     ...losers.map(workerId => ({ type: "cancel-worker", workerId })),
   ];
+
+  /* A proof may have settled before this candidate event. Classify the evidence
+     already in hand before starting or skipping grace; otherwise an earlier
+     exhaustion proof could be silently discarded when grace expires. */
+  const existingEvidence = classify(claimed, false);
+  if (DECISIVE_TERMINATION_REASONS.has(existingEvidence.terminationReason)) {
+    const finished = finishWith(claimed, existingEvidence);
+    return { state: finished.state, effects: [...effects, ...finished.effects] };
+  }
 
   if (state.proofGraceMs > 0) {
     return {
