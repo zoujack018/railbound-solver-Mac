@@ -418,6 +418,48 @@ test("createProofScopeKey：非法值抛 TypeError", () => {
   assert.throws(() => createProofScopeKey("case-1"), TypeError);
 });
 
+/* ── Authoritative-candidate safety line ──
+   A Worker's `done` payload may *claim* a proof, but its self-reported `best` is
+   not evidence that the main thread ever verified a solution. Without a
+   valid-candidate the portfolio accepted, `optimal-proven / complete=true` is
+   never available. */
+
+function soloState(overrides = {}) {
+  return createPortfolioState({
+    workerIds: [0],
+    expectSolution: true,
+    proofScopeKey: "scope-a",
+    proofGraceMs: 100,
+    ...overrides,
+  });
+}
+
+test("SAFE-1. 无 valid-candidate 时 Worker 自报 best 不得成为权威候选", () => {
+  const { state } = reduce(soloState(), doneEvent(0, { ...optimalResult(7), workerIndex: 0 }));
+  assert.equal(state.bestCandidate, null);
+  assert.equal(state.finalEvidence.complete, false);
+  assert.equal(state.finalEvidence.terminationReason, "portfolio-incomplete");
+  assert.equal(state.finalEvidence.bestResult, null);
+});
+
+test("SAFE-3. 主线程候选 + 同域同成本证明：complete=true，bestResult 用候选布局", () => {
+  const claimed = reduce(soloState(), candidateEvent(0, 7)).state;
+  const { state } = reduce(claimed, doneEvent(0, { ...optimalResult(7), workerIndex: 0 }));
+  assert.equal(state.finalEvidence.complete, true);
+  assert.equal(state.finalEvidence.terminationReason, "optimal-proven");
+  assert.equal(state.finalEvidence.bestResult.best.cost, 7);
+  assert.deepEqual(state.finalEvidence.bestResult.best.placed, { "0,0": "-" });
+  assert.equal(state.finalEvidence.proofResult.workerIndex, 0);
+  assert.equal(state.finalEvidence.proofResult.terminationReason, "optimal-proven");
+});
+
+test("SAFE-4. 无候选时同域 exhaustion 仍可 complete=true", () => {
+  const { state } = reduce(soloState(), doneEvent(0, { ...exhaustionResult(), workerIndex: 0 }));
+  assert.equal(state.finalEvidence.complete, true);
+  assert.equal(state.finalEvidence.terminationReason, "search-exhausted");
+  assert.equal(state.finalEvidence.bestResult, null);
+});
+
 /* ── Model-checker counterexample regressions (found by
       test/puzzle-portfolio-model-tests.js) ── */
 
@@ -484,8 +526,13 @@ test("CE-2. 同成本候选的域外/域内先后顺序不得改变结论", () =
   const localFirst = run([[0, "scope-a"], [1, "scope-b"]]);
   assert.equal(foreignFirst.terminationReason, localFirst.terminationReason);
   assert.equal(foreignFirst.complete, localFirst.complete);
-  assert.equal(foreignFirst.complete, true);
-  assert.equal(foreignFirst.terminationReason, "optimal-proven");
+  /* Neither trace contains a valid-candidate, so the portfolio holds no
+     host-verified candidate and may not claim optimality at all — regardless of
+     which Worker's self-reported proof arrived first. */
+  assert.equal(foreignFirst.complete, false);
+  assert.equal(foreignFirst.terminationReason, "portfolio-incomplete");
+  assert.equal(foreignFirst.bestResult, null);
+  assert.equal(localFirst.bestResult, null);
 });
 
 console.log(`\n═══════════ Portfolio state machine: ${passed} passed, ${failures.length} failed ═══════════`);

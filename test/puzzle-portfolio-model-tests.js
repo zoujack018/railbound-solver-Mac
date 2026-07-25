@@ -191,6 +191,16 @@ function oracleIncompleteStatus(results) {
   return "incomplete";
 }
 
+/* Whichever Worker is credited with a proof must be a function of the evidence,
+   so the oracle always credits the lowest workerIndex. */
+function oraclePick(list) {
+  let picked = null;
+  for (const result of list) {
+    if (!picked || (result.workerIndex ?? Infinity) < (picked.workerIndex ?? Infinity)) picked = result;
+  }
+  return picked;
+}
+
 function oracleEvidence(state) {
   /* One pass over the settled evidence; each contract predicate is still stated
      and evaluated separately, this simply avoids four array traversals per
@@ -199,68 +209,48 @@ function oracleEvidence(state) {
   const validExhaustion = [];
   const optimalClaims = [];
   const results = [];
-  let fallback = null;
   for (const entry of state.settled) {
     const result = entry.result;
     results.push(result);
     if (oracleValidOptimal(result)) validOptimal.push(result);
     if (oracleValidExhaustion(result)) validExhaustion.push(result);
     if (oracleOptimalClaim(result)) optimalClaims.push(result);
-    if (result?.status !== "solved" || !result.best) continue;
-    if (!fallback
-      || result.best.cost < fallback.best.cost
-      || (result.best.cost === fallback.best.cost && sameScope(result) && !sameScope(fallback))) {
-      fallback = result;
-    }
   }
 
-  /* The authoritative candidate is the one the host already re-verified. Only
-     when the portfolio holds none may a Worker-reported candidate stand in, and
-     then the cheapest wins, with an in-domain candidate preferred over an
-     equally cheap foreign-domain one so arrival order cannot decide. */
-  let authCost = state.bestCost;
-  let authPlaced = state.bestPlaced;
-  let authInScope = state.bestCost != null;
-  if (authCost == null && fallback) {
-    authCost = fallback.best.cost;
-    authPlaced = fallback.best.placed ?? null;
-    authInScope = sameScope(fallback);
-  }
+  /* The ONLY authoritative candidate is one the portfolio accepted through a
+     valid-candidate event — i.e. one the host re-verified with simulate().
+     A Worker's `done` payload may claim a proof, but its self-reported `best`
+     is not a verified solution and can never stand in for one. */
+  const authCost = state.bestCost;
+  const authPlaced = state.bestPlaced;
 
   if (authCost != null) {
-    if (validExhaustion.length) {
+    const exhaustion = oraclePick(validExhaustion);
+    if (exhaustion) {
       return {
         status: "solved", complete: false, terminationReason: "portfolio-contract-conflict",
-        bestCost: authCost, bestPlaced: authPlaced, proofWorker: validExhaustion[0].workerIndex ?? null,
+        bestCost: authCost, bestPlaced: authPlaced, proofWorker: exhaustion.workerIndex ?? null,
       };
     }
-    /* A proof only speaks about a candidate from its own search domain. If the
-       authoritative candidate came out of a foreign domain, no proof applies to
-       it, so completeness may never be claimed. */
-    if (!authInScope) {
-      return {
-        status: "solved", complete: false, terminationReason: "candidate-unproven-portfolio",
-        bestCost: authCost, bestPlaced: authPlaced, proofWorker: null,
-      };
-    }
-    const matching = validOptimal.find(result => result.finalCost === authCost);
+    const matching = oraclePick(validOptimal.filter(result => result.finalCost === authCost));
     if (matching) {
       return {
         status: "solved", complete: true, terminationReason: "optimal-proven",
         bestCost: authCost, bestPlaced: authPlaced, proofWorker: matching.workerIndex ?? null,
       };
     }
-    const disagreeing = validOptimal.find(result => result.finalCost !== authCost);
+    const disagreeing = oraclePick(validOptimal.filter(result => result.finalCost !== authCost));
     if (disagreeing) {
       return {
         status: "solved", complete: false, terminationReason: "portfolio-proof-mismatch",
         bestCost: authCost, bestPlaced: authPlaced, proofWorker: disagreeing.workerIndex ?? null,
       };
     }
-    if (optimalClaims.length) {
+    const tainted = oraclePick(optimalClaims);
+    if (tainted) {
       return {
         status: "solved", complete: false, terminationReason: "portfolio-proof-mismatch",
-        bestCost: authCost, bestPlaced: authPlaced, proofWorker: optimalClaims[0].workerIndex ?? null,
+        bestCost: authCost, bestPlaced: authPlaced, proofWorker: tainted.workerIndex ?? null,
       };
     }
     return {
@@ -269,10 +259,15 @@ function oracleEvidence(state) {
     };
   }
 
-  if (validExhaustion.length) {
+  /* No accepted candidate. Unsolvability can still be proven, because an
+     exhaustion proof asserts the absence of any solution and needs no candidate
+     to be about. An optimality claim cannot: there is nothing for it to be
+     optimal over, so it never raises completeness. */
+  const exhaustion = oraclePick(validExhaustion);
+  if (exhaustion) {
     return {
       status: "search-exhausted", complete: true, terminationReason: "search-exhausted",
-      bestCost: null, bestPlaced: null, proofWorker: validExhaustion[0].workerIndex ?? null,
+      bestCost: null, bestPlaced: null, proofWorker: exhaustion.workerIndex ?? null,
     };
   }
   const material = results.filter(result => result.status !== "cancelled");
@@ -543,6 +538,11 @@ const coverage = {
   cancelEffects: 0,
   publishEffects: 0,
   graceStartEffects: 0,
+  p19Checks: 0,
+  pairwiseTerminalCasesN3: 0,
+  pairwiseTerminalCasesN4: 0,
+  n4CandidateAllSettledCases: 0,
+  terminalVariantPerWorker: {},
 };
 
 function bump(bucket, key) {
@@ -551,7 +551,7 @@ function bump(bucket, key) {
 
 /* ═══════════ Safety properties 1–18 ═══════════ */
 
-function checkSafety(config, trace, before, output, oracleAfter) {
+function checkSafety(config, trace, before, output, oracleAfter, acceptedCandidateCosts) {
   const state = output.state;
   const active = state.activeWorkerIds;
   const cancelled = state.cancelledWorkerIds;
@@ -619,6 +619,21 @@ function checkSafety(config, trace, before, output, oracleAfter) {
       if (evidence.bestResult) {
         recordCounterexample("P9 search-exhausted complete=true 却带有候选", config, trace,
           { bestResult: evidence.bestResult });
+      }
+    }
+    /* 19: an optimal-proven completeness claim requires a valid-candidate the
+       state machine actually accepted, at the very cost the proof asserts. This
+       is derived from the publish-candidate effects seen along the trace, never
+       from finalEvidence, so the verdict cannot vouch for itself. */
+    if (evidence.complete === true && evidence.terminationReason === "optimal-proven") {
+      coverage.p19Checks += 1;
+      const provenCost = evidence.proofResult?.finalCost ?? null;
+      if (!acceptedCandidateCosts.size) {
+        recordCounterexample("P19 无任何被接纳的 valid-candidate 却声明 optimal-proven", config, trace,
+          { provenCost });
+      } else if (!acceptedCandidateCosts.has(provenCost)) {
+        recordCounterexample("P19 optimal-proven 的成本没有对应被接纳的候选", config, trace,
+          { provenCost, acceptedCandidateCosts: [...acceptedCandidateCosts] });
       }
     }
     // 17: an equal-cost Worker proof must not replace the host candidate layout.
@@ -802,6 +817,7 @@ function runConfig(config, limits) {
     plan: initialPlan,
     graceFired: initialGrace,
     cancelCounts: {},
+    acceptedCosts: new Set(),
     trace: [],
   }];
   seen.add(stateKey(initialProduction, initialPlan));
@@ -891,7 +907,16 @@ function exploreQueue(config, limits, queue, seen, catalog) {
         });
       }
 
-      checkSafety(config, trace, beforeProjection, output, oracleOutput.state);
+      /* Accepted-candidate facts come from publish-candidate effects, which are
+         emitted exactly when the reducer adopts a host-verified candidate. */
+      let nextAccepted = node.acceptedCosts;
+      for (const effect of output.effects) {
+        if (effect.type !== "publish-candidate") continue;
+        if (nextAccepted === node.acceptedCosts) nextAccepted = new Set(node.acceptedCosts);
+        nextAccepted.add(effect.candidate.cost);
+      }
+
+      checkSafety(config, trace, beforeProjection, output, oracleOutput.state, nextAccepted);
 
       if (output.state.finalEvidence) {
         bump(coverage.finalReasons, output.state.finalEvidence.terminationReason);
@@ -925,6 +950,7 @@ function exploreQueue(config, limits, queue, seen, catalog) {
         plan: nextPlan,
         graceFired: nextGrace,
         cancelCounts: nextCancels,
+        acceptedCosts: nextAccepted,
         trace,
       });
     }
@@ -961,9 +987,161 @@ for (const config of CONFIGS) {
     if (!(error instanceof Counterexample)) throw error;
   }
 }
-const elapsedMs = Number(process.hrtime.bigint() - started) / 1e6;
 
 /* ═══════════ Forced replay sequences A–H ═══════════ */
+
+/* ═══════════ Exhaustive pairwise terminal replay ═══════════
+   The BFS above slices the terminal alphabet per Worker at N=3 and N=4, so a
+   defect needing two specific Workers to emit two specific terminal variants is
+   outside its reach. This layer closes exactly that gap: for every ordered
+   Worker pair and every one of the 18×18 ordered terminal-variant pairs it
+   replays both arrival orders and re-runs the same production/oracle/safety
+   comparison. It is exhaustive over pairs, not over the whole state space. */
+
+function noteTerminalVariant(workerCount, workerId, terminal) {
+  const key = `N${workerCount}:w${workerId}`;
+  if (!coverage.terminalVariantPerWorker[key]) coverage.terminalVariantPerWorker[key] = new Set();
+  coverage.terminalVariantPerWorker[key].add(`${terminal.kindId}|${terminal.scope}`);
+}
+
+/* Drives a fixed event list through production and oracle in lockstep,
+   asserting the projection, the effects and every safety property at each step. */
+function replayLockstep(config, events, label) {
+  let production = createPortfolioState({
+    workerIds: config.workerIds,
+    expectSolution: config.expectSolution,
+    proofScopeKey: PORTFOLIO_SCOPE,
+    proofGraceMs: config.proofGraceMs,
+  });
+  let oracle = oracleInit(config);
+  let accepted = new Set();
+  const cancelCounts = {};
+  const trace = [];
+
+  for (const event of events) {
+    trace.push(event);
+    deepFreeze(production);
+    deepFreeze(event);
+    const beforeProjection = projectProduction(production);
+    const output = reducePortfolioEvent(production, event);
+    const oracleOutput = oracleReduce(config, oracle, event);
+    coverage.transitions += 1;
+    bump(coverage.eventTypes, event.type);
+
+    if (projectionKey(projectProduction(output.state)) !== projectionKey(projectOracle(oracleOutput.state))) {
+      recordCounterexample(`oracle 与 production 状态投影不一致（${label}）`, config, trace, {
+        production: projectProduction(output.state),
+        oracle: projectOracle(oracleOutput.state),
+      });
+    }
+    if (effectsKey(output.effects, productionEvidenceProjection)
+      !== effectsKey(oracleOutput.effects, evidenceProjection)) {
+      recordCounterexample(`oracle 与 production effects 不一致（${label}）`, config, trace, {
+        production: projectEffects(output.effects, productionEvidenceProjection),
+        oracle: projectEffects(oracleOutput.effects, evidenceProjection),
+      });
+    }
+    for (const effect of output.effects) {
+      if (effect.type === "publish-candidate") accepted.add(effect.candidate.cost);
+      if (effect.type !== "cancel-worker") continue;
+      cancelCounts[effect.workerId] = (cancelCounts[effect.workerId] || 0) + 1;
+      if (cancelCounts[effect.workerId] > 1) {
+        recordCounterexample(`P16 同一个 workerId 被取消多次（${label}）`, config, trace, { cancelCounts });
+      }
+    }
+    checkSafety(config, trace, beforeProjection, output, oracleOutput.state, accepted);
+    production = output.state;
+    oracle = oracleOutput.state;
+  }
+  return production;
+}
+
+const pairwiseCoverage = { 3: new Map(), 4: new Map() };
+
+function runPairwiseTerminalReplay() {
+  for (const workerCount of [3, 4]) {
+    const workerIds = Array.from({ length: workerCount }, (_, index) => index);
+    for (const expectSolution of [true, false]) {
+      const config = { workerIds, workerCount, expectSolution, proofGraceMs: 100 };
+      for (const first of workerIds) {
+        for (const second of workerIds) {
+          if (first === second) continue;
+          const pairKey = `${first}->${second}`;
+          if (!pairwiseCoverage[workerCount].has(pairKey)) {
+            pairwiseCoverage[workerCount].set(pairKey, new Set());
+          }
+          const combos = pairwiseCoverage[workerCount].get(pairKey);
+          for (const terminalA of TERMINALS) {
+            for (const terminalB of TERMINALS) {
+              combos.add(`${terminalA.kindId}|${terminalA.scope}#${terminalB.kindId}|${terminalB.scope}`);
+              noteTerminalVariant(workerCount, first, terminalA);
+              noteTerminalVariant(workerCount, second, terminalB);
+              const eventA = { type: "worker-done", workerId: first, result: terminalResult(terminalA, first), atMs: 300 };
+              const eventB = { type: "worker-done", workerId: second, result: terminalResult(terminalB, second), atMs: 310 };
+              const label = `N${workerCount} ${pairKey} ${terminalA.kindId}/${terminalA.scope} × ${terminalB.kindId}/${terminalB.scope}`;
+              replayLockstep(config, [eventA, eventB], `${label} order=AB`);
+              replayLockstep(config, [eventB, eventA], `${label} order=BA`);
+              const counter = workerCount === 3 ? "pairwiseTerminalCasesN3" : "pairwiseTerminalCasesN4";
+              coverage[counter] += 2;
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+/* N=4 negative convergence: one accepted candidate, then all four Workers
+   settle, across both candidate costs, both grace settings, every terminal
+   variant as a four-Worker sweep, and all 24 settle-order permutations. */
+const n4SettleOrders = new Set();
+const n4TerminalVariants = new Set();
+
+function permute(list) {
+  if (list.length <= 1) return [list.slice()];
+  const output = [];
+  for (let index = 0; index < list.length; index++) {
+    const rest = list.slice(0, index).concat(list.slice(index + 1));
+    for (const tail of permute(rest)) output.push([list[index], ...tail]);
+  }
+  return output;
+}
+
+function runN4CandidateAllSettledReplay() {
+  const workerIds = [0, 1, 2, 3];
+  const orders = permute(workerIds);
+  for (const cost of [LOW_COST, HIGH_COST]) {
+    for (const proofGraceMs of [0, 100]) {
+      const config = { workerIds, workerCount: 4, expectSolution: false, proofGraceMs };
+      for (const terminal of TERMINALS) {
+        n4TerminalVariants.add(`${terminal.kindId}|${terminal.scope}`);
+        for (const order of orders) {
+          n4SettleOrders.add(order.join(""));
+          const events = [candidateEvent(order[0], cost, "dfs", 100)];
+          for (const workerId of order) {
+            events.push({ type: "worker-done", workerId, result: terminalResult(terminal, workerId), atMs: 300 });
+            noteTerminalVariant(4, workerId, terminal);
+          }
+          replayLockstep(config, events,
+            `N4 negative cost=${cost} grace=${proofGraceMs} ${terminal.kindId}/${terminal.scope} order=${order.join("")}`);
+          coverage.n4CandidateAllSettledCases += 1;
+        }
+      }
+    }
+  }
+}
+
+try {
+  runPairwiseTerminalReplay();
+} catch (error) {
+  if (!(error instanceof Counterexample)) throw error;
+}
+try {
+  runN4CandidateAllSettledReplay();
+} catch (error) {
+  if (!(error instanceof Counterexample)) throw error;
+}
+const elapsedMs = Number(process.hrtime.bigint() - started) / 1e6;
 
 const replayFailures = [];
 function replay(name, config, events, expectation) {
@@ -1084,10 +1262,10 @@ replay("H 负例：候选到达但其他 Worker 未结束", FOUR_NEGATIVE, [
 
 /* ═══════════ Report ═══════════ */
 
-console.log("\nPortfolio model check");
-console.log(`  configs=${coverage.configs}`);
-console.log(`  uniqueStates=${coverage.uniqueStates}`);
-console.log(`  transitions=${coverage.transitions}`);
+console.log("\nPortfolio model check (bounded BFS + exhaustive pairwise terminal replay)");
+console.log(`  bfsConfigs=${coverage.configs}`);
+console.log(`  bfsUniqueStates=${coverage.uniqueStates}`);
+console.log(`  transitions=${coverage.transitions} (BFS + pairwise replay)`);
 console.log(`  maxDepth=${coverage.maxDepth}`);
 console.log(`  elapsedMs=${Math.round(elapsedMs)}`);
 console.log(`  eventTypes=${JSON.stringify(coverage.eventTypes)}`);
@@ -1099,6 +1277,13 @@ console.log(`  workerCounts=${JSON.stringify(coverage.workerCounts)}`);
 console.log(`  expectSolutionModes=${JSON.stringify(coverage.expectSolutionModes)}`);
 console.log(`  graceModes=${JSON.stringify(coverage.graceModes)}`);
 console.log(`  effects cancel=${coverage.cancelEffects} publish=${coverage.publishEffects} grace=${coverage.graceStartEffects}`);
+console.log(`  pairwiseTerminalCasesN3=${coverage.pairwiseTerminalCasesN3}`);
+console.log(`  pairwiseTerminalCasesN4=${coverage.pairwiseTerminalCasesN4}`);
+console.log(`  n4CandidateAllSettledCases=${coverage.n4CandidateAllSettledCases}`);
+console.log(`  n4SettleOrders=${n4SettleOrders.size} n4TerminalVariants=${n4TerminalVariants.size}`);
+console.log(`  terminalVariantPerWorker=${JSON.stringify(Object.fromEntries(
+  Object.entries(coverage.terminalVariantPerWorker).map(([key, set]) => [key, set.size])))}`);
+console.log(`  p19Checks=${coverage.p19Checks}`);
 console.log(`  counterexamples=${counterexamples.length}`);
 
 if (counterexamples.length) {
@@ -1166,7 +1351,7 @@ expect("每个强制 terminationReason 至少命中一次", () => {
     assert.ok(coverage.finalReasons[reason] > 0, `终止原因 ${reason} 未命中`);
   }
 });
-expect("每个 N 的逐 Worker 终态字母表并集等于完整 18 变体域", () => {
+expect("BFS 层：每个 N 的逐 Worker 终态字母表并集等于完整 18 变体域（并集完整，非逐 Worker 穷举）", () => {
   for (const workerCount of [1, 2, 3, 4]) {
     const config = { workerCount, workerIds: Array.from({ length: workerCount }, (_, i) => i) };
     const union = new Set();
@@ -1179,6 +1364,38 @@ expect("每个 N 的逐 Worker 终态字母表并集等于完整 18 变体域", 
 expect("scope-a 与 scope-b 证明均被尝试", () => {
   assert.ok(coverage.scopeProofAttempts["scope-a"] > 0);
   assert.ok(coverage.scopeProofAttempts["scope-b"] > 0);
+});
+expect("pairwise 层：N=3 每个 ordered worker pair 覆盖 18×18 终态组合", () => {
+  const pairs = pairwiseCoverage[3];
+  assert.equal(pairs.size, 6, `N=3 ordered pair 数应为 6，实际 ${pairs.size}`);
+  for (const [pairKey, combos] of pairs) {
+    assert.equal(combos.size, TERMINALS.length * TERMINALS.length, `N=3 ${pairKey} 组合数 ${combos.size}`);
+  }
+});
+expect("pairwise 层：N=4 每个 ordered worker pair 覆盖 18×18 终态组合", () => {
+  const pairs = pairwiseCoverage[4];
+  assert.equal(pairs.size, 12, `N=4 ordered pair 数应为 12，实际 ${pairs.size}`);
+  for (const [pairKey, combos] of pairs) {
+    assert.equal(combos.size, TERMINALS.length * TERMINALS.length, `N=4 ${pairKey} 组合数 ${combos.size}`);
+  }
+});
+expect("pairwise 层：N=3 与 N=4 的每个 Worker 都执行过全部 18 个终态变体", () => {
+  for (const workerCount of [3, 4]) {
+    for (let workerId = 0; workerId < workerCount; workerId++) {
+      const seen = coverage.terminalVariantPerWorker[`N${workerCount}:w${workerId}`];
+      assert.ok(seen, `N${workerCount} worker ${workerId} 无终态记录`);
+      assert.equal(seen.size, TERMINALS.length, `N${workerCount} worker ${workerId} 只覆盖 ${seen.size} 个变体`);
+    }
+  }
+});
+expect("N=4 负例全收敛回放：候选成本、grace、18 变体与 24 个终止排列全覆盖", () => {
+  assert.equal(coverage.n4CandidateAllSettledCases, 2 * 2 * TERMINALS.length * 24,
+    `实际 ${coverage.n4CandidateAllSettledCases}`);
+  assert.equal(n4SettleOrders.size, 24, `终止顺序排列数 ${n4SettleOrders.size}`);
+  assert.equal(n4TerminalVariants.size, TERMINALS.length, `四 Worker 同变体轨迹覆盖 ${n4TerminalVariants.size} 个变体`);
+});
+expect("P19 至少被检查一次", () => {
+  assert.ok(coverage.p19Checks > 0, `p19Checks=${coverage.p19Checks}`);
 });
 expect("探索转换数不少于 10000", () => {
   assert.ok(coverage.transitions >= 10000, `transitions=${coverage.transitions}`);

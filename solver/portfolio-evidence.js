@@ -177,6 +177,56 @@ function hasValidOptimalProof(result) {
     && !(result.overLimit?.length);
 }
 
+/* ═══════════ Deterministic evidence ordering ═══════════
+   Every selection below must be a function of the evidence set alone. Sorting
+   lives here rather than in the callers so no caller can influence a verdict by
+   pre-ordering its results array. All sorts run on filtered copies, so neither
+   the input array nor any result object is modified. */
+
+function scopeRank(result, proofScopeKey) {
+  return proofScopeKey == null || result.proofScopeKey === proofScopeKey ? 0 : 1;
+}
+
+/* Last-resort ordering when results carry no workerIndex: a stable key derived
+   from the evidence content, never from array position. */
+function identityFallbackKey(result) {
+  return [
+    result.proofScopeKey ?? "",
+    result.status ?? "",
+    result.terminationReason ?? "",
+    result.finalCost ?? "",
+    result.best?.cost ?? "",
+  ].join("|");
+}
+
+function compareByIdentity(a, b) {
+  const aIndexed = Number.isFinite(a.workerIndex);
+  const bIndexed = Number.isFinite(b.workerIndex);
+  if (aIndexed !== bIndexed) return aIndexed ? -1 : 1;
+  if (aIndexed && a.workerIndex !== b.workerIndex) return a.workerIndex - b.workerIndex;
+  const aKey = identityFallbackKey(a);
+  const bKey = identityFallbackKey(b);
+  if (aKey < bKey) return -1;
+  return aKey > bKey ? 1 : 0;
+}
+
+/* Cheapest first; on a tie the portfolio's own search domain wins, because a
+   foreign-domain candidate disqualifies every proof. */
+function compareCandidates(a, b, proofScopeKey) {
+  return (a.best.cost - b.best.cost)
+    || (scopeRank(a, proofScopeKey) - scopeRank(b, proofScopeKey))
+    || compareByIdentity(a, b);
+}
+
+function pickDeterministic(results, predicate) {
+  let picked = null;
+  for (const result of results) {
+    if (!predicate(result)) continue;
+    if (!picked || compareByIdentity(result, picked) < 0) picked = result;
+  }
+  return picked;
+}
+
 function preferredIncompleteStatus(results) {
   if (results.some(result => result.status === "error")) return "error";
   if (results.some(result => result.status === "timeout")) return "timeout";
@@ -189,45 +239,49 @@ function preferredIncompleteStatus(results) {
 /* Pure portfolio proof classifier. Worker-local telemetry and candidates enter
    as immutable evidence; no top-level proof field is inherited via object
    spread from an arbitrary worker. */
-export function classifyPortfolioEvidence(results, {
-  fastCandidate = false,
-  proofScopeKey = null,
-  authoritativeCandidate = null,
-} = {}) {
+export function classifyPortfolioEvidence(results, options = {}) {
+  const { fastCandidate = false, proofScopeKey = null } = options;
   const proofEligibleResults = proofScopeKey == null
     ? results
     : results.filter(result => result?.proofScopeKey === proofScopeKey);
-  /* Equal-cost candidates keep the caller's order: the sort is stable, so the
-     caller decides the tie-break by how it orders `results`. */
-  const candidates = results
-    .filter(result => result?.status === "solved" && result.best)
-    .sort((a, b) => a.best.cost - b.best.cost);
-  /* When the caller holds a candidate the host already re-verified, that
-     candidate is the authority. A Worker's self-reported `best` must not become
-     the portfolio's answer by merely claiming a lower cost — including a
-     cancelled loser's candidate, which the orchestrator deliberately refused to
-     adopt. Worker proofs are then judged against the authoritative cost. */
-  const bestResult = authoritativeCandidate || candidates[0] || null;
-  const exhaustionProofs = proofEligibleResults.filter(hasValidExhaustionProof);
-  const optimalProofs = proofEligibleResults.filter(hasValidOptimalProof);
+
+  /* `authoritativeCandidate` is three-state and the distinction is the safety
+     line of the whole portfolio:
+       omitted / undefined — legacy call: infer a candidate from `results`.
+       object              — the caller holds a candidate the host re-verified;
+                             it is the only authority, and no Worker's
+                             self-reported `best` may replace it.
+       null                — the caller states there is NO verified candidate;
+                             inferring one from `results` is forbidden, so a
+                             Worker's self-reported `best` can never become the
+                             portfolio's answer. */
+  const inferCandidate = options.authoritativeCandidate === undefined;
+  const bestResult = inferCandidate
+    ? (results
+        .filter(result => result?.status === "solved" && result.best)
+        .sort((a, b) => compareCandidates(a, b, proofScopeKey))[0] || null)
+    : options.authoritativeCandidate;
 
   if (bestResult) {
-    if (exhaustionProofs.length) {
+    const exhaustionProof = pickDeterministic(proofEligibleResults, hasValidExhaustionProof);
+    if (exhaustionProof) {
       return {
         status: "solved",
         complete: false,
         terminationReason: "portfolio-contract-conflict",
         bestResult,
-        proofResult: exhaustionProofs[0],
+        proofResult: exhaustionProof,
       };
     }
     const bestScopeEligible = proofScopeKey == null || bestResult.proofScopeKey === proofScopeKey;
     const sharesBestScope = result => proofScopeKey != null
       || result?.proofScopeKey === bestResult.proofScopeKey;
-    const relevantOptimalProofs = bestScopeEligible
-      ? optimalProofs.filter(sharesBestScope)
-      : [];
-    const matchingProof = relevantOptimalProofs.find(result => result.finalCost === bestResult.best.cost);
+    const relevantOptimalProof = predicate => (bestScopeEligible
+      ? pickDeterministic(proofEligibleResults, result =>
+          hasValidOptimalProof(result) && sharesBestScope(result) && predicate(result))
+      : null);
+
+    const matchingProof = relevantOptimalProof(result => result.finalCost === bestResult.best.cost);
     if (matchingProof) {
       return {
         status: "solved",
@@ -237,7 +291,7 @@ export function classifyPortfolioEvidence(results, {
         proofResult: matchingProof,
       };
     }
-    const costMismatchedProof = relevantOptimalProofs.find(result => result.finalCost !== bestResult.best.cost);
+    const costMismatchedProof = relevantOptimalProof(result => result.finalCost !== bestResult.best.cost);
     if (costMismatchedProof) {
       return {
         status: "solved",
@@ -256,26 +310,28 @@ export function classifyPortfolioEvidence(results, {
         proofResult: null,
       };
     }
-    const mismatchedProof = bestScopeEligible ? proofEligibleResults.find(result =>
-      sharesBestScope(result)
-      && result?.complete === true
-      && result?.terminationReason === "optimal-proven") : null;
+    const taintedProof = bestScopeEligible
+      ? pickDeterministic(proofEligibleResults, result => sharesBestScope(result)
+          && result?.complete === true
+          && result?.terminationReason === "optimal-proven")
+      : null;
     return {
       status: "solved",
       complete: false,
-      terminationReason: mismatchedProof ? "portfolio-proof-mismatch" : "candidate-unproven-portfolio",
+      terminationReason: taintedProof ? "portfolio-proof-mismatch" : "candidate-unproven-portfolio",
       bestResult,
-      proofResult: mismatchedProof || null,
+      proofResult: taintedProof,
     };
   }
 
-  if (exhaustionProofs.length) {
+  const exhaustionProof = pickDeterministic(proofEligibleResults, hasValidExhaustionProof);
+  if (exhaustionProof) {
     return {
       status: "search-exhausted",
       complete: true,
       terminationReason: "search-exhausted",
       bestResult: null,
-      proofResult: exhaustionProofs[0],
+      proofResult: exhaustionProof,
     };
   }
 
