@@ -273,10 +273,20 @@ generation for funnel puzzles belongs to a future P12 generalization
 (cycle-family parameterization, a design round) or stays with the DFS
 portfolio. The next rounds, in order:
 
-1. **P10 precondition: DFS profile** — measure the per-node hotspot (state-key
-   string building is the standing suspect; P7 evaluation adds ~16%) before
-   designing any Zobrist/compact encoding.
-2. **P12 generalization (cycle families)** — only as a deliberate design
+The fourteenth round ran the P10-precondition profile (7×7-8-7A budget-19
+exhaustion, 7.26M nodes / 28.6s, `node --prof`): the per-node state-key
+string (construction + visited-Set hashing) plus string-keyed dynamic
+lookups account for ~50–60% of ticks; GC is 0.9% (object pooling ruled
+out); P7's own share ≈7.6%. The next rounds, in order:
+
+1. **P10: exact compact visited key** — replace the per-node ~100+-char
+   `sk` string with a compact exact encoding or a two-level hash→exact
+   table. SOUNDNESS LINE: a visited false positive prunes a subtree and
+   breaks completeness proofs, so lossy Zobrist alone is forbidden; the
+   old P4 negative probe (naive string LRU) does not cover this design.
+2. **String-keyed hot objects → array indexing** (`placed` etc.) — second
+   candidate, separate A/B after the key round.
+3. **P12 generalization (cycle families)** — only as a deliberate design
    round, if funnel-puzzle candidates beyond the DFS portfolio are needed.
 
 Historical probe scope: the old P4 probe rejects only the naive string-key LRU,
