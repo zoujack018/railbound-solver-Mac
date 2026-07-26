@@ -1,6 +1,6 @@
 # Test 关卡求解报告
 
-更新日期：2026-07-23（第八版：bounded portfolio proof grace）
+更新日期：2026-07-26（第九版：异构 Worker portfolio）
 
 ## 结论
 
@@ -21,6 +21,10 @@ seed 0、默认每题 20 秒（6×7-8-3A 单独 300 秒、7×7-8-5A 单独 120 �
 `PUZZLE_WORKERS=1..16` portfolio；原 bounded pattern seed 正名为 P12，以及
 候选消息补齐 `p12SeedMs` / source，属于协议与测量修正。第八版本轮唯一性能
 优化是 bounded portfolio proof grace；没有叠加异构 CSP/DFS 角色、P5 或 P7。
+第九版唯一性能优化是异构 Worker portfolio（Worker 0 保持 CSP→DFS，其余
+Worker 直进 DFS；`PORTFOLIO_HETEROGENEOUS=off` 回退同构），7×7-8-5A N=8
+首候选 ≈5.42s → ≈0.45s、ΣCSP ≈40s → ≈0.42s，属角色分配收益而非剪枝；
+P5、P7 与真 P8 仍未实施。
 10×11 应记为 `solved(p12-seed)`，关闭 P12 后的有机首候选和最优性证明仍未解决。
 
 ## 第五版：测量仪表与 `complete` 语义
@@ -486,6 +490,79 @@ P5/P7，因此不得把任何这类潜在收益归入本轮。
 
 本轮只修 proof retention 这一处性能/证明权衡。异构 portfolio、Barrier P5②、
 P7 和真正 P8 均未实现，后续必须分别作为单变量 A/B。
+
+## 第九版：异构 Worker portfolio（本轮唯一性能优化）
+
+### 动机与协议
+
+第七、八版的 N=8 组合复制八份相同的 CSP→DFS 管线：7×7-8-5A 上八个 Worker
+各自烧完约 5 秒的共享 CSP 预算后才进入 DFS，ΣCSP 约 40 秒，而确定性 CSP
+的八份拷贝不产生任何多样性。本轮只改变一个变量——Worker 角色分配：
+
+- Worker 0 保持完整 CSP→DFS 管线（含 P12 seed），作为候选侦察兵；
+- Worker 1..N-1 携带 `solverOptions.skipCsp = true`，跳过 CSP 与 P12，
+  直接以各自 seed 进入 DFS（Worker 端新增 `skipCsp` 分支，复用既有
+  `dfs(skip-csp)` 完备性路径，`complete` 语义不变）；
+- `skipCsp` 位于 `solverOptions` 内，因此经 `createProofScopeKey()`
+  两种角色**天然拥有不同 proofScopeKey**：跨角色候选照常参与比较与
+  权威 `simulate()` 复核（合法候选是关卡层面的事实），但完备性证明
+  绝不跨角色转移；
+- 组合状态机的完备性域取 **DFS-only 角色的域**：N-1 个同域 Worker 才能
+  互相印证证明，负例的 `search-exhausted` 与 grace 内的 `optimal-proven`
+  都产自该域。CSP 角色自己的完备性声明留在其域内，被保守丢弃——这是
+  已知的证明损失面（Worker 0 获胜且在宽限内完成证明的场景），换取
+  证明层（solver/portfolio-*）**零改动**；
+- `PORTFOLIO_HETEROGENEOUS=on|off`，默认 `on`；`off` 完整恢复第七/八版
+  同构组合用于 A/B。N=1 路径不受影响。
+
+遥测新增 `portfolioStats.heterogeneous` 与 `portfolioStats.workerRoles`；
+汇总行新增 `heterogeneous=` 字段；角色分布可从
+`p12Seed=classic-csp-route:1,dfs-only-role:7` 读出。
+
+### 7×7-8-5A、N=8：同构 vs 异构，两组顺序 A/B
+
+相同代码、相同 seed 序列、默认 grace=100ms，只切换
+`PORTFOLIO_HETEROGENEOUS`：
+
+| 轮次 | 模式 | 首候选 | 总墙钟 | ΣCSP | ΣDFS | 总 CPU（ΣCSP+ΣDFS） | 成本 | complete |
+|---|---|---:|---:|---:|---:|---:|---:|---|
+| 1 | 同构 | 5,432.92ms | 5,537ms | 40,010.61ms | 3,377.96ms | ≈43.4s | 23 | false |
+| 1 | 异构 | 441.27ms | 545ms | 415.66ms | 3,023.91ms | ≈3.4s | 23 | false |
+| 2 | 同构 | 5,405.41ms | 5,514ms | 40,008.14ms | 3,142.02ms | ≈43.2s | 23 | false |
+| 2 | 异构 | 451.15ms | 554ms | 429.03ms | 3,096.34ms | ≈3.5s | 23 | false |
+
+两种模式的 winner 完全一致（Worker 7 / seed 55464 / dfs 候选 / 23 轨 /
+67 步），nodes 下界一致（≥53,217），`complete:false` /
+`portfolio-first-valid-candidate` 不变。差异全部来自角色分配：
+
+- **首候选墙钟 ≈5.42s → ≈0.45s**：winner 不再先烧 ≈4.9s CSP 才进 DFS。
+- **ΣCSP ≈40.0s → ≈0.42s**：仅 Worker 0 运行 CSP，且它在 ≈0.45s 被
+  winner 取消（cancelled 相位时间为外推值，`phaseTimesExact:false`）。
+  原目标"ΣCSP ≈40s → ≈5s"被超额达成，因为快停连唯一一份 CSP 也没让跑满。
+- **ΣDFS 基本持平**（≈3.4s → ≈3.0s），搜索本身没有变化。
+
+这些收益是**角色分配消除重复 CSP**的结果，属于 CPU/延迟再分配，不是剪枝
+改进，不改变任何搜索完备性或候选质量结论；23 轨仍只是 incumbent 观察值，
+不是最小值。
+
+### 快速门禁与验收
+
+三条既有真实 Worker 集成夹具在异构默认下全部保持：
+
+1. 4×8、N=8、grace=0：`complete:false` / `portfolio-first-valid-candidate`。
+2. 4×8、N=8、grace=1000ms：DFS-only winner 在宽限内（实测 ≈17ms）完成
+   同域最优性证明，保持成本 9、`complete:true` / `optimal-proven`；
+   机器 proofScopeKey 断言携带 `"skipCsp":true` 且不含 seed。
+3. swap、N=4：DFS-only 域内 `complete:true` / `search-exhausted`。
+
+新增第四条集成夹具：`PORTFOLIO_HETEROGENEOUS=off` 的 4×8 同构回归——
+最优证明仍在宽限内保留，且 scope key 不含 `skipCsp`，钉住 A/B 开关的
+双向可用性。模型检查器与证明层测试无需改动（solver/portfolio-* 零改动），
+全门禁（模型检查 17/17、金丝雀 10、协议 2、P12 协议 5、构建）全绿。
+
+浏览器宿主接入同一角色策略（nW>1 时 Worker 0 为 CSP 角色，其余 DFS-only，
+按角色盖 proofScopeKey），经构建验证；其量化收益未单独测量，不计入本轮
+结论。Barrier P5②、P7、真 P8 与 P10 仍未实现，后续必须分别作为单变量 A/B。
 
 ## 规则语义现状（均经作者确认）
 

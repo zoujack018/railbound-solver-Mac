@@ -40,6 +40,23 @@ assert.ok(proofScope, `proofScopeKey 未出现在组合遥测中：${proofRetain
 assert.doesNotMatch(proofScope[1], /"seed"/);
 assert.match(proofScope[1], /"requestId":/);
 assert.match(proofScope[1], /"minTracks":/);
+/* 异构模式（默认）下组合的完备性域是 DFS-only 角色的域，机器 scope key
+   必须携带 skipCsp —— 这钉住"不同角色不同 proofScopeKey"。 */
+assert.match(proofRetained, /heterogeneous=true/);
+assert.match(proofScope[1], /"skipCsp":true/);
+
+/* 同构 A/B：PORTFOLIO_HETEROGENEOUS=off 恢复第七轮同构组合，最优证明
+   仍在 grace 内保留，且 scope key 不含 skipCsp。 */
+const homogeneous = runPortfolio("关卡-4x8-20260722-6-3A.json", {
+  PUZZLE_WORKERS: "8",
+  PUZZLE_PROOF_GRACE_MS: "1000",
+  PORTFOLIO_HETEROGENEOUS: "off",
+});
+assert.match(homogeneous, /finalCost=9/);
+assert.match(homogeneous, /complete=true/);
+assert.match(homogeneous, /terminationReason=optimal-proven/);
+assert.match(homogeneous, /heterogeneous=false/);
+assert.doesNotMatch(homogeneous, /"skipCsp"/);
 
 const repeatedWinnerCandidate = runPortfolio("关卡-7x5-20260722-5-7.json", {
   PUZZLE_WORKERS: "8",

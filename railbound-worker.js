@@ -1803,6 +1803,23 @@ self.onmessage = function (e) {
 
   postToMain({ type: "progress", phase: "prepare", iters: 0, pruned, cspMs: 0, dfsMs: 0, cspStats: cspGuard.snapshot(), dfsStats: emptyDfsStats() });
 
+  /* Heterogeneous portfolio role: candidate generation (CSP and the P12 seed)
+     is delegated to the CSP-role Worker; this one goes straight to DFS on its
+     own seed. `skipCsp` lives in solverOptions, so the DFS-only role owns a
+     distinct proofScopeKey and its completeness claims never transfer to the
+     CSP role's scope. */
+  if (solverOptions.skipCsp === true) {
+    cspGuard.stats.p12Seed.skipped = true;
+    cspGuard.stats.p12Seed.skipReason = "dfs-only-role";
+    cspGuard.stats.p12Seed.terminationReason = "dfs-only-role";
+    markCspSkipped("dfs-only-role");
+    const cspInfo = "CSP skipped: portfolio dfs-only role";
+    postToMain({ type: "progress", phase: "dfs", iters: 0, cspInfo, cspMs, dfsMs, cspStats: cspGuard.snapshot() });
+    const dfsResult = runDfs(budget);
+    finishAfterDfs(dfsResult.solutions.length > 0 ? "dfs(skip-csp)" : "no-solution", cspInfo, [], dfsResult);
+    return;
+  }
+
   /* Train 0 handling: CSP enumerates paths only for normal cars (zero car
      excluded — it has no goal). DFS simulates all cars jointly with full
      collision detection. Final validation uses simulate() + zeroSafetyLookahead(). */

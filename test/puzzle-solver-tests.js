@@ -24,6 +24,13 @@ const WORKER_URL = pathToFileURL(path.join(TEST_DIR, "solver-worker-node.js"));
 const defaultTimeoutMs = positiveInteger(process.env.PUZZLE_TIMEOUT_MS, 20_000);
 const puzzleWorkers = Math.min(positiveInteger(process.env.PUZZLE_WORKERS, 1), MAX_PUZZLE_WORKERS);
 const portfolioProofGraceMs = nonNegativeInteger(process.env.PUZZLE_PROOF_GRACE_MS, 100);
+const heterogeneousMode = String(process.env.PORTFOLIO_HETEROGENEOUS || "on").trim().toLowerCase();
+if (heterogeneousMode !== "on" && heterogeneousMode !== "off") {
+  throw new Error(`PORTFOLIO_HETEROGENEOUS must be on or off, received: ${process.env.PORTFOLIO_HETEROGENEOUS}`);
+}
+/* on（默认）：N>1 时 Worker 0 保持 CSP→DFS，其余 Worker 跳过 CSP 直接 DFS；
+   off：恢复第七轮的同构组合（全部 Worker 复制同一 CSP→DFS 管线）用于 A/B。 */
+const heterogeneousPortfolio = heterogeneousMode === "on";
 const PORTFOLIO_PROOF_GRACE_MARGIN_MS = 10;
 const requestedPattern = process.argv.slice(2).join(" ");
 
@@ -109,6 +116,11 @@ function buildSolverOptions(env = process.env) {
 }
 
 const solverOptions = buildSolverOptions();
+/* DFS-only 角色的 solverOptions。`skipCsp` 进入 createProofScopeKey 的
+   solverOptions 字段，因此该角色自动拥有与 CSP 角色不同的 proofScopeKey：
+   跨角色候选仍可比较（通过 simulate() 验证的候选是关卡层面的事实），
+   但完备性证明绝不跨角色转移。 */
+const dfsRoleSolverOptions = { ...solverOptions, skipCsp: true };
 
 function findJSONFiles(directory) {
   const files = [];
@@ -168,6 +180,7 @@ async function solveWorkerSession(testCase, {
   onValidCandidate = null,
   proofScopeKey = null,
   retainCandidateOnFailure = () => false,
+  solverOptions: sessionSolverOptions = solverOptions,
 } = {}) {
   const started = performance.now();
   const worker = new Worker(WORKER_URL, { type: "module" });
@@ -460,7 +473,7 @@ async function solveWorkerSession(testCase, {
         puzzle: { ...testCase.puzzle, _minTracks: true },
         seed,
         maxTracksHint: testCase.maxTracks ?? 0,
-        solverOptions,
+        solverOptions: sessionSolverOptions,
       });
     }
   });
@@ -631,12 +644,23 @@ async function solveCase(testCase) {
 
   const portfolioStarted = performance.now();
   const expectSolution = testCase.hasSolution !== false;
-  const proofScopeKey = createProofScopeKey({
+  const heterogeneous = heterogeneousPortfolio;
+  const scopeKeyFor = roleOptions => createProofScopeKey({
     requestId: testCase.relativePath,
     maxTracksHint: testCase.maxTracks ?? 0,
     minTracks: true,
-    solverOptions,
+    solverOptions: roleOptions,
   });
+  const cspRoleScopeKey = scopeKeyFor(solverOptions);
+  const dfsRoleScopeKey = heterogeneous ? scopeKeyFor(dfsRoleSolverOptions) : cspRoleScopeKey;
+  /* 异构模式下组合的完备性域是 DFS-only 角色的域：N-1 个同域 Worker 才能
+     互相印证证明，负例的 search-exhausted 与 grace 内的最优证明都产自这里。
+     CSP 角色（Worker 0）是候选侦察兵：它的候选照常参与比较与验证，但它的
+     完备性声明留在自己的域内，被保守丢弃而不是跨域转移。 */
+  const proofScopeKey = heterogeneous ? dfsRoleScopeKey : cspRoleScopeKey;
+  const roleFor = workerIndex => (heterogeneous && workerIndex > 0
+    ? { solverOptions: dfsRoleSolverOptions, proofScopeKey: dfsRoleScopeKey, role: "dfs-only" }
+    : { solverOptions, proofScopeKey: cspRoleScopeKey, role: "csp-dfs" });
   const workerIds = Array.from({ length: puzzleWorkers }, (_, index) => index);
   const controllers = workerIds.map(() => new AbortController());
   const collected = [];
@@ -756,7 +780,8 @@ async function solveCase(testCase) {
     seed: portfolioSeed(workerIndex),
     workerIndex,
     signal: controllers[workerIndex].signal,
-    proofScopeKey,
+    proofScopeKey: roleFor(workerIndex).proofScopeKey,
+    solverOptions: roleFor(workerIndex).solverOptions,
     retainCandidateOnFailure: () => graceStartedAt != null,
     onValidCandidate: (candidate, simulateResult) => dispatch({
       type: "valid-candidate",
@@ -819,6 +844,8 @@ async function solveCase(testCase) {
   telemetry.portfolioStats.winningSource = winningSource;
   telemetry.portfolioStats.proofWorkerIndex = proofWorkerIndex;
   telemetry.portfolioStats.proofScopeKey = proofScopeKey;
+  telemetry.portfolioStats.heterogeneous = heterogeneous;
+  telemetry.portfolioStats.workerRoles = workerIds.map(workerIndex => roleFor(workerIndex).role);
   telemetry.portfolioStats.proofGraceMs = portfolioProofGraceMs;
   telemetry.portfolioStats.proofGraceEffectiveMs = finiteMax(results.map(result => result.proofGraceEffectiveMs)) ?? 0;
   telemetry.portfolioStats.proofGraceWaitMs = finiteMax(results.map(result => result.proofGraceWaitMs)) ?? 0;
@@ -897,6 +924,7 @@ function describeTelemetry(result) {
       `proofGraceOutcome=${portfolio.proofGraceOutcome}`,
       `cspStatsKnown=${portfolio.cspStatsKnownWorkers}/${portfolio.workerCount}`,
       `winner=${portfolio.winningWorkerIndex ?? "-"}/${portfolio.winningSeed ?? "-"}/${portfolio.winningSource || "-"}`,
+      `heterogeneous=${portfolio.heterogeneous === true}`,
       `proofScopeKey=${portfolio.proofScopeKey || "-"}`,
     ] : []),
   ].join(" · ");
@@ -954,7 +982,7 @@ if (!selectedFiles.length) {
   process.exit(2);
 }
 
-console.log(`\nPuzzle solver cases: ${selectedFiles.length} (default timeout ${defaultTimeoutMs}ms each, workers ${puzzleWorkers}, proof grace ${puzzleWorkers > 1 ? portfolioProofGraceMs : 0}ms)`);
+console.log(`\nPuzzle solver cases: ${selectedFiles.length} (default timeout ${defaultTimeoutMs}ms each, workers ${puzzleWorkers}${puzzleWorkers > 1 ? `, portfolio ${heterogeneousPortfolio ? "heterogeneous" : "homogeneous"}` : ""}, proof grace ${puzzleWorkers > 1 ? portfolioProofGraceMs : 0}ms)`);
 console.log(`Solver options: ${Object.keys(solverOptions).length ? JSON.stringify(solverOptions) : "Worker defaults"}\n`);
 const results = [];
 for (const filePath of selectedFiles) {

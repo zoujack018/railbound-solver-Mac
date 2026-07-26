@@ -302,12 +302,22 @@ export default function App() {
     const validated = new Array(nW).fill(null);
     const candidateFailures = Array.from({ length: nW }, () => []);
     const overLimit = Array.from({ length: nW }, () => []);
-    const proofScopeKey = createProofScopeKey({
+    /* 异构组合：Worker 0 保持 CSP→DFS 作候选侦察兵，其余 Worker 跳过 CSP
+       直接以不同 seed 跑 DFS。`skipCsp` 进入 solverOptions，因此两种角色
+       天然拥有不同 proofScopeKey；组合的完备性域取 DFS-only 角色的域，
+       CSP 角色的完备性声明不跨域转移（候选照常比较与验证）。 */
+    const scopeKeyFor = roleOptions => createProofScopeKey({
       requestId,
       maxTracksHint: maxTrk > 0 ? maxTrk : 0,
       minTracks: true,
-      solverOptions: {},
+      solverOptions: roleOptions,
     });
+    const heterogeneous = nW > 1;
+    const roleSolverOptions = i => (heterogeneous && i > 0 ? { skipCsp: true } : {});
+    const cspRoleScopeKey = scopeKeyFor({});
+    const dfsRoleScopeKey = heterogeneous ? scopeKeyFor({ skipCsp: true }) : cspRoleScopeKey;
+    const roleScopeKey = i => (heterogeneous && i > 0 ? dfsRoleScopeKey : cspRoleScopeKey);
+    const proofScopeKey = heterogeneous ? dfsRoleScopeKey : cspRoleScopeKey;
     /* A single Worker has no portfolio race, so it keeps the old behaviour of
        running to completion instead of stopping on its own first candidate. */
     let machine = createPortfolioState({
@@ -451,7 +461,7 @@ export default function App() {
               best: best ? { cost: best.cost, sources: best.sources } : null,
               candidateFailures: candidateFailures[i],
               overLimit: overLimit[i],
-              proofScopeKey,
+              proofScopeKey: roleScopeKey(i),
               workerIndex: i,
             },
           });
@@ -471,7 +481,7 @@ export default function App() {
             terminationReason: "worker-error",
             finalCost: null,
             best: null,
-            proofScopeKey,
+            proofScopeKey: roleScopeKey(i),
             workerIndex: i,
           },
         });
@@ -481,7 +491,7 @@ export default function App() {
         failWorker("worker-error", event.message || "Worker 加载或执行失败");
       };
       w.onmessageerror = () => failWorker("message-error", "Worker 消息无法反序列化");
-      w.postMessage({ type: "solve", requestId, puzzle: pf, seed: portfolioSeed(i), maxTracksHint: maxTrk > 0 ? maxTrk : 0 });
+      w.postMessage({ type: "solve", requestId, puzzle: pf, seed: portfolioSeed(i), maxTracksHint: maxTrk > 0 ? maxTrk : 0, solverOptions: roleSolverOptions(i) });
       workers.push(w);
     }
     workersRef.current = workers;

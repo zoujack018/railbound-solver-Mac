@@ -47,6 +47,7 @@ P12_PATTERN_SEED_MS=50 P12_PATTERN_SEED_WORK_BUDGET=1000 npm run test:puzzles --
 PUZZLE_WORKERS=8 npm run test:puzzles -- "7x7-20260722-8-5A"
 PUZZLE_PROOF_GRACE_MS=0 PUZZLE_WORKERS=8 npm run test:puzzles -- "4x8"
 PUZZLE_PROOF_GRACE_MS=100 PUZZLE_WORKERS=8 npm run test:puzzles -- "4x8"
+PORTFOLIO_HETEROGENEOUS=off PUZZLE_WORKERS=8 npm run test:puzzles  # Homogeneous A/B
 DFS_MAX_ITERATIONS=15000000 npm run test:puzzles
 ```
 
@@ -61,6 +62,13 @@ message field is `solverOptions.p12Seed`. True P8 means the
 still-unimplemented waypoint/CSP segmented enumeration for 8×8-8-5B.
 
 `PUZZLE_WORKERS` accepts 1..16 and defaults to 1, preserving the old runner path.
+For N>1 the portfolio is heterogeneous by default (`PORTFOLIO_HETEROGENEOUS=on`):
+Worker 0 keeps the full CSP→DFS pipeline (incl. P12) as a candidate scout, Workers
+1..N-1 carry `solverOptions.skipCsp` and go straight to DFS on their own seeds.
+`skipCsp` lives in solverOptions, so the two roles own distinct `proofScopeKey`s —
+cross-role candidates compare, completeness proofs never transfer. The state
+machine's proof domain is the DFS-only role's scope; the CSP role's own proofs
+are conservatively dropped. `off` restores the homogeneous portfolio for A/B.
 `PUZZLE_PROOF_GRACE_MS` defaults to 100ms; `0` restores immediate stop on first
 candidate. Effective grace is capped at the remaining case wall-clock budget
 minus a 10ms margin. Keep portfolio wall time separate from summed worker phase
@@ -221,22 +229,16 @@ through to DFS. P12 progress uses phase `p12-seed`; solution source is
 
 Each optimization round changes exactly one performance variable, measured on
 one benchmark puzzle plus one negative-case proof. The seventh round added
-portfolio execution; the eighth round's only performance change was bounded
-portfolio proof grace. The next rounds, in order:
+portfolio execution; the eighth added bounded portfolio proof grace; the ninth
+added the heterogeneous Worker portfolio (Worker 0 CSP→DFS scout, Workers
+1..N-1 DFS-only, distinct role `proofScopeKey`s, default on,
+`PORTFOLIO_HETEROGENEOUS=off` for A/B — 7×7-8-5A N=8 first candidate
+≈5.42s→≈0.45s, ΣCSP ≈40s→≈0.42s; role allocation, not pruning). The next
+rounds, in order:
 
-1. **Heterogeneous Worker portfolio** (next performance task). Today N=8 runs
-   eight identical CSP copies: 7×7-8-5A first candidate ≈5.45s but ΣCSP ≈40s.
-   Single variable: Worker 0 keeps CSP→DFS; Workers 1..N-1 skip CSP and run
-   DFS with distinct seeds. Distinct roles get distinct `proofScopeKey`s;
-   cross-domain candidates compare, cross-domain completeness proofs do not
-   transfer. Goal: ΣCSP from ~40s to ~5s without hurting first-candidate
-   latency. Acceptance: 7×7-8-5A homogeneous-vs-heterogeneous N=8 comparison of
-   first-candidate wall clock, ΣCSP, ΣDFS, total CPU; 4×8 still retains the
-   9-track optimal proof within grace; N=4 swap still `complete:true` /
-   `search-exhausted`. Never describe CPU savings as a pruning improvement.
-2. **Barrier P5② or P7** — one pruning variable, benchmarked on 7×7-8-7A.
-3. **True P8 segmented enumeration** — targets 8×8-8-5B.
-4. **P10 Zobrist/state encoding** — only if profiling shows the hotspot; no
+1. **Barrier P5② or P7** — one pruning variable, benchmarked on 7×7-8-7A.
+2. **True P8 segmented enumeration** — targets 8×8-8-5B.
+3. **P10 Zobrist/state encoding** — only if profiling shows the hotspot; no
    preset design.
 
 Historical probe scope: the old P4 probe rejects only the naive string-key LRU,
@@ -258,18 +260,16 @@ Do not re-read the whole project per task:
 
 ## Current state and caveats (as of 2026-07-26)
 
-- Branch `collision-semantics-and-solver-contract` is 4 commits ahead of origin
-  (`173250d` unify portfolio orchestration → `549b17b` evidence ordering fixes →
-  `541bffd` model checker → `7493164` require authoritative candidates).
-  **Gate:** `7493164` must pass independent acceptance before any new solver
-  performance work — verify the `authoritativeCandidate` three-state handling,
-  both CE-2 orderings downgrading to `complete:false`, classifier order
-  insensitivity, and that N=3/N=4 pairwise replays cover the claimed
-  combinations. After acceptance: run the full gate plus the three real-Worker
-  integration fixtures, push, update the PR, and freeze the proof layer.
-- Key solver results to preserve: 6×7 17-track optimal; 7×7-8-5A N=8 ≈5.45s
-  26-track candidate `complete:false`; 7×7-8-7A 20-track optimum proven;
-  10×11 P12 seed 37 tracks, strictly `complete:false`.
+- The `7493164` acceptance gate PASSED (three-state `authoritativeCandidate`,
+  both CE-2 orderings, classifier permutation invariance, asserted N=3/N=4
+  pairwise coverage all independently verified); the proof layer
+  (`solver/portfolio-*`) is FROZEN. Any change requires updating the
+  model-checker oracle independently and re-running the full gate.
+- Key solver results to preserve: 6×7 17-track optimal; 7×7-8-5A N=8
+  heterogeneous ≈0.45s first candidate at cost 23, `complete:false`
+  (homogeneous A/B: ≈5.42s); 7×7-8-7A 20-track optimum proven;
+  10×11 P12 seed 37 tracks, strictly `complete:false`; 4×8 N=8 retains the
+  9-track optimal proof within grace under both portfolio modes.
 - A new Git baseline is linked to `zoujack018/railbound-solver-Mac`; history from
   before the 2026-07-22 repository initialization is still unavailable.
 - Historical 73 fine-grained rule tests are missing (scripts were lost); do not
