@@ -1206,7 +1206,7 @@ function solveCSP(pz, maxCost, bs, meta, cspGuard, telemetry) {
 
 // ═══════════ DFS fallback solver ═══════════
 
-function solveDFS(pz, maxSol, minTracks, budget, seed, bs, meta, telemetry, maxIters = DEFAULT_DFS_MAX_ITERATIONS, prePlaced = {}, p7Enabled = true) {
+function solveDFS(pz, maxSol, minTracks, budget, seed, bs, meta, telemetry, maxIters = DEFAULT_DFS_MAX_ITERATIONS, prePlaced = {}, p7Enabled = true, p7GoalEntry = true) {
   const placed = { ...prePlaced }, solutions = [], tm = buildTunnelMap(pz.tunnels);
   const _prePlacedCount = Object.keys(prePlaced).length;
   const ge = pz.goalEntry || pz.goal_entry, ms = pz.maxSteps || pz.max_steps || 50, gx = pz.goal[0], gy = pz.goal[1];
@@ -1275,6 +1275,16 @@ function solveDFS(pz, maxSol, minTracks, budget, seed, bs, meta, telemetry, maxI
     }
   }
   const P7_INF = 0x3fffffff;
+  /* 终点入口精化（DFS_P7_GOAL_ENTRY=off 可回退）：终点只能从 goal_entry 侧
+     进入是精确规则（cellCanAcceptDFS 同款约束），因此反向 BFS 从终点出发时
+     只沿入口邻格扩散。这只会增大 h，不破坏可采纳性——任何真实到达路径的
+     末段必然是「入口邻格 → 终点」。7×7-8-7A / 7×8-8-7 的入口邻格本身是
+     Barrier 格，正是本精化的来源（见第十一版 P5② 适用性探针）。 */
+  const _p7GoalRestricted = p7Enabled === true && p7GoalEntry === true && DELTA[ge] !== undefined;
+  const _p7GoalIdx = gy * pz.width + gx;
+  const _p7GeNeighborIdx = _p7GoalRestricted
+    ? (gy + DELTA[ge][1]) * pz.width + (gx + DELTA[ge][0])
+    : -1;
   function p7Field(targetKey, tx, ty) {
     let field = _p7.fields.get(targetKey);
     if (field && field.version === _p7.version) return field.dist;
@@ -1283,6 +1293,7 @@ function solveDFS(pz, maxSol, minTracks, budget, seed, bs, meta, telemetry, maxI
     dist.fill(P7_INF);
     const start = ty * W + tx;
     dist[start] = 0;
+    const goalRestricted = _p7GoalRestricted && start === _p7GoalIdx;
     /* 0-1 BFS：cur 为当前代价桶（栈序即可），进入格代价 = 未铺 blank ? 1 : 0 */
     let cur = [start], nxt = [], d = 0;
     while (cur.length || nxt.length) {
@@ -1294,12 +1305,13 @@ function solveDFS(pz, maxSol, minTracks, budget, seed, bs, meta, telemetry, maxI
         const vx = ux + (dir === 0 ? 1 : dir === 1 ? -1 : 0), vy = uy + (dir === 2 ? 1 : dir === 3 ? -1 : 0);
         if (vx < 0 || vx >= W || vy < 0 || vy >= _p7.H) continue;
         const v = vy * W + vx;
+        if (goalRestricted && u === _p7GoalIdx && v !== _p7GeNeighborIdx) continue;
         if (!pass[v]) continue;
         const w = blank[v] && placed[keys[v]] === undefined ? 1 : 0;
         if (d + w < dist[v]) { dist[v] = d + w; (w ? nxt : cur).push(v); }
       }
       const tp = tunnelPair[u];
-      if (tp >= 0) {
+      if (tp >= 0 && !(goalRestricted && u === _p7GoalIdx)) {
         const w = blank[tp] && placed[keys[tp]] === undefined ? 1 : 0;
         if (d + w < dist[tp]) { dist[tp] = d + w; (w ? nxt : cur).push(tp); }
       }
@@ -1818,8 +1830,10 @@ self.onmessage = function (e) {
   const p12SeedConfig = normalizeP12Seed(solverOptions.p12Seed || DEFAULT_P12_SEED);
   cspGuard.stats.p12Seed = createP12SeedStats(p12SeedConfig);
   const dfsMaxIterations = finiteBudget(solverOptions.dfsMaxIterations, DEFAULT_DFS_MAX_ITERATIONS);
-  /* P7 可采纳成本下界剪枝默认开启；显式 false 恢复第九轮基线用于 A/B。 */
+  /* P7 可采纳成本下界剪枝默认开启；显式 false 恢复第九轮基线用于 A/B。
+     p7GoalEntry 控制终点入口精化（第十一轮变量），显式 false 恢复第十轮 h。 */
   const p7LowerBound = solverOptions.p7LowerBound !== false;
+  const p7GoalEntry = solverOptions.p7GoalEntry !== false;
   let cspMs = 0, p12SeedMs = 0, dfsMs = 0;
 
   function emptyDfsStats(reason = "not-run") {
@@ -1887,7 +1901,7 @@ self.onmessage = function (e) {
       cspStats: cspGuard.snapshot(),
       dfsStats: emptyDfsStats("running"),
     });
-    const result = solveDFS(fpz, 1, minTracks, dfsBudget, seed || 0, bs, meta, telemetry, dfsMaxIterations, {}, p7LowerBound);
+    const result = solveDFS(fpz, 1, minTracks, dfsBudget, seed || 0, bs, meta, telemetry, dfsMaxIterations, {}, p7LowerBound, p7GoalEntry);
     dfsMs += elapsedMs(dfsStartedAt);
     telemetry.dfsMs = dfsMs;
     telemetry.dfsStartedAt = null;

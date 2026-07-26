@@ -242,12 +242,19 @@ placed-key version; skipped entirely when slack ≥ bs.size so uncapped
 first-candidate search pays zero overhead; `DFS_P7_LOWER_BOUND=off` for
 A/B — 7×7-8-7A budget 19 nodes −28.8%, budget 20 flips from
 budget-truncated `complete:false` to single-run `optimal-proven` within
-the default 15M iterations). The next rounds, in order:
+the default 15M iterations). The eleventh round closed the Barrier static
+direction: an applicability probe PROVED the P5② connectivity-freeze prune
+can never fire on the current Barrier corpus (all barrier triggers stay
+reachable from all cars even with every barrier cell walled — the goals of
+7×7-8-7A / 7×8-8-7 are barrier-mouthed and gated by toggle TIMING, which
+static pruning cannot shortcut), so it was not implemented; the probe's one
+implemented by-product is the P7 goal-entry refinement (relaxed BFS leaves
+the goal only via `goal_entry`; benchmark-neutral, kept as a zero-cost
+exact-rule tightening, `DFS_P7_GOAL_ENTRY=off` to revert). The next rounds,
+in order:
 
-1. **Barrier P5② trigger-necessity pruning** — benchmarked on 7×7-8-7A /
-   7×8-8-7; the P7 result does not prejudge it either way.
-2. **True P8 segmented enumeration** — targets 8×8-8-5B.
-3. **P10 Zobrist/state encoding** — only if profiling shows the hotspot; no
+1. **True P8 segmented enumeration** — targets 8×8-8-5B.
+2. **P10 Zobrist/state encoding** — only if profiling shows the hotspot; no
    preset design.
 
 Historical probe scope: the old P4 probe rejects only the naive string-key LRU,
