@@ -117,6 +117,8 @@ function createCspGuard(rawConfig, telemetry = null) {
     overflowReasons: [],
     /* P8① 分段枚举遥测（仅测量，不参与预算判定）。 */
     p8Segmented: {},
+    /* 组合层末端诊断（仅测量）：终态在四级验证漏斗中的去向。 */
+    mergeDiag: { finalStates: 0, tUsageRejects: 0, quickRejects: 0, simulateFails: 0, remembered: 0 },
   };
 
   function abort(reason) {
@@ -215,6 +217,7 @@ function createCspGuard(rawConfig, telemetry = null) {
       pathsByCar,
       overflowReasons: [...stats.overflowReasons],
       p8Segmented: JSON.parse(JSON.stringify(stats.p8Segmented)),
+      mergeDiag: { ...stats.mergeDiag },
     };
   }
   return {
@@ -1502,12 +1505,14 @@ function solveCSP(pz, maxCost, bs, meta, cspGuard, telemetry, p8Segmented = true
     }
     for (const st of states) {
       if (cspGuard.checkTime()) return;
-      if (!validateTUsage(st.asgn)) continue;
+      cspGuard.stats.mergeDiag.finalStates += 1;
+      if (!validateTUsage(st.asgn)) { cspGuard.stats.mergeDiag.tUsageRejects += 1; continue; }
       const placed = {}; for (const k in st.asgn) placed[k] = st.asgn[k].track;
-      if (quickCollisionCheck(placed)) continue;
+      if (quickCollisionCheck(placed)) { cspGuard.stats.mergeDiag.quickRejects += 1; continue; }
       /* Always validate through the unified Rule Layer simulate */
       const r = simulate(pz, placed);
-      if (r.ok && st.cost <= bestCost) rememberSolution(placed, st.cost);
+      if (!r.ok) { cspGuard.stats.mergeDiag.simulateFails += 1; continue; }
+      if (st.cost <= bestCost) { cspGuard.stats.mergeDiag.remembered += 1; rememberSolution(placed, st.cost); }
     }
   }
   function bt(idx, asgn, cost, arrivals) {
@@ -1523,11 +1528,13 @@ function solveCSP(pz, maxCost, bs, meta, cspGuard, telemetry, p8Segmented = true
       cspStats: cspGuard.snapshot(),
     });
     if (idx === order.length) {
-      if (!validateTUsage(asgn)) return;
+      cspGuard.stats.mergeDiag.finalStates += 1;
+      if (!validateTUsage(asgn)) { cspGuard.stats.mergeDiag.tUsageRejects += 1; return; }
       const placed = {}; for (const k in asgn) placed[k] = asgn[k].track;
-      if (quickCollisionCheck(placed)) return;
+      if (quickCollisionCheck(placed)) { cspGuard.stats.mergeDiag.quickRejects += 1; return; }
       const r = simulate(pz, placed);
-      if (r.ok && cost <= bestCost) rememberSolution(placed, cost);
+      if (!r.ok) { cspGuard.stats.mergeDiag.simulateFails += 1; return; }
+      if (cost <= bestCost) { cspGuard.stats.mergeDiag.remembered += 1; rememberSolution(placed, cost); }
       return;
     }
     const ci = order[idx], remaining = order.slice(idx + 1), posCi = orderPosByCi[ci];

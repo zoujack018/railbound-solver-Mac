@@ -261,13 +261,23 @@ layer (beam trim + arrival-order windows + quick-check) still yields ZERO
 valid leaves — the wall moved from enumeration to combination. The next
 rounds, in order:
 
-1. **Platform-puzzle combination layer** — diagnose why the beam discards
-   every compatible combination on 7×7-8-5A (arrival-order windows, trim
-   diversity, or quick-check timing) and fix ONE variable. **P8② admission
-   relaxation for 8×8-8-5B stays FROZEN until segmented CSP produces a
-   simulate()-verified candidate on 7×7-8-5A.**
-2. **P10 Zobrist/state encoding** — only if profiling shows the hotspot; no
-   preset design.
+The thirteenth round closed the diagnosis: funnel counters (3,645 complete
+merge leaves, all genuinely invalid), a zero-false-reject measurement on the
+quick check, and an arrival probe on the real 23-track solution (per-car
+arrivals 7/23/40/67 vs enumeration windows capped at 21/31/32/33) proved the
+**slack windowing is the structural root cause** — funnel-waiting puzzles'
+solutions only exist outside minLen+slack, so enumerative CSP (whole-route
+or segmented) is structurally unproductive on that family. **P8② admission
+for 8×8-8-5B is dead as motivated** (same waiting family); candidate
+generation for funnel puzzles belongs to a future P12 generalization
+(cycle-family parameterization, a design round) or stays with the DFS
+portfolio. The next rounds, in order:
+
+1. **P10 precondition: DFS profile** — measure the per-node hotspot (state-key
+   string building is the standing suspect; P7 evaluation adds ~16%) before
+   designing any Zobrist/compact encoding.
+2. **P12 generalization (cycle families)** — only as a deliberate design
+   round, if funnel-puzzle candidates beyond the DFS portfolio are needed.
 
 Historical probe scope: the old P4 probe rejects only the naive string-key LRU,
 not Zobrist/P10; the old P5 negative result covers the 10×11 P5① probe only,
