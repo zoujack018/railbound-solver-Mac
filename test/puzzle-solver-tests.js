@@ -77,6 +77,11 @@ function buildSolverOptions(env = process.env) {
     throw new Error(`P12_PATTERN_SEED must be on or off, received: ${p12Mode}`);
   }
 
+  const p7Mode = String(env.DFS_P7_LOWER_BOUND || "").trim().toLowerCase();
+  if (p7Mode && p7Mode !== "on" && p7Mode !== "off") {
+    throw new Error(`DFS_P7_LOWER_BOUND must be on or off, received: ${env.DFS_P7_LOWER_BOUND}`);
+  }
+
   const maxMs = optionalPositiveInteger(env.CSP_TIMEBOX_MS);
   const maxPaths = optionalPositiveInteger(env.CSP_PATH_BUDGET);
   const maxCombinations = optionalPositiveInteger(env.CSP_COMBINATION_BUDGET);
@@ -112,6 +117,7 @@ function buildSolverOptions(env = process.env) {
   if (Object.keys(cspTimebox).length) options.cspTimebox = cspTimebox;
   if (Object.keys(p12Seed).length) options.p12Seed = p12Seed;
   if (dfsMaxIterations != null) options.dfsMaxIterations = dfsMaxIterations;
+  if (p7Mode) options.p7LowerBound = p7Mode === "on";
   return options;
 }
 

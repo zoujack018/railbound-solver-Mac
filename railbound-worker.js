@@ -1206,7 +1206,7 @@ function solveCSP(pz, maxCost, bs, meta, cspGuard, telemetry) {
 
 // ═══════════ DFS fallback solver ═══════════
 
-function solveDFS(pz, maxSol, minTracks, budget, seed, bs, meta, telemetry, maxIters = DEFAULT_DFS_MAX_ITERATIONS, prePlaced = {}) {
+function solveDFS(pz, maxSol, minTracks, budget, seed, bs, meta, telemetry, maxIters = DEFAULT_DFS_MAX_ITERATIONS, prePlaced = {}, p7Enabled = true) {
   const placed = { ...prePlaced }, solutions = [], tm = buildTunnelMap(pz.tunnels);
   const _prePlacedCount = Object.keys(prePlaced).length;
   const ge = pz.goalEntry || pz.goal_entry, ms = pz.maxSteps || pz.max_steps || 50, gx = pz.goal[0], gy = pz.goal[1];
@@ -1240,6 +1240,94 @@ function solveDFS(pz, maxSol, minTracks, budget, seed, bs, meta, telemetry, maxI
     const bansAt = portBans[k];
     if (!bansAt) return false;
     for (const side of bansAt) if (exitPort(track, side) !== null) return true;
+    return false;
+  }
+  /* ═══ P7 可采纳成本下界剪枝（第十轮，单变量，DFS_P7_LOWER_BOUND=off 可回退）═══
+     h = max over 未到站普通车 of「该车到下一必需目标（未服务站台目标格，否则
+     终点）的宽松最短路上需要新铺的 blank 格数」。宽松图：fixed/机关/隧道/已铺
+     格权重 0，未铺 blank 权重 1；忽略轨道几何方向、Barrier 状态、portBans 与
+     碰撞 —— 全部只放松不收紧，因此 h 不高估任何补全的新增铺轨数（取 max 而非
+     sum，不高估共享）。健全性：若 (placedCount - prePlaced) + h > bestCost，
+     该分支下任何解的成本都超过 bestCost，本就会被 rememberSolution 的
+     cost ≤ bestCost 检查拒绝；提前剪枝不丢任何可记录解。h=∞（宽松图不可达）
+     是同一论证的特例。距离场按目标缓存，仅在铺/回退（placed 键增删）后重算；
+     升级只换轨型不改键集，权重不变，无需失效。 */
+  const _p7 = {
+    enabled: p7Enabled === true,
+    W: pz.width, H: pz.height,
+    pass: null, blank: null, keys: null, tunnelPair: null,
+    fields: new Map(), version: 0,
+    evals: 0, bfsRuns: 0, pruned: 0,
+  };
+  if (_p7.enabled) {
+    const n = _p7.W * _p7.H;
+    _p7.pass = new Uint8Array(n);
+    _p7.blank = new Uint8Array(n);
+    _p7.keys = new Array(n);
+    _p7.tunnelPair = new Int32Array(n).fill(-1);
+    for (let y = 0; y < _p7.H; y++) for (let x = 0; x < _p7.W; x++) {
+      const i = y * _p7.W + x, k = pk(x, y);
+      _p7.keys[i] = k;
+      _p7.blank[i] = bs.has(k) ? 1 : 0;
+      _p7.pass[i] = (bs.has(k) || pz.fixed[k] !== undefined || tm[k] || _tswitchMap[k] || _autoSwitchMap[k]
+        || (x === gx && y === gy)) ? 1 : 0;
+      if (tm[k]) _p7.tunnelPair[i] = tm[k].pair.y * _p7.W + tm[k].pair.x;
+    }
+  }
+  const P7_INF = 0x3fffffff;
+  function p7Field(targetKey, tx, ty) {
+    let field = _p7.fields.get(targetKey);
+    if (field && field.version === _p7.version) return field.dist;
+    if (!field) { field = { version: -1, dist: new Int32Array(_p7.W * _p7.H) }; _p7.fields.set(targetKey, field); }
+    const { W, pass, blank, keys, tunnelPair } = _p7, dist = field.dist;
+    dist.fill(P7_INF);
+    const start = ty * W + tx;
+    dist[start] = 0;
+    /* 0-1 BFS：cur 为当前代价桶（栈序即可），进入格代价 = 未铺 blank ? 1 : 0 */
+    let cur = [start], nxt = [], d = 0;
+    while (cur.length || nxt.length) {
+      if (!cur.length) { cur = nxt; nxt = []; d += 1; continue; }
+      const u = cur.pop();
+      if (dist[u] < d) continue;
+      const ux = u % W, uy = (u - ux) / W;
+      for (let dir = 0; dir < 4; dir++) {
+        const vx = ux + (dir === 0 ? 1 : dir === 1 ? -1 : 0), vy = uy + (dir === 2 ? 1 : dir === 3 ? -1 : 0);
+        if (vx < 0 || vx >= W || vy < 0 || vy >= _p7.H) continue;
+        const v = vy * W + vx;
+        if (!pass[v]) continue;
+        const w = blank[v] && placed[keys[v]] === undefined ? 1 : 0;
+        if (d + w < dist[v]) { dist[v] = d + w; (w ? nxt : cur).push(v); }
+      }
+      const tp = tunnelPair[u];
+      if (tp >= 0) {
+        const w = blank[tp] && placed[keys[tp]] === undefined ? 1 : 0;
+        if (d + w < dist[tp]) { dist[tp] = d + w; (w ? nxt : cur).push(tp); }
+      }
+    }
+    field.version = _p7.version;
+    _p7.bfsRuns += 1;
+    return dist;
+  }
+  function p7Prune(cars, servedPlatforms, slack) {
+    _p7.evals += 1;
+    for (const c of cars) {
+      if (isZeroCar(c)) continue;
+      const ci = c.y * _p7.W + c.x;
+      if (ci < 0 || ci >= _p7.pass.length) continue;
+      let hCar;
+      if (_hasPlatforms && carNeedsPassengers(_platformState, servedPlatforms, c.name)) {
+        hCar = P7_INF;
+        for (const p of _platformState.requiredByCar[String(c.name)] || []) {
+          if (servedPlatforms.has(p.id)) continue;
+          const comma = p.targetKey.indexOf(",");
+          const d = p7Field(p.targetKey, Number(p.targetKey.slice(0, comma)), Number(p.targetKey.slice(comma + 1)))[ci];
+          if (d < hCar) hCar = d;
+        }
+      } else {
+        hCar = p7Field("__goal", gx, gy)[ci];
+      }
+      if (hCar > slack) return true;
+    }
     return false;
   }
   let deepest = { step: 0, arrived: [], cars: [], placed: {} };
@@ -1287,6 +1375,7 @@ function solveDFS(pz, maxSol, minTracks, budget, seed, bs, meta, telemetry, maxI
       searchComplete,
       terminationReason,
       solutions: solutions.length,
+      p7: { enabled: _p7.enabled, evals: _p7.evals, bfsRuns: _p7.bfsRuns, pruned: _p7.pruned },
     };
   }
   function candidateLimitReached() {
@@ -1437,6 +1526,16 @@ function solveDFS(pz, maxSol, minTracks, budget, seed, bs, meta, telemetry, maxI
     }
     const placedCount = Object.keys(placed).length;
     if (step > ms || placedCount > bestCost || (placedCount === bestCost && solutions.length >= MAX_ALTERNATES)) return;
+    if (_p7.enabled) {
+      /* h ≤ 未铺 blank 总数 ≤ bs.size，因此 slack ≥ bs.size 时评估不可能
+         剪枝（预算无上限的首候选阶段 slack=∞），直接跳过，保持零开销。
+         历史 P5① 探针已证明纯可达性剪切在该阶段不值回票价。 */
+      const slack = bestCost - (placedCount - _prePlacedCount);
+      if (slack < bs.size && p7Prune(cars, servedPlatforms, slack)) {
+        _p7.pruned += 1;
+        return;
+      }
+    }
     if (candidateLimitReached()) return;
     for (const c0 of cars) {
       const c = c0; const k = pk(c.x, c.y);
@@ -1499,9 +1598,11 @@ function solveDFS(pz, maxSol, minTracks, budget, seed, bs, meta, telemetry, maxI
         if (Object.keys(placed).length + 1 > bestCost) continue;
         const ex = exitPort(tr, c.entry); if (!ex) continue;
         placed[k] = tr;
+        _p7.version += 1;
         const undo = pushUsage(k, c.entry, ex);
         dfs(cars, arrived, step, visited, toggled, tsToggled, autoToggled, tsLocks, servedPlatforms); undo();
         delete placed[k];
+        _p7.version += 1;
         if (candidateLimitReached()) return;
       }
       /* All cars (including zero) must have a track placed — no skip option */
@@ -1717,6 +1818,8 @@ self.onmessage = function (e) {
   const p12SeedConfig = normalizeP12Seed(solverOptions.p12Seed || DEFAULT_P12_SEED);
   cspGuard.stats.p12Seed = createP12SeedStats(p12SeedConfig);
   const dfsMaxIterations = finiteBudget(solverOptions.dfsMaxIterations, DEFAULT_DFS_MAX_ITERATIONS);
+  /* P7 可采纳成本下界剪枝默认开启；显式 false 恢复第九轮基线用于 A/B。 */
+  const p7LowerBound = solverOptions.p7LowerBound !== false;
   let cspMs = 0, p12SeedMs = 0, dfsMs = 0;
 
   function emptyDfsStats(reason = "not-run") {
@@ -1784,7 +1887,7 @@ self.onmessage = function (e) {
       cspStats: cspGuard.snapshot(),
       dfsStats: emptyDfsStats("running"),
     });
-    const result = solveDFS(fpz, 1, minTracks, dfsBudget, seed || 0, bs, meta, telemetry, dfsMaxIterations);
+    const result = solveDFS(fpz, 1, minTracks, dfsBudget, seed || 0, bs, meta, telemetry, dfsMaxIterations, {}, p7LowerBound);
     dfsMs += elapsedMs(dfsStartedAt);
     telemetry.dfsMs = dfsMs;
     telemetry.dfsStartedAt = null;

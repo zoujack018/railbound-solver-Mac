@@ -48,6 +48,7 @@ PUZZLE_WORKERS=8 npm run test:puzzles -- "7x7-20260722-8-5A"
 PUZZLE_PROOF_GRACE_MS=0 PUZZLE_WORKERS=8 npm run test:puzzles -- "4x8"
 PUZZLE_PROOF_GRACE_MS=100 PUZZLE_WORKERS=8 npm run test:puzzles -- "4x8"
 PORTFOLIO_HETEROGENEOUS=off PUZZLE_WORKERS=8 npm run test:puzzles  # Homogeneous A/B
+DFS_P7_LOWER_BOUND=off npm run test:puzzles  # Disable the P7 admissible lower bound
 DFS_MAX_ITERATIONS=15000000 npm run test:puzzles
 ```
 
@@ -233,10 +234,18 @@ portfolio execution; the eighth added bounded portfolio proof grace; the ninth
 added the heterogeneous Worker portfolio (Worker 0 CSP→DFS scout, Workers
 1..N-1 DFS-only, distinct role `proofScopeKey`s, default on,
 `PORTFOLIO_HETEROGENEOUS=off` for A/B — 7×7-8-5A N=8 first candidate
-≈5.42s→≈0.45s, ΣCSP ≈40s→≈0.42s; role allocation, not pruning). The next
-rounds, in order:
+≈5.42s→≈0.45s, ΣCSP ≈40s→≈0.42s; role allocation, not pruning). The tenth
+added the P7 admissible cost lower bound in DFS (h = max over unarrived
+normal cars of unpaved-blank count on the relaxed shortest path to the
+car's next required target; target-side 0-1 BFS fields cached on the
+placed-key version; skipped entirely when slack ≥ bs.size so uncapped
+first-candidate search pays zero overhead; `DFS_P7_LOWER_BOUND=off` for
+A/B — 7×7-8-7A budget 19 nodes −28.8%, budget 20 flips from
+budget-truncated `complete:false` to single-run `optimal-proven` within
+the default 15M iterations). The next rounds, in order:
 
-1. **Barrier P5② or P7** — one pruning variable, benchmarked on 7×7-8-7A.
+1. **Barrier P5② trigger-necessity pruning** — benchmarked on 7×7-8-7A /
+   7×8-8-7; the P7 result does not prejudge it either way.
 2. **True P8 segmented enumeration** — targets 8×8-8-5B.
 3. **P10 Zobrist/state encoding** — only if profiling shows the hotspot; no
    preset design.
@@ -288,9 +297,11 @@ Do not re-read the whole project per task:
   observed cost 23, still `complete:false`. That cost improvement is an
   observation, not an optimality proof or repeatability guarantee. The portfolio
   is seed coverage trading CPU for latency — not pruning.
-- 7×7-8-7A is a slow Barrier benchmark, not a fast canary: budget 19 exhausts
-  completely at 10,199,936 nodes in about 36.1s; budget 20 finds a legal 38-step
-  candidate in about 1.0s, proving minimum 20 under current rules. A v3.02 game
-  screenshot supports a 20-rail inventory but is not a per-level developer text claim.
+- 7×7-8-7A is a slow Barrier benchmark, not a fast canary: with P7 on, budget
+  19 exhausts completely at 7,262,738 nodes in ≈28.6s (P7 off: 10,199,936 /
+  ≈35.2s), and budget 20 completes within the default 15M iteration budget at
+  14,233,286 nodes (≈56.5s), giving a single-run `optimal-proven` minimum of
+  20 (candidate at ≈0.7s). A v3.02 game screenshot supports a 20-rail
+  inventory but is not a per-level developer text claim.
 - `railbound-solver-v3.jsx` is the largest tech debt: grid state, SVG rendering, solver orchestration, and playback all in one file.
 - Dev and preview servers bind to `127.0.0.1` only. Don't use `--host 0.0.0.0` on untrusted networks.
