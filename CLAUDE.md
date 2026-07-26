@@ -49,6 +49,7 @@ PUZZLE_PROOF_GRACE_MS=0 PUZZLE_WORKERS=8 npm run test:puzzles -- "4x8"
 PUZZLE_PROOF_GRACE_MS=100 PUZZLE_WORKERS=8 npm run test:puzzles -- "4x8"
 PORTFOLIO_HETEROGENEOUS=off PUZZLE_WORKERS=8 npm run test:puzzles  # Homogeneous A/B
 DFS_P7_LOWER_BOUND=off npm run test:puzzles  # Disable the P7 admissible lower bound
+CSP_P8_SEGMENTED=off npm run test:puzzles    # Disable P8① segmented waypoint enumeration
 DFS_MAX_ITERATIONS=15000000 npm run test:puzzles
 ```
 
@@ -250,10 +251,21 @@ reachable from all cars even with every barrier cell walled — the goals of
 static pruning cannot shortcut), so it was not implemented; the probe's one
 implemented by-product is the P7 goal-entry refinement (relaxed BFS leaves
 the goal only via `goal_entry`; benchmark-neutral, kept as a zero-cost
-exact-rule tightening, `DFS_P7_GOAL_ENTRY=off` to revert). The next rounds,
-in order:
+exact-rule tightening, `DFS_P7_GOAL_ENTRY=off` to revert). The twelfth round
+implemented P8① segmented waypoint enumeration (`CSP_P8_SEGMENTED=off` to
+revert; per-segment/per-entry quota 512, lazy join charged to the shared P1
+budget, truncation only ever drops candidates): waypoint-car enumeration
+−54%/−65% on 7×7-8-5A, but a terminal diagnostic (244.8M combination
+iterations, zero budget/timebox aborts) proved the cross-car combination
+layer (beam trim + arrival-order windows + quick-check) still yields ZERO
+valid leaves — the wall moved from enumeration to combination. The next
+rounds, in order:
 
-1. **True P8 segmented enumeration** — targets 8×8-8-5B.
+1. **Platform-puzzle combination layer** — diagnose why the beam discards
+   every compatible combination on 7×7-8-5A (arrival-order windows, trim
+   diversity, or quick-check timing) and fix ONE variable. **P8② admission
+   relaxation for 8×8-8-5B stays FROZEN until segmented CSP produces a
+   simulate()-verified candidate on 7×7-8-5A.**
 2. **P10 Zobrist/state encoding** — only if profiling shows the hotspot; no
    preset design.
 

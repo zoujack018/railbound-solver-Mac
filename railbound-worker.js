@@ -25,6 +25,9 @@ function postToMain(message) {
 
 const MAX_PATHS = 10000;
 const MAX_ENUM_ITERS = 4000000;
+/* P8① 每段每入口的保留配额：段列表乘积决定拼接规模，512×512 ≈ 26 万次
+   拼接尝试，远低于共享迭代预算。 */
+const P8_SEG_KEEP = 512;
 const PATH_SLACK = 6;
 const MAX_ALTERNATES = 5;
 const CSP_BEAM_WIDTH = 2000;
@@ -112,6 +115,8 @@ function createCspGuard(rawConfig, telemetry = null) {
     combinationIterations: 0,
     overflow: false,
     overflowReasons: [],
+    /* P8① 分段枚举遥测（仅测量，不参与预算判定）。 */
+    p8Segmented: {},
   };
 
   function abort(reason) {
@@ -209,6 +214,7 @@ function createCspGuard(rawConfig, telemetry = null) {
       config: { ...stats.config },
       pathsByCar,
       overflowReasons: [...stats.overflowReasons],
+      p8Segmented: JSON.parse(JSON.stringify(stats.p8Segmented)),
     };
   }
   return {
@@ -781,7 +787,365 @@ function enumeratePaths(car, pz, bs, meta, maxCost, waypoints = [], minRequiredA
 
 // ═══════════ CSP solver ═══════════
 
-function solveCSP(pz, maxCost, bs, meta, cspGuard, telemetry) {
+/* ═══════════ P8① segmented path enumeration（第十二轮，单变量）═══════════
+   含 waypoint 的车不再把整条 start→wp…→goal 路径塞进一次枚举（段组合互乘导致
+   桶溢出），而是按目标切成连续短段独立枚举，再惰性拼接：
+   - 段 i 在踩上目标格时结束并记录进入端口（目标格的轨道由下一段作为起点格
+     选择），最后一段要求以 goal_entry 进入终点——与整条枚举的语义逐点对应；
+   - 段间以端口衔接（下一段的起点入口 = 上一段的结束入口）、轨道 usage 合并
+     （同格冲突走与组合层同构的 T 升级检索）、总步数窗口（等待时间以
+     arrival = steps + 2×wpCount 在下游不变地计入）连接；
+   - 拼接按段递归惰性生成，禁止物化完整笛卡尔积；每次拼接尝试计入共享
+   　P1 路径迭代预算；
+   - 任何段桶/拼接截断都置 overflow——CSP 本就只产候选，overflow 进一步
+     保证不会触发 trustworthy 提前返回，完备性语义不变。
+   admission 阈值、P7、portfolio、CSP 时间盒与 DFS 本轮一律不动。 */
+function enumerateSegmentedPaths(car, pz, bs, meta, maxCost, waypoints, minRequiredArrival, blocked, cspGuard) {
+  if (!waypoints.length || isZeroCar(car)) {
+    return enumeratePaths(car, pz, bs, meta, maxCost, waypoints, minRequiredArrival, blocked, cspGuard);
+  }
+  const ge = pz.goalEntry || pz.goal_entry, gx = pz.goal[0], gy = pz.goal[1], pathLimit = pz.maxPaths || MAX_PATHS;
+  cspGuard.beginCar(car.name);
+  const wholeMin = bfsMinSteps(car, pz, bs, waypoints, blocked, cspGuard);
+  if (wholeMin === Infinity) {
+    cspGuard.noteRetained(car.name, 0);
+    return { paths: [], overflow: false, overflowReasons: [], minSteps: wholeMin };
+  }
+  const slack = pz.pathSlack ?? PATH_SLACK;
+  const ms = pz.maxSteps || pz.max_steps || 50;
+  const minLen = Math.max(wholeMin, minRequiredArrival);
+  const maxLen = Math.min(ms, minLen + slack);
+  const tunnelMap = buildTunnelMap(pz.tunnels);
+  const tswitchMap = buildTSwitchMap(pz.tswitches);
+  const autoSwitchMap = buildAutoSwitchMap(pz.autoSwitches || pz.auto_switches);
+  const overflowReasons = new Set();
+  let overflow = false;
+  const segStats = [];
+
+  /* 段级最短步 BFS：与 bfsMinSteps 同构的移动模型，单目标。 */
+  function segMinSteps(sx, sy, sEntry, target, isFinal) {
+    if (sx === target.x && sy === target.y) return 0;
+    const q = [[sx, sy, sEntry, 0]];
+    const visited = new Set();
+    for (let qi = 0; qi < q.length; qi++) {
+      if (cspGuard.checkTime()) return Infinity;
+      const [x, y, entry, steps] = q[qi];
+      const sk = x + "," + y + "," + entry;
+      if (visited.has(sk)) continue; visited.add(sk);
+      const k = pk(x, y);
+      let exits = [];
+      if (tunnelMap[k]) {
+        if (entry !== tunnelMap[k].facing) continue;
+        const p = tunnelMap[k].pair;
+        exits = [{ nx: p.x + DELTA[p.facing][0], ny: p.y + DELTA[p.facing][1], ne: OPPOSITE[p.facing] }];
+      } else {
+        let pool;
+        if (tswitchMap[k]) pool = tswitchTrackVariants(tswitchMap[k]);
+        else if (autoSwitchMap[k]) pool = tswitchTrackVariants(autoSwitchMap[k]);
+        else if (pz.fixed[k]) pool = [pz.fixed[k]];
+        else if (bs.has(k)) pool = BASIC_BY_ENTRY[entry];
+        else continue;
+        const seenExit = new Set();
+        for (const tr of pool) {
+          const ex = exitPort(tr, entry);
+          if (!ex || seenExit.has(ex)) continue;
+          seenExit.add(ex);
+          exits.push({ nx: x + DELTA[ex][0], ny: y + DELTA[ex][1], ne: OPPOSITE[ex] });
+        }
+      }
+      for (const { nx, ny, ne } of exits) {
+        if (nx === target.x && ny === target.y) { if (!isFinal || ne === ge) return steps + 1; continue; }
+        if (nx === gx && ny === gy) continue; /* 终点只允许终止，不允许过境 */
+        if (nx < 0 || nx >= pz.width || ny < 0 || ny >= pz.height) continue;
+        const nk = pk(nx, ny);
+        if (blocked && blocked.has(nk)) continue;
+        if (!pz.fixed[nk] && !bs.has(nk) && !tunnelMap[nk] && !tswitchMap[nk] && !autoSwitchMap[nk]) continue;
+        q.push([nx, ny, ne, steps + 1]);
+      }
+    }
+    return Infinity;
+  }
+
+  function pathBucketOf(assigns) {
+    let mask = 0;
+    for (const a of assigns) {
+      const parts = a.k.split(","), x = +parts[0], y = +parts[1];
+      const xb = x < Math.ceil(pz.width / 3) ? 0 : (x < Math.ceil(pz.width * 2 / 3) ? 1 : 2);
+      const yb = y < Math.ceil(pz.height / 3) ? 0 : (y < Math.ceil(pz.height * 2 / 3) ? 1 : 2);
+      mask |= 1 << (yb * 3 + xb);
+    }
+    return String(mask);
+  }
+  function keyOf(assigns) { return assigns.map(a => a.k + ":" + a.track).sort().join("|"); }
+  function compareOf(a, b) {
+    const ac = a.assigns.length, bc = b.assigns.length;
+    if (ac !== bc) return ac - bc;
+    if (a.steps !== b.steps) return a.steps - b.steps;
+    const ak = a._key || (a._key = keyOf(a.assigns)), bk = b._key || (b._key = keyOf(b.assigns));
+    return ak < bk ? -1 : ak > bk ? 1 : 0;
+  }
+  const perBucket = pz.maxPathsPerBucket || Math.max(80, Math.ceil(pathLimit / 48));
+
+  /* 单段有界 DFS：结构与 enumeratePaths 的 dfs 逐点对应，去掉 wpIdx 与零号车
+     分支；踩上段目标即终止（非最后一段记录 endEntry，最后一段要求 ge）。 */
+  function runSegment(sx, sy, sEntry, target, isFinal, overflowTag) {
+    const segMin = segMinSteps(sx, sy, sEntry, target, isFinal);
+    const stat = { target: target.x + "," + target.y, entry: sEntry, minSteps: segMin, enumerated: 0, kept: 0, overflow: false };
+    segStats.push(stat);
+    if (segMin === Infinity) return [];
+    const segMaxLen = Math.min(maxLen, segMin + slack);
+    const buckets = {}, order = [];
+    let segIters = 0, segOverflow = false;
+    function keep(p) {
+      stat.enumerated += 1;
+      const b = pathBucketOf(p.assigns);
+      let arr = buckets[b];
+      if (!arr) { arr = []; buckets[b] = arr; order.push(b); }
+      if (arr.length < perBucket) { arr.push(p); return; }
+      segOverflow = true;
+      let wi = 0;
+      for (let i = 1; i < arr.length; i++) if (compareOf(arr[i], arr[wi]) > 0) wi = i;
+      if (compareOf(p, arr[wi]) < 0) arr[wi] = p;
+    }
+    function dfs(x, y, entry, assigns, visited, cost, steps) {
+      segIters += 1;
+      if (cspGuard.notePathIteration(car.name)) return;
+      if (segIters > MAX_ENUM_ITERS) { segOverflow = true; return; }
+      if (cost > maxCost || steps >= segMaxLen) return;
+      if (steps + Math.abs(x - target.x) + Math.abs(y - target.y) > segMaxLen) return;
+      const k = pk(x, y);
+      const vk = k + ":" + entry;
+      if (visited.has(vk)) return;
+      visited.add(vk);
+      if (tunnelMap[k]) {
+        if (entry !== tunnelMap[k].facing) { visited.delete(vk); return; }
+        const p = tunnelMap[k].pair;
+        const nx = p.x + DELTA[p.facing][0], ny = p.y + DELTA[p.facing][1], ne = OPPOSITE[p.facing];
+        if (nx === target.x && ny === target.y) {
+          if (!isFinal || ne === ge) keep({ assigns, steps: steps + 1, endEntry: ne });
+          visited.delete(vk); return;
+        }
+        if (nx === gx && ny === gy) { visited.delete(vk); return; }
+        if (nx < 0 || nx >= pz.width || ny < 0 || ny >= pz.height) { visited.delete(vk); return; }
+        const nk = pk(nx, ny);
+        if (blocked && blocked.has(nk)) { visited.delete(vk); return; }
+        if (!pz.fixed[nk] && !bs.has(nk) && !tunnelMap[nk] && !tswitchMap[nk] && !autoSwitchMap[nk]) { visited.delete(vk); return; }
+        dfs(nx, ny, ne, assigns, visited, cost, steps + 1);
+        visited.delete(vk); return;
+      }
+      const fixed = pz.fixed[k];
+      const sw = tswitchMap[k];
+      const au = autoSwitchMap[k];
+      const existIdx = fixed || sw || au ? -1 : assigns.findIndex(a => a.k === k);
+      let pool;
+      if (sw) pool = tswitchTrackVariants(sw).filter(t => exitPort(t, entry) !== null);
+      else if (au) pool = tswitchTrackVariants(au).filter(t => exitPort(t, entry) !== null);
+      else if (fixed) pool = [fixed];
+      else if (bs.has(k)) {
+        if (existIdx >= 0) {
+          const prev = assigns[existIdx]; pool = [];
+          for (const tn of T_TRACKS) {
+            if (exitPort(tn, prev.entry) !== prev.exit) continue;
+            if (prev.extra) { let ok = true; for (const e of prev.extra) { if (exitPort(tn, e.entry) !== e.exit) { ok = false; break; } } if (!ok) continue; }
+            if (exitPort(tn, entry) === null) continue;
+            pool.push(tn);
+          }
+        } else {
+          const m = meta[k];
+          pool = m ? m.basicTracks.filter(t => exitPort(t, entry) !== null) : BASIC_BY_ENTRY[entry];
+        }
+      } else { visited.delete(vk); return; }
+      for (const tr of pool) {
+        const ex = exitPort(tr, entry); if (!ex) continue;
+        const nx = x + DELTA[ex][0], ny = y + DELTA[ex][1], ne = OPPOSITE[ex];
+        let na, nc;
+        if (fixed || sw || au) { na = assigns; nc = cost; }
+        else if (existIdx >= 0) {
+          na = assigns.map((a, i) => {
+            if (i !== existIdx) return a;
+            const extra = a.extra ? [...a.extra, { entry, exit: ex }] : [{ entry, exit: ex }];
+            return { k, track: tr, entry: a.entry, exit: a.exit, extra };
+          });
+          nc = cost;
+        } else { na = [...assigns, { k, track: tr, entry, exit: ex }]; nc = cost + 1; }
+        if (nx === target.x && ny === target.y) {
+          if (!isFinal || ne === ge) keep({ assigns: na, steps: steps + 1, endEntry: ne });
+          continue;
+        }
+        if (nx === gx && ny === gy) continue;
+        if (nx < 0 || nx >= pz.width || ny < 0 || ny >= pz.height) continue;
+        const nk = pk(nx, ny);
+        if (blocked && blocked.has(nk)) continue;
+        if (!pz.fixed[nk] && !bs.has(nk) && !tunnelMap[nk] && !tswitchMap[nk] && !autoSwitchMap[nk]) continue;
+        dfs(nx, ny, ne, na, visited, nc, steps + 1);
+      }
+      visited.delete(vk);
+    }
+    dfs(sx, sy, sEntry, [], new Set(), 0, 0);
+    for (const b of order) buckets[b].sort(compareOf);
+    /* 段保留配额：桶轮转取最优后截到 SEG_KEEP。拼接是段列表的乘积，配额把
+       乘积压回预算内；截断只意味着少产候选（overflow 照置），不涉完备性。 */
+    const out = [];
+    for (let i = 0; out.length < P8_SEG_KEEP; i++) {
+      let added = false;
+      for (const b of order) {
+        const p = buckets[b][i]; if (!p) continue;
+        out.push(p); added = true;
+        if (out.length >= P8_SEG_KEEP) break;
+      }
+      if (!added) break;
+    }
+    const truncated = order.reduce((sum, b) => sum + buckets[b].length, 0) > out.length;
+    if (segOverflow || truncated) {
+      stat.overflow = true;
+      overflow = true;
+      overflowReasons.add(overflowTag);
+      cspGuard.addOverflow(overflowTag, car.name);
+    }
+    out.sort(compareOf);
+    stat.kept = out.length;
+    return out;
+  }
+
+  /* 目标链：wp1..wpn, goal。段 0 起点为车辆本身；若车恰好站在 wp1 上则跳过。 */
+  const targets = [];
+  const startOnFirstWp = waypoints[0] && car.x === waypoints[0].x && car.y === waypoints[0].y;
+  for (let i = startOnFirstWp ? 1 : 0; i < waypoints.length; i++) targets.push({ x: waypoints[i].x, y: waypoints[i].y, isFinal: false });
+  targets.push({ x: gx, y: gy, isFinal: true });
+
+  /* 逐段枚举：段 i 只为上一段实际出现过的 endEntry 枚举。 */
+  const segLists = [];
+  let entrySets = [car.entry];
+  let startCell = { x: car.x, y: car.y };
+  for (let i = 0; i < targets.length; i++) {
+    if (cspGuard.stats.aborted) break;
+    const byEntry = new Map();
+    for (const entry of entrySets) {
+      const paths = runSegment(startCell.x, startCell.y, entry, targets[i], targets[i].isFinal, "segment-bucket-capacity");
+      if (paths.length) byEntry.set(entry, paths);
+    }
+    segLists.push(byEntry);
+    const nextEntries = new Set();
+    for (const paths of byEntry.values()) for (const p of paths) nextEntries.add(p.endEntry);
+    entrySets = [...nextEntries];
+    startCell = { x: targets[i].x, y: targets[i].y };
+    if (!byEntry.size) break;
+  }
+  if (cspGuard.stats.aborted || segLists.length < targets.length || !segLists[segLists.length - 1].size) {
+    cspGuard.stats.p8Segmented[String(car.name)] = { segments: segStats, joined: 0, joinIterations: 0, overflow };
+    cspGuard.noteRetained(car.name, 0);
+    return { paths: [], overflow, overflowReasons: [...overflowReasons], minSteps: wholeMin, maxLen, minLen };
+  }
+
+  /* 后缀最短步：拼接时的总步数下界剪枝。 */
+  const suffixMin = new Array(targets.length + 1).fill(0);
+  for (let i = targets.length - 1; i >= 0; i--) {
+    let m = Infinity;
+    for (const paths of segLists[i].values()) for (const p of paths) if (p.steps < m) m = p.steps;
+    suffixMin[i] = (m === Infinity ? 0 : m) + suffixMin[i + 1];
+  }
+
+  /* 惰性拼接：按段递归，端口衔接 + usage 合并 + 总窗口过滤；不物化笛卡尔积。 */
+  function mergeAssign(map, a) {
+    const cur = map[a.k];
+    if (!cur) {
+      map[a.k] = { k: a.k, track: a.track, entry: a.entry, exit: a.exit, extra: a.extra ? a.extra.map(e => ({ ...e })) : undefined };
+      return true;
+    }
+    const all = [], seen = new Set();
+    for (const u of [{ entry: cur.entry, exit: cur.exit }, ...(cur.extra || []), { entry: a.entry, exit: a.exit }, ...(a.extra || [])]) {
+      const id = u.entry + ">" + u.exit;
+      if (!seen.has(id)) { seen.add(id); all.push(u); }
+    }
+    let track = null;
+    if (all.every(u => exitPort(cur.track, u.entry) === u.exit)) track = cur.track;
+    else {
+      for (const tn of T_TRACKS) { if (all.every(u => exitPort(tn, u.entry) === u.exit)) { track = tn; break; } }
+    }
+    if (!track) return false;
+    map[a.k] = { k: a.k, track, entry: all[0].entry, exit: all[0].exit, extra: all.length > 1 ? all.slice(1) : undefined };
+    return true;
+  }
+  const joinedBuckets = {}, joinedOrder = [];
+  let joinedEnumerated = 0, joinIterations = 0, joinAborted = false;
+  function keepJoined(assigns, steps) {
+    if (cspGuard.notePath(car.name)) { joinAborted = true; return; }
+    joinedEnumerated += 1;
+    const p = { assigns, steps };
+    const b = pathBucketOf(assigns);
+    let arr = joinedBuckets[b];
+    if (!arr) { arr = []; joinedBuckets[b] = arr; joinedOrder.push(b); }
+    if (arr.length < perBucket) { arr.push(p); return; }
+    overflow = true;
+    overflowReasons.add("path-bucket-capacity");
+    cspGuard.addOverflow("path-bucket-capacity", car.name);
+    let wi = 0;
+    for (let i = 1; i < arr.length; i++) if (compareOf(arr[i], arr[wi]) > 0) wi = i;
+    if (compareOf(p, arr[wi]) < 0) arr[wi] = p;
+  }
+  function joinRec(segIdx, entry, map, cellCount, steps) {
+    if (joinAborted || cspGuard.stats.aborted) return;
+    const paths = segLists[segIdx].get(entry);
+    if (!paths) return;
+    for (const p of paths) {
+      joinIterations += 1;
+      if (cspGuard.notePathIteration(car.name)) { joinAborted = true; return; }
+      if (joinIterations > MAX_ENUM_ITERS) {
+        joinAborted = true;
+        overflow = true;
+        overflowReasons.add("segment-join-iterations");
+        cspGuard.addOverflow("segment-join-iterations", car.name);
+        return;
+      }
+      const total = steps + p.steps;
+      if (total + suffixMin[segIdx + 1] > maxLen) continue;
+      const next = {};
+      for (const k in map) next[k] = map[k];
+      let count = cellCount, ok = true;
+      for (const a of p.assigns) {
+        const had = next[a.k] !== undefined;
+        if (!mergeAssign(next, a)) { ok = false; break; }
+        if (!had) count += 1;
+        if (count > maxCost) { ok = false; break; }
+      }
+      if (!ok) continue;
+      if (segIdx === targets.length - 1) {
+        if (total >= minLen && total <= maxLen) keepJoined(Object.values(next), total);
+        continue;
+      }
+      joinRec(segIdx + 1, p.endEntry, next, count, total);
+      if (joinAborted) return;
+    }
+  }
+  joinRec(0, car.entry, {}, 0, 0);
+
+  for (const b of joinedOrder) joinedBuckets[b].sort(compareOf);
+  const flat = [];
+  const bucketCount = joinedOrder.reduce((sum, b) => sum + joinedBuckets[b].length, 0);
+  if (bucketCount > pathLimit) {
+    overflow = true;
+    overflowReasons.add("path-retention-limit");
+    cspGuard.addOverflow("path-retention-limit", car.name);
+  }
+  for (let i = 0; flat.length < pathLimit; i++) {
+    let added = false;
+    for (const b of joinedOrder) {
+      const p = joinedBuckets[b][i]; if (!p) continue;
+      flat.push(p); added = true;
+      if (flat.length >= pathLimit) break;
+    }
+    if (!added) break;
+  }
+  flat.sort(compareOf);
+  const seen = new Set(), deduped = [];
+  for (const p of flat) { const fp = p._key || keyOf(p.assigns); if (!seen.has(fp)) { seen.add(fp); deduped.push(p); } }
+  cspGuard.stats.p8Segmented[String(car.name)] = { segments: segStats, joined: deduped.length, joinIterations, overflow };
+  cspGuard.noteRetained(car.name, deduped.length);
+  for (const reason of overflowReasons) cspGuard.addOverflow(reason, car.name);
+  return { paths: deduped, overflow, overflowReasons: [...overflowReasons], minSteps: wholeMin, maxLen, minLen };
+}
+
+function solveCSP(pz, maxCost, bs, meta, cspGuard, telemetry, p8Segmented = true) {
   cspGuard.stats.attempted = true;
   if (cspGuard.checkTime(true)) {
     return { sol: null, alternates: [], overflow: cspGuard.stats.overflow, info: "CSP aborted: " + cspGuard.stats.abortReason };
@@ -835,7 +1199,10 @@ function solveCSP(pz, maxCost, bs, meta, cspGuard, telemetry) {
       cspGuard.noteRetained(car.name, 0);
       allPathResults.push({ paths: [], overflow: false, overflowReasons: [], minSteps: Infinity, minLen: 0, maxLen: 0 });
     } else {
-      allPathResults.push(enumeratePaths(car, pz, bs, meta, maxCost, waypointsByCar[car.name], minRequiredByCar[car.name] || 0, blockedByCar[car.name], cspGuard));
+      const enumerator = p8Segmented && (waypointsByCar[car.name] || []).length
+        ? enumerateSegmentedPaths
+        : enumeratePaths;
+      allPathResults.push(enumerator(car, pz, bs, meta, maxCost, waypointsByCar[car.name], minRequiredByCar[car.name] || 0, blockedByCar[car.name], cspGuard));
     }
   }
   if (cspGuard.stats.aborted) {
@@ -1834,6 +2201,8 @@ self.onmessage = function (e) {
      p7GoalEntry 控制终点入口精化（第十一轮变量），显式 false 恢复第十轮 h。 */
   const p7LowerBound = solverOptions.p7LowerBound !== false;
   const p7GoalEntry = solverOptions.p7GoalEntry !== false;
+  /* P8① 分段枚举默认开启（只影响含 waypoint 的车）；显式 false 恢复整条枚举。 */
+  const p8Segmented = solverOptions.p8Segmented !== false;
   let cspMs = 0, p12SeedMs = 0, dfsMs = 0;
 
   function emptyDfsStats(reason = "not-run") {
@@ -1964,7 +2333,7 @@ self.onmessage = function (e) {
     for (const slack of slacks) {
       if (cspGuard.stats.aborted) break;
       const ppz = { ...fpz, pathSlack: slack };
-      const csp = solveCSP(ppz, curBudget, bs, meta, cspGuard, telemetry);
+      const csp = solveCSP(ppz, curBudget, bs, meta, cspGuard, telemetry, p8Segmented);
       lastCsp = csp;
       if (csp && csp.sol && (!bestSol || csp.sol.__cost < bestSol.__cost)) {
         bestSol = csp.sol;
