@@ -89,6 +89,10 @@ function buildSolverOptions(env = process.env) {
   if (p8Mode && p8Mode !== "on" && p8Mode !== "off") {
     throw new Error(`CSP_P8_SEGMENTED must be on or off, received: ${env.CSP_P8_SEGMENTED}`);
   }
+  const p10Mode = String(env.DFS_P10_COMPACT_KEY || "").trim().toLowerCase();
+  if (p10Mode && p10Mode !== "on" && p10Mode !== "off") {
+    throw new Error(`DFS_P10_COMPACT_KEY must be on or off, received: ${env.DFS_P10_COMPACT_KEY}`);
+  }
 
   const maxMs = optionalPositiveInteger(env.CSP_TIMEBOX_MS);
   const maxPaths = optionalPositiveInteger(env.CSP_PATH_BUDGET);
@@ -128,6 +132,7 @@ function buildSolverOptions(env = process.env) {
   if (p7Mode) options.p7LowerBound = p7Mode === "on";
   if (p7GoalEntryMode) options.p7GoalEntry = p7GoalEntryMode === "on";
   if (p8Mode) options.p8Segmented = p8Mode === "on";
+  if (p10Mode) options.p10CompactKey = p10Mode === "on";
   return options;
 }
 

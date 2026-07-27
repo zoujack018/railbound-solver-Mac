@@ -1580,7 +1580,7 @@ function solveCSP(pz, maxCost, bs, meta, cspGuard, telemetry, p8Segmented = true
 
 // ═══════════ DFS fallback solver ═══════════
 
-function solveDFS(pz, maxSol, minTracks, budget, seed, bs, meta, telemetry, maxIters = DEFAULT_DFS_MAX_ITERATIONS, prePlaced = {}, p7Enabled = true, p7GoalEntry = true) {
+function solveDFS(pz, maxSol, minTracks, budget, seed, bs, meta, telemetry, maxIters = DEFAULT_DFS_MAX_ITERATIONS, prePlaced = {}, p7Enabled = true, p7GoalEntry = true, p10CompactKey = true) {
   const placed = { ...prePlaced }, solutions = [], tm = buildTunnelMap(pz.tunnels);
   const _prePlacedCount = Object.keys(prePlaced).length;
   const ge = pz.goalEntry || pz.goal_entry, ms = pz.maxSteps || pz.max_steps || 50, gx = pz.goal[0], gy = pz.goal[1];
@@ -1716,6 +1716,115 @@ function solveDFS(pz, maxSol, minTracks, budget, seed, bs, meta, telemetry, maxI
     }
     return false;
   }
+  /* ═══ P10 精确紧凑 visited 键（第十五轮，单变量，DFS_P10_COMPACT_KEY=off 可回退）═══
+     第十四版 profile 定罪：每节点 ~100+ 字符 sk 的构造（map/sort/join）与
+     visited Set 的字符串哈希合计 ≈16–24%，另有 ≈33% 字符串键 IC 查找。本轮
+     把 sk 换成固定槽位的 16 位/字符二进制打包短串。健全性红线：visited 假阳
+     性会错误剪子树、破坏完备性证明，因此编码必须逐分量双射——车名→固定槽位
+     （名字集合与多重集在无重名下等价于槽位映射，与旧键的 sort 语义一致）、
+     arrived 因"必是 _order 前缀"的既有断言只编码长度、其余动态分量各占独立
+     位段/字符。任何维度超出编码上限时整轮回退旧字符串键（不允许运行中切换
+     格式——路径式 visited 的 add/delete 必须始终同一编码）。 */
+  const _p10 = {
+    enabled: p10CompactKey === true,
+    fallbackReason: null,
+    nameSlot: {},
+    entryCode: { N: 0, E: 1, S: 2, W: 3 },
+    sideBit: { N: 1, E: 2, S: 4, W: 8 },
+    barBit: {}, tsBit: {}, autoBit: {}, platBit: {},
+    cellIdx: new Map(), trackIds: new Map(),
+    blankKeys: [], carCount: 0, buf: null,
+  };
+  if (_p10.enabled) {
+    const fail = reason => { _p10.enabled = false; _p10.fallbackReason = reason; };
+    _p10.carCount = pz.cars.length;
+    if (_p10.carCount > 8) fail("cars>8");
+    else if (pz.width > 15 || pz.height > 15) fail("board>15x15");
+    else if (pz.cars.some(c => (c.wait || 0) > 7)) fail("initial-wait>7");
+    else if (pz.cars.some(c => _p10.entryCode[c.entry] === undefined)) fail("entry-domain");
+    else {
+      /* toggled 的键域是触发器颜色（可含无 Barrier 的颜色）；旧键把它们视作
+         独立状态维度，紧凑键必须同样区分，位域取触发器∪Barrier 颜色全集。 */
+      const barColors = [...new Set([
+        ...Object.values(_trigMap),
+        ...(pz.barriers || []).map(b => b.color),
+      ])].sort();
+      const tsColors = [...new Set(Object.values(_tswMap))].sort();
+      const autoCells = Object.keys(_autoSwitchMap).sort();
+      const platIds = [];
+      for (const name in _platformState.requiredByCar) {
+        for (const item of _platformState.requiredByCar[name]) platIds.push(item.id);
+      }
+      platIds.sort();
+      const trackUniverse = new Set([...T_TRACKS]);
+      for (const entry in BASIC_BY_ENTRY) for (const t of BASIC_BY_ENTRY[entry]) trackUniverse.add(t);
+      for (const k in _tswitchMap) for (const t of tswitchTrackVariants(_tswitchMap[k])) trackUniverse.add(t);
+      for (const k in _autoSwitchMap) for (const t of tswitchTrackVariants(_autoSwitchMap[k])) trackUniverse.add(t);
+      for (const k in pz.fixed) trackUniverse.add(pz.fixed[k]);
+      if (barColors.length > 12) fail("bar-colors>12");
+      else if (tsColors.length > 16) fail("tsw-colors>16");
+      else if (autoCells.length > 16) fail("auto-cells>16");
+      else if (platIds.length > 16) fail("platforms>16");
+      else if (trackUniverse.size > 127) fail("tracks>127");
+      else {
+        pz.cars.forEach((c, i) => { _p10.nameSlot[String(c.name)] = i; });
+        barColors.forEach((c, i) => { _p10.barBit[c] = 1 << i; });
+        tsColors.forEach((c, i) => { _p10.tsBit[c] = 1 << i; });
+        autoCells.forEach((k, i) => { _p10.autoBit[k] = 1 << i; });
+        platIds.forEach((id, i) => { _p10.platBit[id] = 1 << i; });
+        for (let y = 0; y < pz.height; y++) for (let x = 0; x < pz.width; x++) _p10.cellIdx.set(pk(x, y), y * pz.width + x);
+        [...trackUniverse].sort().forEach((t, i) => { _p10.trackIds.set(t, i); });
+        _p10.blankKeys = [...bs].sort();
+        _p10.buf = new Uint16Array(2 + _p10.carCount * 2 + 4 + _p10.blankKeys.length);
+      }
+    }
+  }
+  function buildP10Key(cars, arrived, toggled, tsToggled, autoToggled, tsLocks, servedPlatforms) {
+    const buf = _p10.buf, carCount = _p10.carCount;
+    let n = 0;
+    /* 旧键仅在 _hasBars 时纳入 toggled 段（无 Barrier 时开关无动力学意义），
+       紧凑键逐点对齐以保证节点数逐例相等。 */
+    let barMask = 0;
+    if (_hasBars) { for (const color in toggled) if (toggled[color]) barMask |= _p10.barBit[color]; }
+    buf[n++] = arrived.length | (barMask << 4);
+    buf.fill(0, n, n + carCount);
+    for (const c of cars) {
+      buf[n + _p10.nameSlot[String(c.name)]] = 1 | (c.x << 1) | (c.y << 5)
+        | (_p10.entryCode[c.entry] << 9) | ((c.wait || 0) << 11) | (c.parked ? 16384 : 0);
+    }
+    n += carCount;
+    if (_hasTS) {
+      let tsMask = 0;
+      for (const color in tsToggled) if (tsToggled[color]) tsMask |= _p10.tsBit[color];
+      buf[n++] = tsMask;
+      buf.fill(0, n, n + carCount);
+      for (const name in tsLocks) {
+        const lock = tsLocks[name];
+        buf[n + _p10.nameSlot[name]] = 1 | (_p10.cellIdx.get(lock.k) << 1) | (_p10.trackIds.get(lock.track) << 9);
+      }
+      n += carCount;
+    }
+    if (_hasAuto) {
+      let autoMask = 0;
+      for (const k in autoToggled) if (autoToggled[k]) autoMask |= _p10.autoBit[k];
+      buf[n++] = autoMask;
+    }
+    if (_hasPlatforms) {
+      let served = 0;
+      for (const id of servedPlatforms) served |= _p10.platBit[id];
+      buf[n++] = served;
+    }
+    if (_hasZero) {
+      for (const k of _p10.blankKeys) {
+        const bans = portBans[k];
+        if (!bans || !bans.size) continue;
+        let mask = 0;
+        for (const side of bans) mask |= _p10.sideBit[side];
+        buf[n++] = (_p10.cellIdx.get(k) << 4) | mask;
+      }
+    }
+    return String.fromCharCode.apply(null, buf.subarray(0, n));
+  }
   let deepest = { step: 0, arrived: [], cars: [], placed: {} };
   const solutionKeys = new Set();
   function placedKey(obj) { return Object.keys(obj).sort().map(k => k + ":" + obj[k]).join("|"); }
@@ -1762,6 +1871,7 @@ function solveDFS(pz, maxSol, minTracks, budget, seed, bs, meta, telemetry, maxI
       terminationReason,
       solutions: solutions.length,
       p7: { enabled: _p7.enabled, evals: _p7.evals, bfsRuns: _p7.bfsRuns, pruned: _p7.pruned },
+      p10: { compact: _p10.enabled, fallbackReason: _p10.fallbackReason },
     };
   }
   function candidateLimitReached() {
@@ -1994,13 +2104,17 @@ function solveDFS(pz, maxSol, minTracks, budget, seed, bs, meta, telemetry, maxI
       /* All cars (including zero) must have a track placed — no skip option */
       return;
     }
-    /* Build visited key with FULL dynamic state (banned = 已决定不铺轨的格) */
-    const sk = arrived.join(",") + "|" + cars.map(c => c.name + ":" + c.x + "," + c.y + "," + c.entry + ":" + (c.wait || 0) + (c.parked ? ":P" : "")).sort().join("|") +
-      (_hasBars ? "|T:" + Object.keys(toggled).filter(k => toggled[k]).sort().join(",") : "") +
-      (_hasTS ? "|TS:" + Object.keys(tsToggled).filter(k => tsToggled[k]).sort().join(",") + "|L:" + Object.keys(tsLocks).sort().map(n => n + ":" + tsLocks[n].k + ":" + tsLocks[n].track).join(",") : "") +
-      (_hasAuto ? "|A:" + Object.keys(autoToggled).filter(k => autoToggled[k]).sort().join(",") : "") +
-      (_hasPlatforms ? "|P:" + [...servedPlatforms].sort().join(",") : "") +
-      (_hasZero && Object.keys(portBans).length ? "|X:" + Object.keys(portBans).sort().map(k => k + ":" + [...portBans[k]].sort().join("")).join(",") : "");
+    /* Build visited key with FULL dynamic state (banned = 已决定不铺轨的格)。
+       P10：紧凑键与旧字符串键表示同一等价关系（见 _p10 注释），A/B 下
+       节点数必须逐例相等。 */
+    const sk = _p10.enabled
+      ? buildP10Key(cars, arrived, toggled, tsToggled, autoToggled, tsLocks, servedPlatforms)
+      : arrived.join(",") + "|" + cars.map(c => c.name + ":" + c.x + "," + c.y + "," + c.entry + ":" + (c.wait || 0) + (c.parked ? ":P" : "")).sort().join("|") +
+        (_hasBars ? "|T:" + Object.keys(toggled).filter(k => toggled[k]).sort().join(",") : "") +
+        (_hasTS ? "|TS:" + Object.keys(tsToggled).filter(k => tsToggled[k]).sort().join(",") + "|L:" + Object.keys(tsLocks).sort().map(n => n + ":" + tsLocks[n].k + ":" + tsLocks[n].track).join(",") : "") +
+        (_hasAuto ? "|A:" + Object.keys(autoToggled).filter(k => autoToggled[k]).sort().join(",") : "") +
+        (_hasPlatforms ? "|P:" + [...servedPlatforms].sort().join(",") : "") +
+        (_hasZero && Object.keys(portBans).length ? "|X:" + Object.keys(portBans).sort().map(k => k + ":" + [...portBans[k]].sort().join("")).join(",") : "");
     if (visited.has(sk)) {
       if (arrived.length === _order.length && !cars.some(c => !isZeroCar(c))) {
         if (allPlatformsServed(_platformState, servedPlatforms) && validatePlacedTUsage()) {
@@ -2210,6 +2324,8 @@ self.onmessage = function (e) {
   const p7GoalEntry = solverOptions.p7GoalEntry !== false;
   /* P8① 分段枚举默认开启（只影响含 waypoint 的车）；显式 false 恢复整条枚举。 */
   const p8Segmented = solverOptions.p8Segmented !== false;
+  /* P10 紧凑 visited 键默认开启；显式 false 恢复旧字符串键用于 A/B。 */
+  const p10CompactKey = solverOptions.p10CompactKey !== false;
   let cspMs = 0, p12SeedMs = 0, dfsMs = 0;
 
   function emptyDfsStats(reason = "not-run") {
@@ -2277,7 +2393,7 @@ self.onmessage = function (e) {
       cspStats: cspGuard.snapshot(),
       dfsStats: emptyDfsStats("running"),
     });
-    const result = solveDFS(fpz, 1, minTracks, dfsBudget, seed || 0, bs, meta, telemetry, dfsMaxIterations, {}, p7LowerBound, p7GoalEntry);
+    const result = solveDFS(fpz, 1, minTracks, dfsBudget, seed || 0, bs, meta, telemetry, dfsMaxIterations, {}, p7LowerBound, p7GoalEntry, p10CompactKey);
     dfsMs += elapsedMs(dfsStartedAt);
     telemetry.dfsMs = dfsMs;
     telemetry.dfsStartedAt = null;

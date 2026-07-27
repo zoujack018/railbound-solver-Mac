@@ -50,6 +50,7 @@ PUZZLE_PROOF_GRACE_MS=100 PUZZLE_WORKERS=8 npm run test:puzzles -- "4x8"
 PORTFOLIO_HETEROGENEOUS=off PUZZLE_WORKERS=8 npm run test:puzzles  # Homogeneous A/B
 DFS_P7_LOWER_BOUND=off npm run test:puzzles  # Disable the P7 admissible lower bound
 CSP_P8_SEGMENTED=off npm run test:puzzles    # Disable P8① segmented waypoint enumeration
+DFS_P10_COMPACT_KEY=off npm run test:puzzles # Restore the legacy string visited key
 DFS_MAX_ITERATIONS=15000000 npm run test:puzzles
 ```
 
@@ -279,14 +280,19 @@ string (construction + visited-Set hashing) plus string-keyed dynamic
 lookups account for ~50–60% of ticks; GC is 0.9% (object pooling ruled
 out); P7's own share ≈7.6%. The next rounds, in order:
 
-1. **P10: exact compact visited key** — replace the per-node ~100+-char
-   `sk` string with a compact exact encoding or a two-level hash→exact
-   table. SOUNDNESS LINE: a visited false positive prunes a subtree and
-   breaks completeness proofs, so lossy Zobrist alone is forbidden; the
-   old P4 negative probe (naive string LRU) does not cover this design.
-2. **String-keyed hot objects → array indexing** (`placed` etc.) — second
-   candidate, separate A/B after the key round.
-3. **P12 generalization (cycle families)** — only as a deliberate design
+The fifteenth round implemented the P10 exact compact visited key
+(`DFS_P10_COMPACT_KEY=off` to revert; fixed-slot 16-bit-per-char packing,
+component-wise bijective, automatic whole-run fallback to the legacy string
+key when any dimension exceeds the encoding limits): 13/13 off/on cases
+with exactly equal node counts pinned the equivalence relation, 7×7-8-7A
+wall −4.3% (budget 19) / −6.0% (budget 20) with bit-identical node counts.
+The gain is modest — the remaining hotspot is the ≈33% string-keyed
+IC-load bucket. The next rounds, in order:
+
+1. **String-keyed hot objects → array indexing** (`placed`, `useMap`,
+   `portBans`, `_barMap` …) — the profile's largest remaining bucket;
+   node-count-equality A/B like P10.
+2. **P12 generalization (cycle families)** — only as a deliberate design
    round, if funnel-puzzle candidates beyond the DFS portfolio are needed.
 
 Historical probe scope: the old P4 probe rejects only the naive string-key LRU,
