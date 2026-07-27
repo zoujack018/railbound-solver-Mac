@@ -178,10 +178,41 @@ function zeroSafetyKey(cars, toggled, tsToggled, autoToggled, tsLocks) {
 }
 
 /* 追尾判定已删除（2026-07-22，作者确认）：真实 Railbound 允许车辆一格间距
-   跟随行驶；追撞静止车辆的场景由排队机制（跟随等待）与占格碰撞自然覆盖。
-   删除依据：4×8 关卡在原规则下完备搜索最小 11 轨 > 题目上限 9，删除后恰好
-   9 轨；6×7 的 16 轨（上限）解仅因 TAILING 被拒；autoswitch 6×4 夹具的
-   hasSolution:true 与原规则第 1 步必然 TAILING 直接矛盾。 */
+   跟随行驶；若前车静止，后车驶入其占格会由同一步落点重合的 CELL_COLLISION
+   直接拒绝。删除依据：4×8 关卡在原规则下完备搜索最小 11 轨 > 题目上限 9，
+   删除后恰好 9 轨；autoswitch 6×4 夹具的 hasSolution:true 与原规则第 1 步
+   必然 TAILING 直接矛盾。 */
+
+/* 对穿碰撞（2026-07-22，作者确认，实例：7×7-8-5A 自变 T 处 3 向下、4 向右）：
+   相邻两车同一步穿过同一条边互换格子是碰撞。只对相邻格互换判撞——
+   经隧道传送导致的"位置互换"没有物理交汇，不算。 */
+function detectSwapCollision(prevCars, nextCars) {
+  if (nextCars.length < 2) return null;
+  const prevByName = new Map();
+  for (const c of prevCars) prevByName.set(c.name, c);
+  let moves = null;
+  for (const c of nextCars) {
+    const p = prevByName.get(c.name);
+    if (!p || (p.x === c.x && p.y === c.y)) continue;
+    const adjacent = Math.abs(p.x - c.x) + Math.abs(p.y - c.y) === 1;
+    if (!adjacent) continue;
+    const from = pk(p.x, p.y), to = pk(c.x, c.y);
+    if (moves) {
+      const other = moves.get(to + ">" + from);
+      if (other) {
+        return {
+          reason: "对穿碰撞",
+          detail: { errorCode: "SWAP_COLLISION", cars: [other, c.name], cells: [from, to] },
+        };
+      }
+    } else {
+      moves = new Map();
+    }
+    moves.set(from + ">" + to, c.name);
+  }
+  return null;
+}
+
 function detectCarCollision(cars, world) {
   const occupied = new Map();
   for (const car of cars) {
@@ -236,7 +267,8 @@ function zeroSafetyLookahead(puzzle, cars, ctx) {
     const tsTriggeredColors = [];
     const autoUsedKeys = [];
     const releaseTSLocks = new Set();
-    /* 与 simulate() 一致的排队推进：意向移动 -> 不动点降级 -> 移动者发信号 */
+    /* 与 simulate() 一致的三阶段推进：意向移动 -> 占格碰撞裁决 -> 移动者发信号
+       （静止车=墙，无排队降级） */
     const moveRecs = [];
 
     for (const c of zeroCars) {
@@ -297,21 +329,6 @@ function zeroSafetyLookahead(puzzle, cars, ctx) {
       moveRecs.push({ stay: false, c, nx, ny, ne, usedTSLock, usedAutoSwitch, fromKey: k });
     }
 
-    const stayCells = new Set(moveRecs.filter(m => m.stay).map(m => pk(m.c.x, m.c.y)));
-    let queueChanged = true;
-    while (queueChanged) {
-      queueChanged = false;
-      for (const m of moveRecs) {
-        if (m.stay) continue;
-        if (stayCells.has(pk(m.nx, m.ny))) {
-          m.stay = true;
-          m.keep = { name: m.c.name, role: m.c.role, x: m.c.x, y: m.c.y, entry: m.c.entry, wait: 0, _queued: true };
-          stayCells.add(pk(m.c.x, m.c.y));
-          queueChanged = true;
-        }
-      }
-    }
-
     for (const m of moveRecs) {
       if (m.stay) { nxt.push(m.keep); continue; }
       const { c, nx, ny, ne, usedTSLock, usedAutoSwitch, fromKey } = m;
@@ -323,7 +340,7 @@ function zeroSafetyLookahead(puzzle, cars, ctx) {
     }
 
     const world = { tracks, tm, barriers, tswitchMap, autoSwitchMap, toggled, tsToggled, autoToggled, tsLocks };
-    const collision = detectCarCollision(nxt, world);
+    const collision = detectCarCollision(nxt, world) || detectSwapCollision(zeroCars, nxt);
     if (collision) return { ok: false, ...collision };
     zeroCars = nxt;
     applyWorldTransitions(zeroCars, { triggeredColors, tsTriggeredColors, autoUsedKeys, releaseTSLocks }, world);
@@ -383,10 +400,11 @@ function simulate(puzzle, placed) {
     const tsTriggeredColors = [];
     const autoUsedKeys = [];
     const releaseTSLocks = new Set();
-    /* 排队机制（2026-07-22，作者确认）：分三阶段推进 ——
-       ① 逐车计算意向移动；② 不动点降级：目标格被不动车（停车/等待/
-       Barrier 阻挡/已排队）占据的车原地排队，级联传播；③ 只对实际移动
-       的车辆触发机关信号与接客。 */
+    /* 三阶段推进：① 逐车计算意向移动；② 碰撞由占格检测统一裁决 ——
+       静止车（停车/接客等待/Barrier 阻挡）就是墙，驶入其格子 = 碰撞，
+       游戏中没有"预判性排队"（2026-07-22 作者实测：8×8-8-5B 中 4 追撞
+       接客等待的 3 = 撞车；此前的排队降级机制因此回退）；
+       ③ 只对实际移动的车辆触发机关信号与接客。 */
     const moveRecs = [];
 
     for (const c0 of cars) {
@@ -465,22 +483,6 @@ function simulate(puzzle, placed) {
       moveRecs.push({ stay: false, c, nx, ny, ne, usedTSLock, usedAutoSwitch, fromKey: k });
     }
 
-    /* 排队不动点：目标格被不动车占据的移动车降级为原地等待，级联传播 */
-    const stayCells = new Set(moveRecs.filter(m => m.stay).map(m => pk(m.c.x, m.c.y)));
-    let queueChanged = true;
-    while (queueChanged) {
-      queueChanged = false;
-      for (const m of moveRecs) {
-        if (m.stay) continue;
-        if (stayCells.has(pk(m.nx, m.ny))) {
-          m.stay = true;
-          m.keep = { name: m.c.name, role: m.c.role, x: m.c.x, y: m.c.y, entry: m.c.entry, wait: 0, _queued: true };
-          stayCells.add(pk(m.c.x, m.c.y));
-          queueChanged = true;
-        }
-      }
-    }
-
     for (const m of moveRecs) {
       if (m.stay) { nxt.push(m.keep); continue; }
       const { c, nx, ny, ne, usedTSLock, usedAutoSwitch, fromKey } = m;
@@ -497,7 +499,7 @@ function simulate(puzzle, placed) {
       nxt.push({ name: c.name, role: c.role, x: nx, y: ny, entry: ne, wait });
     }
     const world = { tracks, tm, barriers, tswitchMap, autoSwitchMap, toggled, tsToggled, autoToggled, tsLocks };
-    const collision = detectCarCollision(nxt, world);
+    const collision = detectCarCollision(nxt, world) || detectSwapCollision(cars, nxt);
     if (collision) return { ok: false, ...collision, arrived, steps: t, history };
     cars = nxt; history.push(cars.map(c => ({ ...c })));
     applyWorldTransitions(cars, { triggeredColors, tsTriggeredColors, autoUsedKeys, releaseTSLocks }, world);
@@ -529,6 +531,7 @@ function formatSimError(result) {
   if (d.expected) parts.push(`expected=${d.expected}`);
   if (d.actual) parts.push(`actual=${d.actual}`);
   if (d.cars) parts.push(`involved=[${d.cars.join(',')}]`);
+  if (d.cells) parts.push(`cells=[${d.cells.join(' | ')}]`);
   if (d.leader) parts.push(`leader=${d.leader} follower=${d.follower}`);
   if (d.direction) parts.push(`dir=${d.direction}`);
   if (d.from) parts.push(`from=(${d.from})`);
@@ -676,6 +679,7 @@ export {
   occupiedBarrierColors,
   buildPlatformState, platformPickupForCar, carNeedsPassengers, allPlatformsServed,
   isZeroCar, requiredOrder, zeroSafetySteps, zeroSafetyLookahead,
+  detectSwapCollision,
   simulate, formatSimError, forwardReachable, backwardReachable, filterBlanks,
   blockedCellsForCar, carWaypoints, minRemainingDist,
   puzzleHasDynamicState,

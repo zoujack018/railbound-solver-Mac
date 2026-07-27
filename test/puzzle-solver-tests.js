@@ -6,10 +6,32 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { normalizePuzzle } from "../puzzle-io.js";
 import { isPuzzleManifestFileName, PUZZLE_TEST_MANIFEST } from "../puzzle-library.js";
 import { simulate } from "../railbound-rules.js";
+import {
+  boundedProofGraceMs,
+  classifyPortfolioEvidence,
+  createProofScopeKey,
+  inspectPortfolioCandidate,
+  MAX_PUZZLE_WORKERS,
+  normalizeCandidateSources,
+  portfolioSeed,
+  solvedStatusLabel,
+  workerProofIssue,
+} from "../solver/portfolio-evidence.js";
+import { createPortfolioState, reducePortfolioEvent } from "../solver/portfolio-state-machine.js";
 
 const TEST_DIR = fileURLToPath(new URL("./", import.meta.url));
 const WORKER_URL = pathToFileURL(path.join(TEST_DIR, "solver-worker-node.js"));
 const defaultTimeoutMs = positiveInteger(process.env.PUZZLE_TIMEOUT_MS, 20_000);
+const puzzleWorkers = Math.min(positiveInteger(process.env.PUZZLE_WORKERS, 1), MAX_PUZZLE_WORKERS);
+const portfolioProofGraceMs = nonNegativeInteger(process.env.PUZZLE_PROOF_GRACE_MS, 100);
+const heterogeneousMode = String(process.env.PORTFOLIO_HETEROGENEOUS || "on").trim().toLowerCase();
+if (heterogeneousMode !== "on" && heterogeneousMode !== "off") {
+  throw new Error(`PORTFOLIO_HETEROGENEOUS must be on or off, received: ${process.env.PORTFOLIO_HETEROGENEOUS}`);
+}
+/* on（默认）：N>1 时 Worker 0 保持 CSP→DFS，其余 Worker 跳过 CSP 直接 DFS；
+   off：恢复第七轮的同构组合（全部 Worker 复制同一 CSP→DFS 管线）用于 A/B。 */
+const heterogeneousPortfolio = heterogeneousMode === "on";
+const PORTFOLIO_PROOF_GRACE_MARGIN_MS = 10;
 const requestedPattern = process.argv.slice(2).join(" ");
 
 /* 结果分类（测试契约）：
@@ -17,7 +39,8 @@ const requestedPattern = process.argv.slice(2).join(" ");
  *   over-limit       只找到超过轨道上限的合法解 —— 判失败
  *   candidate-failed 候选全部被 simulate() 拒绝 —— 判失败（搜索器与规则不一致）
  *   budget-exhausted 迭代预算耗尽仍无候选 —— 不是无解证明
- *   timeout          时间预算耗尽 —— 不是无解证明
+ *   timeout          Worker 外层墙钟预算耗尽 —— 不是无解证明
+ *   incomplete       Worker 未提供完备无解证明 —— 不是无解证明
  *   search-exhausted 搜索空间在预算内走完且无候选 —— 当前算法边界内无解
  * hasSolution=false 的题只有 search-exhausted 算通过；预算耗尽是"不确定"，仍判失败。 */
 
@@ -25,6 +48,100 @@ function positiveInteger(value, fallback) {
   const parsed = Number.parseInt(value, 10);
   return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
 }
+
+function nonNegativeInteger(value, fallback) {
+  if (value == null || value === "") return fallback;
+  const parsed = Number.parseInt(value, 10);
+  return Number.isInteger(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
+function optionalPositiveInteger(value) {
+  if (value == null || value === "") return null;
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isInteger(parsed) || parsed <= 0) throw new Error(`Expected a positive integer, received: ${value}`);
+  return parsed;
+}
+
+function buildSolverOptions(env = process.env) {
+  const mode = String(env.CSP_TIMEBOX || "").trim().toLowerCase();
+  if (mode && mode !== "on" && mode !== "off") {
+    throw new Error(`CSP_TIMEBOX must be on or off, received: ${env.CSP_TIMEBOX}`);
+  }
+  const p12ModeNew = String(env.P12_PATTERN_SEED || "").trim().toLowerCase();
+  const p12ModeLegacy = String(env.P8_BACKBONE || "").trim().toLowerCase();
+  if (p12ModeNew && p12ModeLegacy && p12ModeNew !== p12ModeLegacy) {
+    throw new Error("P12_PATTERN_SEED conflicts with deprecated P8_BACKBONE");
+  }
+  const p12Mode = p12ModeNew || p12ModeLegacy;
+  if (p12Mode && p12Mode !== "on" && p12Mode !== "off") {
+    throw new Error(`P12_PATTERN_SEED must be on or off, received: ${p12Mode}`);
+  }
+
+  const p7Mode = String(env.DFS_P7_LOWER_BOUND || "").trim().toLowerCase();
+  if (p7Mode && p7Mode !== "on" && p7Mode !== "off") {
+    throw new Error(`DFS_P7_LOWER_BOUND must be on or off, received: ${env.DFS_P7_LOWER_BOUND}`);
+  }
+  const p7GoalEntryMode = String(env.DFS_P7_GOAL_ENTRY || "").trim().toLowerCase();
+  if (p7GoalEntryMode && p7GoalEntryMode !== "on" && p7GoalEntryMode !== "off") {
+    throw new Error(`DFS_P7_GOAL_ENTRY must be on or off, received: ${env.DFS_P7_GOAL_ENTRY}`);
+  }
+  const p8Mode = String(env.CSP_P8_SEGMENTED || "").trim().toLowerCase();
+  if (p8Mode && p8Mode !== "on" && p8Mode !== "off") {
+    throw new Error(`CSP_P8_SEGMENTED must be on or off, received: ${env.CSP_P8_SEGMENTED}`);
+  }
+  const p10Mode = String(env.DFS_P10_COMPACT_KEY || "").trim().toLowerCase();
+  if (p10Mode && p10Mode !== "on" && p10Mode !== "off") {
+    throw new Error(`DFS_P10_COMPACT_KEY must be on or off, received: ${env.DFS_P10_COMPACT_KEY}`);
+  }
+
+  const maxMs = optionalPositiveInteger(env.CSP_TIMEBOX_MS);
+  const maxPaths = optionalPositiveInteger(env.CSP_PATH_BUDGET);
+  const maxCombinations = optionalPositiveInteger(env.CSP_COMBINATION_BUDGET);
+  const dfsMaxIterations = optionalPositiveInteger(env.DFS_MAX_ITERATIONS);
+  const p12MaxMsNew = optionalPositiveInteger(env.P12_PATTERN_SEED_MS);
+  const p12MaxMsLegacy = optionalPositiveInteger(env.P8_BACKBONE_MS);
+  if (p12MaxMsNew != null && p12MaxMsLegacy != null && p12MaxMsNew !== p12MaxMsLegacy) {
+    throw new Error("P12_PATTERN_SEED_MS conflicts with deprecated P8_BACKBONE_MS");
+  }
+  const p12MaxWorkNew = optionalPositiveInteger(env.P12_PATTERN_SEED_WORK_BUDGET);
+  const p12MaxWorkLegacy = optionalPositiveInteger(env.P8_BACKBONE_WORK_BUDGET);
+  if (p12MaxWorkNew != null && p12MaxWorkLegacy != null && p12MaxWorkNew !== p12MaxWorkLegacy) {
+    throw new Error("P12_PATTERN_SEED_WORK_BUDGET conflicts with deprecated P8_BACKBONE_WORK_BUDGET");
+  }
+  const p12MaxMs = p12MaxMsNew ?? p12MaxMsLegacy;
+  const p12MaxWorkUnits = p12MaxWorkNew ?? p12MaxWorkLegacy;
+  const cspTimebox = {};
+  const p12Seed = {};
+
+  /* No CSP environment variables means "use Worker defaults". `on` makes that
+     choice explicit; `off` disables only the new P1 shared timebox and restores
+     the pre-P1 CSP baseline (the solver's original internal caps still apply). */
+  if (mode === "off") cspTimebox.enabled = false;
+  else if (mode === "on") cspTimebox.enabled = true;
+  if (maxMs != null) cspTimebox.maxMs = maxMs;
+  if (maxPaths != null) cspTimebox.maxPaths = maxPaths;
+  if (maxCombinations != null) cspTimebox.maxCombinations = maxCombinations;
+  if (p12Mode) p12Seed.enabled = p12Mode === "on";
+  if (p12MaxMs != null) p12Seed.maxMs = p12MaxMs;
+  if (p12MaxWorkUnits != null) p12Seed.maxWorkUnits = p12MaxWorkUnits;
+
+  const options = {};
+  if (Object.keys(cspTimebox).length) options.cspTimebox = cspTimebox;
+  if (Object.keys(p12Seed).length) options.p12Seed = p12Seed;
+  if (dfsMaxIterations != null) options.dfsMaxIterations = dfsMaxIterations;
+  if (p7Mode) options.p7LowerBound = p7Mode === "on";
+  if (p7GoalEntryMode) options.p7GoalEntry = p7GoalEntryMode === "on";
+  if (p8Mode) options.p8Segmented = p8Mode === "on";
+  if (p10Mode) options.p10CompactKey = p10Mode === "on";
+  return options;
+}
+
+const solverOptions = buildSolverOptions();
+/* DFS-only 角色的 solverOptions。`skipCsp` 进入 createProofScopeKey 的
+   solverOptions 字段，因此该角色自动拥有与 CSP 角色不同的 proofScopeKey：
+   跨角色候选仍可比较（通过 simulate() 验证的候选是关卡层面的事实），
+   但完备性证明绝不跨角色转移。 */
+const dfsRoleSolverOptions = { ...solverOptions, skipCsp: true };
 
 function findJSONFiles(directory) {
   const files = [];
@@ -73,30 +190,132 @@ function loadCase(filePath, manifest) {
   };
 }
 
-function cleanSolution(solution) {
-  return Object.fromEntries(Object.entries(solution || {}).filter(([key]) => key !== "__cost"));
-}
-
-async function solveCase(testCase) {
+/* One Worker session. It owns message decoding, authoritative candidate
+   verification and its own wall-clock budget — nothing else. Winner selection,
+   loser cancellation and proof grace belong to the portfolio state machine;
+   this session only reports candidates and obeys `signal`. */
+async function solveWorkerSession(testCase, {
+  seed = 0,
+  workerIndex = 0,
+  signal = null,
+  onValidCandidate = null,
+  proofScopeKey = null,
+  retainCandidateOnFailure = () => false,
+  solverOptions: sessionSolverOptions = solverOptions,
+} = {}) {
   const started = performance.now();
   const worker = new Worker(WORKER_URL, { type: "module" });
   const candidateFailures = [];
   const overLimit = [];
   let best = null;
+  let firstCandidateMs = null;
   let lastProgress = null;
   let dfsInfo = null;
   let reportedIterations = 0;
   let lastCspInfo = "";
+  let phaseObservedAt = null;
+  const telemetry = {
+    cspMs: null,
+    p12SeedMs: null,
+    dfsMs: null,
+    cspStats: null,
+    dfsStats: null,
+    workerFirstCandidateMs: null,
+    workerFinalCost: null,
+    complete: false,
+    terminationReason: null,
+    phase: null,
+  };
+
+  const mergeStats = (previous, next) => {
+    if (!next || typeof next !== "object") return previous;
+    return { ...(previous || {}), ...next };
+  };
+  const captureTelemetry = message => {
+    if (Number.isFinite(message.cspMs)) telemetry.cspMs = message.cspMs;
+    if (Number.isFinite(message.p12SeedMs)) telemetry.p12SeedMs = message.p12SeedMs;
+    if (Number.isFinite(message.dfsMs)) telemetry.dfsMs = message.dfsMs;
+    if (message.cspStats) telemetry.cspStats = mergeStats(telemetry.cspStats, message.cspStats);
+    if (message.dfsStats) telemetry.dfsStats = mergeStats(telemetry.dfsStats, message.dfsStats);
+    if (Number.isFinite(message.firstCandidateMs)) telemetry.workerFirstCandidateMs = message.firstCandidateMs;
+    if (Number.isFinite(message.finalCost)) telemetry.workerFinalCost = message.finalCost;
+    if (typeof message.complete === "boolean") telemetry.complete = message.complete;
+    if (typeof message.terminationReason === "string" && message.terminationReason) {
+      telemetry.terminationReason = message.terminationReason;
+    }
+    if (typeof message.phase === "string" && message.phase) {
+      telemetry.phase = message.phase;
+      phaseObservedAt = performance.now();
+    }
+    /* Transitional compatibility is for measurement only. It must never turn
+       an old `dfsInfo.exhausted === false` into a completeness claim. */
+    if (message.dfsInfo) {
+      dfsInfo = mergeStats(dfsInfo, message.dfsInfo);
+      telemetry.dfsStats = mergeStats(telemetry.dfsStats, {
+        nodes: message.dfsInfo.iterations,
+        limit: message.dfsInfo.limit,
+        deepestStep: message.dfsInfo.deepest?.step ?? message.dfsInfo.deepest,
+        deepest: message.dfsInfo.deepest,
+        iterationBudgetHit: message.dfsInfo.exhausted,
+        solutions: message.dfsInfo.solutions,
+      });
+    }
+  };
 
   return await new Promise(resolve => {
     let settled = false;
+    let onAbort = null;
     const finish = result => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      void worker.terminate();
-      resolve({
+      if (signal && onAbort) signal.removeEventListener("abort", onAbort);
+      worker.removeAllListeners("message");
+      const finishedAt = performance.now();
+      const elapsedMs = finishedAt - started;
+      let resolvedCspMs = telemetry.cspMs;
+      let resolvedP12SeedMs = telemetry.p12SeedMs;
+      let resolvedDfsMs = telemetry.dfsMs;
+      const forcedStop = result.terminationReason === "wall-clock-timeout"
+        || result.terminationReason === "portfolio-cancelled"
+        || result.terminationReason === "portfolio-first-valid-candidate"
+        || result.terminationReason === "candidate-unproven-worker-error"
+        || result.terminationReason === "candidate-unproven-worker-exit"
+        || result.status === "error";
+      if (forcedStop) {
+        const phaseTailMs = Number.isFinite(phaseObservedAt)
+          ? Math.max(0, performance.now() - phaseObservedAt)
+          : null;
+        if (telemetry.phase === "csp") {
+          if (Number.isFinite(phaseTailMs)) resolvedCspMs = (Number.isFinite(resolvedCspMs) ? resolvedCspMs : 0) + phaseTailMs;
+        } else if (telemetry.phase === "p12-seed") {
+          if (Number.isFinite(phaseTailMs)) {
+            resolvedP12SeedMs = (Number.isFinite(resolvedP12SeedMs) ? resolvedP12SeedMs : 0) + phaseTailMs;
+          }
+        } else if (telemetry.phase === "dfs") {
+          if (Number.isFinite(phaseTailMs)) resolvedDfsMs = (Number.isFinite(resolvedDfsMs) ? resolvedDfsMs : 0) + phaseTailMs;
+        }
+      }
+      const payload = {
+        ...telemetry,
+        cspMs: resolvedCspMs,
+        p12SeedMs: resolvedP12SeedMs,
+        dfsMs: resolvedDfsMs,
+        timingExact: !forcedStop,
+        timingEstimated: forcedStop && Number.isFinite(phaseObservedAt),
+        /* Proof-grace telemetry is owned by the portfolio adapter and overlaid
+           onto the winner's result; a session never enters grace by itself. */
+        proofGraceMs: 0,
+        proofGraceEffectiveMs: 0,
+        proofGraceWaitMs: 0,
+        proofGraceOutcome: "not-entered",
+        proofGraceExpired: false,
+        cspStatsKnown: telemetry.cspStats != null,
+        dfsStatsKnown: telemetry.dfsStats != null,
         ...result,
+        workerIndex,
+        seed,
+        proofScopeKey,
         best,
         overLimit,
         candidateFailures,
@@ -104,44 +323,103 @@ async function solveCase(testCase) {
         dfsInfo,
         reportedIterations,
         lastCspInfo,
-        elapsedMs: Math.round(performance.now() - started),
-      });
+        firstCandidateMs,
+        finalCost: best?.cost ?? null,
+        elapsedMs: Math.round(elapsedMs),
+      };
+      Promise.resolve(worker.terminate())
+        .catch(() => undefined)
+        .then(() => resolve(payload));
     };
     const timer = setTimeout(() => finish({
-      status: "timeout",
-      reason: `时间预算耗尽（${testCase.timeoutMs}ms）——不是无解证明`,
+      status: best ? "solved" : "timeout",
+      method: best ? "validated-candidate" : undefined,
+      reason: best
+        ? `已找到合法候选，但墙钟预算耗尽（${testCase.timeoutMs}ms），未证明最优`
+        : `墙钟预算耗尽（${testCase.timeoutMs}ms）——不是无解证明`,
+      complete: false,
+      terminationReason: "wall-clock-timeout",
     }), testCase.timeoutMs);
+    /* The portfolio adapter tags the abort so the winner's own stop is not
+       mislabelled as a losing cancellation. */
+    onAbort = () => {
+      const stop = signal?.reason && typeof signal.reason === "object" ? signal.reason : {};
+      if (stop.kind === "winner-stop" && best) {
+        finish({
+          status: "solved",
+          method: "portfolio-first-valid",
+          reason: stop.text || "多种子组合已停止 winner；未证明最优",
+          complete: false,
+          terminationReason: "portfolio-first-valid-candidate",
+        });
+        return;
+      }
+      finish({
+        status: "cancelled",
+        method: "portfolio-cancelled",
+        reason: stop.text || "另一个 Worker 已找到合法候选，当前 Worker 被取消",
+        complete: false,
+        terminationReason: "portfolio-cancelled",
+      });
+    };
+    if (signal) {
+      signal.addEventListener("abort", onAbort, { once: true });
+      if (signal.aborted) onAbort();
+    }
 
     worker.on("message", message => {
+      if (settled) return;
+      captureTelemetry(message);
       if (message.type === "progress") {
         lastProgress = message;
         reportedIterations += message.iters || 0;
         if (message.cspInfo) lastCspInfo = message.cspInfo;
-        if (message.dfsInfo) dfsInfo = message.dfsInfo;
         return;
       }
       if (message.type === "solution" && message.solution) {
-        const cost = message.solution.__cost;
-        const placed = cleanSolution(message.solution);
+        const source = normalizeCandidateSources(message.source)[0];
+        const placed = Object.fromEntries(
+          Object.entries(message.solution).filter(([key]) => key !== "__cost"),
+        );
         const result = simulate(testCase.puzzle, placed);
-        if (!result.ok) {
-          candidateFailures.push({ cost, reason: result.reason, detail: result.detail });
+        const inspected = inspectPortfolioCandidate(message.solution, result, testCase.maxTracks);
+        if (!inspected.accepted) {
+          (inspected.kind === "over-limit" ? overLimit : candidateFailures).push(inspected.issue);
           return;
         }
-        /* simulate() 通过但超过轨道上限：记录为超限解，绝不算通过。 */
-        if (testCase.maxTracks != null && cost > testCase.maxTracks) {
-          overLimit.push({ cost, steps: result.steps });
-          return;
+        const cost = inspected.actualCost;
+        if (firstCandidateMs == null) {
+          firstCandidateMs = performance.now() - started;
+          if (Number.isFinite(message.candidateMs)) telemetry.workerFirstCandidateMs = message.candidateMs;
         }
         if (!best || cost < best.cost) {
-          best = { cost, steps: result.steps, placed };
+          best = { cost, steps: result.steps, placed, sources: [source] };
+        } else if (cost === best.cost) {
+          best.sources = normalizeCandidateSources([...(best.sources || []), source]);
         }
-        finish({ status: "solved", method: "validated-candidate", reason: "" });
+        /* Report the verified candidate and keep searching. Only the portfolio
+           state machine may decide that this candidate ends the session, and it
+           does so by aborting `signal`. */
+        if (typeof onValidCandidate === "function") {
+          onValidCandidate({ workerIndex, seed, cost, steps: result.steps, placed, source, sources: [source] }, result);
+        }
         return;
       }
       if (message.type === "done") {
+        const proofIssue = workerProofIssue(message, { best, candidateFailures, overLimit });
+        const proofMismatch = proofIssue != null;
         if (best) {
-          finish({ status: "solved", method: message.method, reason: "" });
+          finish({
+            status: "solved",
+            method: message.method,
+            reason: proofMismatch
+              ? `Worker 最优证明与权威候选不一致（worker finalCost=${message.finalCost ?? "missing"}, validated=${best.cost}, rejected=${candidateFailures.length}, overLimit=${overLimit.length}）`
+              : (message.complete === true && message.terminationReason === "optimal-proven" ? "" : "找到合法候选，但未证明最优"),
+            ...(proofMismatch ? {
+              complete: false,
+              terminationReason: proofIssue,
+            } : {}),
+          });
           return;
         }
         let status, reason;
@@ -151,13 +429,22 @@ async function solveCase(testCase) {
           reason = `找到超限解（最优 ${bestOver} 轨 > 上限 ${testCase.maxTracks}）`;
         } else if (candidateFailures.length) {
           status = "candidate-failed";
-          reason = `${candidateFailures.length} 个候选全部被权威 simulate() 拒绝`;
-        } else if (dfsInfo?.exhausted) {
+          reason = `${candidateFailures.length} 个候选未通过权威验证（simulate() 或成本注解不一致）`;
+        } else if (message.terminationReason === "dfs-iteration-budget"
+          || message.terminationReason === "candidate-unproven-dfs-budget"
+          || message.dfsStats?.iterationBudgetHit === true) {
           status = "budget-exhausted";
-          reason = `迭代预算耗尽（${dfsInfo.iterations} 次）——不是无解证明`;
-        } else {
+          const nodes = message.dfsStats?.nodes ?? dfsInfo?.iterations ?? reportedIterations;
+          reason = `DFS 迭代预算耗尽（${nodes} 节点）——不是无解证明`;
+        } else if (message.terminationReason === "wall-clock-timeout") {
+          status = "timeout";
+          reason = "Worker 报告墙钟预算耗尽——不是无解证明";
+        } else if (message.complete === true && message.terminationReason === "search-exhausted") {
           status = "search-exhausted";
-          reason = "搜索空间在预算内走完，无候选（当前算法边界内无解）";
+          reason = "搜索空间完整走完，无候选";
+        } else {
+          status = "incomplete";
+          reason = `搜索未提供完备无解证明（complete=${message.complete === true}, terminationReason=${message.terminationReason || "missing"}）`;
         }
         finish({
           status,
@@ -166,22 +453,446 @@ async function solveCase(testCase) {
           info: message.info || "",
           pruned: message.pruned,
           alternateCount: message.alternates?.length || 0,
+          ...(proofMismatch ? {
+            complete: false,
+            terminationReason: proofIssue,
+          } : {}),
         });
       }
     });
-    worker.on("error", error => finish({ status: "error", reason: error.stack || error.message }));
+    worker.on("error", error => {
+      const retainGraceCandidate = Boolean(best && retainCandidateOnFailure());
+      finish({
+        status: retainGraceCandidate ? "solved" : "error",
+        method: retainGraceCandidate ? "validated-candidate" : undefined,
+        reason: retainGraceCandidate
+          ? `已保留合法候选，但 Worker 在证明宽限内异常：${error.message}`
+          : (error.stack || error.message),
+        complete: false,
+        terminationReason: retainGraceCandidate ? "candidate-unproven-worker-error" : "worker-error",
+      });
+    });
     worker.on("exit", code => {
-      if (!settled && code !== 0) finish({ status: "error", reason: `Worker 异常退出 (${code})` });
+      if (!settled && code !== 0) {
+        const retainGraceCandidate = Boolean(best && retainCandidateOnFailure());
+        finish({
+          status: retainGraceCandidate ? "solved" : "error",
+          method: retainGraceCandidate ? "validated-candidate" : undefined,
+          reason: retainGraceCandidate
+            ? `已保留合法候选，但 Worker 在证明宽限内异常退出 (${code})`
+            : `Worker 异常退出 (${code})`,
+          complete: false,
+          terminationReason: retainGraceCandidate ? "candidate-unproven-worker-exit" : "worker-exit",
+        });
+      }
     });
 
-    worker.postMessage({
-      type: "solve",
-      requestId: testCase.relativePath,
-      puzzle: { ...testCase.puzzle, _minTracks: true },
-      seed: 0,
-      maxTracksHint: testCase.maxTracks ?? 0,
-    });
+    if (!settled) {
+      worker.postMessage({
+        type: "solve",
+        requestId: `${testCase.relativePath}#worker-${workerIndex}`,
+        puzzle: { ...testCase.puzzle, _minTracks: true },
+        seed,
+        maxTracksHint: testCase.maxTracks ?? 0,
+        solverOptions: sessionSolverOptions,
+      });
+    }
   });
+}
+
+function finiteSum(values) {
+  const finite = values.filter(Number.isFinite);
+  return finite.length ? finite.reduce((sum, value) => sum + value, 0) : null;
+}
+
+function finiteMax(values) {
+  const finite = values.filter(Number.isFinite);
+  return finite.length ? Math.max(...finite) : null;
+}
+
+function aggregatePortfolioTelemetry(results, wallMs, firstCandidateWallMs) {
+  const workerStats = results.map(result => ({
+    workerIndex: result.workerIndex,
+    seed: result.seed,
+    status: result.status,
+    method: result.method,
+    phase: result.phase,
+    nodes: result.dfsStats?.nodes ?? result.dfsInfo?.iterations ?? result.reportedIterations ?? 0,
+    deepestStep: result.dfsStats?.deepestStep
+      ?? result.dfsStats?.deepest?.step
+      ?? result.dfsStats?.deepest
+      ?? result.dfsInfo?.deepest?.step
+      ?? result.dfsInfo?.deepest
+      ?? null,
+    cspMs: result.cspMs,
+    p12SeedMs: result.p12SeedMs,
+    dfsMs: result.dfsMs,
+    firstCandidateMs: result.firstCandidateMs,
+    bestCost: result.best?.cost ?? null,
+    sources: result.best ? normalizeCandidateSources(result.best.sources) : [],
+    complete: result.complete === true,
+    terminationReason: result.terminationReason || "missing",
+    cspOverflow: result.cspStats?.overflow,
+    cspAborted: result.cspStats?.aborted,
+    cspAbortReason: result.cspStats?.abortReason || null,
+    p12SeedTermination: result.cspStats?.p12Seed?.terminationReason || null,
+    timingExact: result.timingExact === true,
+    timingEstimated: result.timingEstimated === true,
+    proofGraceMs: result.proofGraceMs ?? 0,
+    proofGraceEffectiveMs: result.proofGraceEffectiveMs ?? 0,
+    proofGraceWaitMs: result.proofGraceWaitMs ?? 0,
+    proofGraceOutcome: result.proofGraceOutcome || "not-entered",
+    proofGraceExpired: result.proofGraceExpired === true,
+    cspStatsKnown: result.cspStatsKnown === true,
+    dfsStatsKnown: result.dfsStatsKnown === true,
+  }));
+  const terminationCounts = {};
+  for (const worker of workerStats) {
+    terminationCounts[worker.terminationReason] = (terminationCounts[worker.terminationReason] || 0) + 1;
+  }
+  const p12SeedTerminationCounts = {};
+  for (const worker of workerStats) {
+    if (!worker.p12SeedTermination) continue;
+    p12SeedTerminationCounts[worker.p12SeedTermination]
+      = (p12SeedTerminationCounts[worker.p12SeedTermination] || 0) + 1;
+  }
+  const totalNodesObserved = finiteSum(workerStats.map(worker => worker.nodes)) ?? 0;
+  const cancelledWorkers = workerStats.filter(worker => worker.status === "cancelled").length;
+  const erroredWorkers = workerStats.filter(worker => worker.status === "error"
+    || worker.terminationReason === "candidate-unproven-worker-error"
+    || worker.terminationReason === "candidate-unproven-worker-exit").length;
+  const estimatedTimingWorkers = workerStats.filter(worker => worker.timingEstimated).length;
+  const unknownTimingWorkers = workerStats.filter(worker =>
+    !worker.timingExact && !worker.timingEstimated).length;
+  const cspStatsKnownWorkers = workerStats.filter(worker => worker.cspStatsKnown).length;
+  const dfsStatsKnownWorkers = workerStats.filter(worker => worker.dfsStatsKnown).length;
+  const nodesExact = !workerStats.some(worker =>
+    worker.status === "cancelled"
+    || worker.status === "timeout"
+    || worker.status === "error"
+    || worker.terminationReason === "wall-clock-timeout"
+    || worker.terminationReason === "portfolio-first-valid-candidate");
+
+  return {
+    workerStats,
+    portfolioStats: {
+      enabled: true,
+      workerCount: results.length,
+      seeds: workerStats.map(worker => worker.seed),
+      wallMs,
+      settledWorkers: results.length - cancelledWorkers,
+      cancelledWorkers,
+      erroredWorkers,
+      totalNodesObserved,
+      nodesExact,
+      phaseTimesExact: workerStats.every(worker => worker.timingExact),
+      estimatedTimingWorkers,
+      unknownTimingWorkers,
+      sumCspMs: finiteSum(workerStats.map(worker => worker.cspMs)),
+      sumP12SeedMs: finiteSum(workerStats.map(worker => worker.p12SeedMs)),
+      sumDfsMs: finiteSum(workerStats.map(worker => worker.dfsMs)),
+      cspTimingKnownWorkers: workerStats.filter(worker => Number.isFinite(worker.cspMs)).length,
+      p12SeedTimingKnownWorkers: workerStats.filter(worker => Number.isFinite(worker.p12SeedMs)).length,
+      dfsTimingKnownWorkers: workerStats.filter(worker => Number.isFinite(worker.dfsMs)).length,
+      cspStatsKnownWorkers,
+      dfsStatsKnownWorkers,
+      firstCandidateWallMs,
+      terminationCounts,
+    },
+    cspStats: {
+      pathsEnumerated: finiteSum(results.map(result => result.cspStats?.pathsEnumerated)),
+      pathIterations: finiteSum(results.map(result => result.cspStats?.pathIterations)),
+      combinationIterations: finiteSum(results.map(result => result.cspStats?.combinationIterations)),
+      knownWorkers: cspStatsKnownWorkers,
+      exact: cspStatsKnownWorkers === results.length && results.every(result => result.timingExact),
+      overflowWorkers: results.filter(result => result.cspStats?.overflow === true).length,
+      abortedWorkers: results.filter(result => result.cspStats?.aborted === true).length,
+      p12Seed: { terminationCounts: p12SeedTerminationCounts },
+    },
+    dfsStats: {
+      nodes: totalNodesObserved,
+      deepestStep: finiteMax(workerStats.map(worker => worker.deepestStep)),
+    },
+  };
+}
+
+function portfolioReason(evidence, workerCount, portfolioStats = null) {
+  switch (evidence.terminationReason) {
+    case "portfolio-first-valid-candidate": {
+      if (portfolioStats?.proofGraceExpired) {
+        return `${workerCount} Worker 多种子组合找到合法候选；${portfolioStats.proofGraceEffectiveMs}ms 证明宽限耗尽，未证明最优`;
+      }
+      if (portfolioStats?.proofGraceOutcome === "wall-margin") {
+        return `${workerCount} Worker 多种子组合找到合法候选；墙钟余量不足以启动证明宽限，未证明最优`;
+      }
+      if (portfolioStats?.proofGraceOutcome === "wall-clock-timeout") {
+        return `${workerCount} Worker 多种子组合找到合法候选；证明宽限被墙钟截止，未证明最优`;
+      }
+      if (portfolioStats?.proofGraceOutcome === "worker-finished-unproven") {
+        return `${workerCount} Worker 多种子组合找到合法候选；winner 在证明宽限内自行结束但未完成证明`;
+      }
+      if (portfolioStats?.proofGraceOutcome === "worker-error"
+        || portfolioStats?.proofGraceOutcome === "worker-exit") {
+        return `${workerCount} Worker 多种子组合找到合法候选；winner 在证明宽限内异常终止，候选保留但未证明最优`;
+      }
+      return `${workerCount} Worker 多种子组合找到首个合法候选；已提前停止，未证明最优`;
+    }
+    case "optimal-proven":
+      return portfolioStats?.proofGraceWaitMs > 0
+        ? `winner 在 ${Math.round(portfolioStats.proofGraceWaitMs * 100) / 100}ms 证明宽限内完成同域最优性证明`
+        : "至少一个同证明域 Worker 找到候选并证明最优";
+    case "search-exhausted":
+      return "至少一个同证明域 Worker 完整走完搜索且无候选";
+    case "portfolio-contract-conflict":
+      return "不同 Worker 的合法候选与完备无解声明冲突；保留候选但撤销完备性";
+    case "portfolio-proof-mismatch":
+      return "Worker 的最优证明与组合内权威候选成本不一致";
+    case "candidate-unproven-portfolio":
+      return "组合找到合法候选，但没有 Worker 证明其最优";
+    case "wall-clock-timeout":
+      return "多 Worker 墙钟预算耗尽——不是无解证明";
+    case "dfs-iteration-budget":
+      return "所有有效 Worker 都耗尽 DFS 迭代预算——不是无解证明";
+    default:
+      return "多 Worker 均未提供可接受的候选或完备证明";
+  }
+}
+
+async function solveCase(testCase) {
+  if (puzzleWorkers === 1) {
+    return solveWorkerSession(testCase, { seed: 0, workerIndex: 0 });
+  }
+
+  const portfolioStarted = performance.now();
+  const expectSolution = testCase.hasSolution !== false;
+  const heterogeneous = heterogeneousPortfolio;
+  const scopeKeyFor = roleOptions => createProofScopeKey({
+    requestId: testCase.relativePath,
+    maxTracksHint: testCase.maxTracks ?? 0,
+    minTracks: true,
+    solverOptions: roleOptions,
+  });
+  const cspRoleScopeKey = scopeKeyFor(solverOptions);
+  const dfsRoleScopeKey = heterogeneous ? scopeKeyFor(dfsRoleSolverOptions) : cspRoleScopeKey;
+  /* 异构模式下组合的完备性域是 DFS-only 角色的域：N-1 个同域 Worker 才能
+     互相印证证明，负例的 search-exhausted 与 grace 内的最优证明都产自这里。
+     CSP 角色（Worker 0）是候选侦察兵：它的候选照常参与比较与验证，但它的
+     完备性声明留在自己的域内，被保守丢弃而不是跨域转移。 */
+  const proofScopeKey = heterogeneous ? dfsRoleScopeKey : cspRoleScopeKey;
+  const roleFor = workerIndex => (heterogeneous && workerIndex > 0
+    ? { solverOptions: dfsRoleSolverOptions, proofScopeKey: dfsRoleScopeKey, role: "dfs-only" }
+    : { solverOptions, proofScopeKey: cspRoleScopeKey, role: "csp-dfs" });
+  const workerIds = Array.from({ length: puzzleWorkers }, (_, index) => index);
+  const controllers = workerIds.map(() => new AbortController());
+  const collected = [];
+  let machine = createPortfolioState({
+    workerIds,
+    expectSolution,
+    proofScopeKey,
+    proofGraceMs: portfolioProofGraceMs,
+  });
+  let firstCandidate = null;
+  let finalEvidence = null;
+  let graceTimer = null;
+  let graceStartedAt = null;
+  let graceEffectiveMs = 0;
+  let graceWaitMs = 0;
+  let graceOutcome = "not-entered";
+  let graceExpired = false;
+
+  const nowMs = () => performance.now() - portfolioStarted;
+  function winnerStopText() {
+    if (graceOutcome === "expired") {
+      return `多种子组合找到首个合法候选；${Math.round(graceEffectiveMs)}ms 证明宽限耗尽，未证明最优`;
+    }
+    if (graceOutcome === "wall-margin") return "多种子组合找到首个合法候选；墙钟余量不足以启动证明宽限，未证明最优";
+    if (graceOutcome === "disabled") return "多种子组合找到首个合法候选；已提前停止，未证明最优";
+    return "组合已取得同证明域证据；winner 停止，候选保留";
+  }
+  function resolveGraceOutcome(evidence) {
+    if (graceOutcome !== "running") return graceOutcome;
+    if (evidence.complete === true && evidence.terminationReason === "optimal-proven") return "optimal-proven";
+    if (evidence.terminationReason === "wall-clock-timeout") return "wall-clock-timeout";
+    const winner = collected.find(result => result.workerIndex === machine.winnerWorkerId);
+    if (winner?.terminationReason === "candidate-unproven-worker-error") return "worker-error";
+    if (winner?.terminationReason === "candidate-unproven-worker-exit") return "worker-exit";
+    return "worker-finished-unproven";
+  }
+
+  /* Adapter: it owns Workers, clocks and timers; the state machine owns the
+     decisions. Effects are drained through a queue so an effect that dispatches
+     a follow-up event (a proof grace with no wall-clock room left) cannot
+     re-enter the reducer mid-drain. */
+  const pendingEvents = [];
+  let draining = false;
+  function dispatch(event) {
+    pendingEvents.push(event);
+    if (draining) return;
+    draining = true;
+    try {
+      while (pendingEvents.length) {
+        const next = pendingEvents.shift();
+        const outcome = reducePortfolioEvent(machine, next);
+        machine = outcome.state;
+        for (const effect of outcome.effects) applyEffect(effect);
+      }
+    } finally {
+      draining = false;
+    }
+  }
+  function applyEffect(effect) {
+    if (effect.type === "publish-candidate") {
+      /* `disabled` is reserved for the grace=0 fast-candidate stop. */
+      if (expectSolution && portfolioProofGraceMs === 0) graceOutcome = "disabled";
+      if (!firstCandidate) {
+        firstCandidate = {
+          workerIndex: effect.workerId,
+          seed: effect.candidate.seed,
+          cost: effect.candidate.cost,
+          source: effect.candidate.sources?.[0] ?? null,
+          wallMs: nowMs(),
+        };
+      }
+      return;
+    }
+    if (effect.type === "cancel-worker") {
+      const controller = controllers[effect.workerId];
+      if (!controller || controller.signal.aborted) return;
+      controller.abort(machine.winnerWorkerId === effect.workerId
+        ? { kind: "winner-stop", text: winnerStopText() }
+        : { kind: "loser-cancel", text: "另一个 Worker 已找到合法候选，当前 Worker 被取消" });
+      return;
+    }
+    if (effect.type === "start-proof-grace") {
+      const startedAt = performance.now();
+      graceEffectiveMs = boundedProofGraceMs(
+        effect.delayMs,
+        startedAt - portfolioStarted,
+        testCase.timeoutMs,
+        PORTFOLIO_PROOF_GRACE_MARGIN_MS,
+      );
+      if (graceEffectiveMs <= 0) {
+        graceOutcome = "wall-margin";
+        dispatch({ type: "proof-grace-expired", workerId: effect.workerId, atMs: nowMs() });
+        return;
+      }
+      graceStartedAt = startedAt;
+      graceOutcome = "running";
+      graceTimer = setTimeout(() => {
+        graceOutcome = "expired";
+        graceExpired = true;
+        dispatch({ type: "proof-grace-expired", workerId: effect.workerId, atMs: nowMs() });
+      }, graceEffectiveMs);
+      return;
+    }
+    if (effect.type === "finish") {
+      if (graceTimer != null) {
+        clearTimeout(graceTimer);
+        graceTimer = null;
+      }
+      if (graceStartedAt != null) graceWaitMs = performance.now() - graceStartedAt;
+      graceOutcome = resolveGraceOutcome(effect.evidence);
+      graceExpired = graceOutcome === "expired";
+      finalEvidence = effect.evidence;
+    }
+  }
+
+  const sessionPromises = workerIds.map(workerIndex => solveWorkerSession(testCase, {
+    seed: portfolioSeed(workerIndex),
+    workerIndex,
+    signal: controllers[workerIndex].signal,
+    proofScopeKey: roleFor(workerIndex).proofScopeKey,
+    solverOptions: roleFor(workerIndex).solverOptions,
+    retainCandidateOnFailure: () => graceStartedAt != null,
+    onValidCandidate: (candidate, simulateResult) => dispatch({
+      type: "valid-candidate",
+      workerId: workerIndex,
+      candidate,
+      result: simulateResult,
+      atMs: nowMs(),
+    }),
+  }).then(result => {
+    collected.push(result);
+    dispatch({
+      type: result.status === "error" ? "worker-failed" : "worker-done",
+      workerId: workerIndex,
+      result,
+      atMs: nowMs(),
+    });
+    return result;
+  }));
+  const rawResults = await Promise.all(sessionPromises);
+  const wallMs = Math.round(performance.now() - portfolioStarted);
+  /* Proof-grace telemetry lives on the winner; losers keep the configured value
+     only, exactly as before the state machine owned the decision. */
+  const winnerWorkerId = machine.winnerWorkerId;
+  const results = rawResults.map(result => {
+    const base = { ...result, proofGraceMs: portfolioProofGraceMs };
+    if (winnerWorkerId == null || result.workerIndex !== winnerWorkerId) return base;
+    return {
+      ...base,
+      proofGraceEffectiveMs: graceEffectiveMs,
+      proofGraceWaitMs: graceWaitMs,
+      proofGraceOutcome: graceOutcome,
+      proofGraceExpired: graceExpired,
+    };
+  });
+  const evidence = finalEvidence || classifyPortfolioEvidence(results, {
+    fastCandidate: expectSolution && Boolean(firstCandidate),
+    proofScopeKey,
+  });
+  const telemetry = aggregatePortfolioTelemetry(results, wallMs, firstCandidate?.wallMs ?? null);
+  const bestCost = evidence.bestResult?.best?.cost ?? null;
+  const equalBest = bestCost == null
+    ? []
+    : results.filter(result => result.best?.cost === bestCost);
+  const best = evidence.bestResult?.best
+    ? {
+        ...evidence.bestResult.best,
+        /* The winning evidence may be the state machine's own verified
+           candidate, which no raw Worker payload mirrors after a fast stop. */
+        sources: normalizeCandidateSources(equalBest.length
+          ? equalBest.flatMap(result => result.best?.sources || [])
+          : evidence.bestResult.best.sources),
+      }
+    : null;
+  const proofWorkerIndex = evidence.proofResult?.workerIndex ?? null;
+  const winningWorkerIndex = evidence.bestResult?.workerIndex ?? firstCandidate?.workerIndex ?? null;
+  const winningSeed = evidence.bestResult?.seed ?? firstCandidate?.seed ?? null;
+  const winningSource = evidence.bestResult?.best?.sources?.[0] ?? firstCandidate?.source ?? null;
+  telemetry.portfolioStats.winningWorkerIndex = winningWorkerIndex;
+  telemetry.portfolioStats.winningSeed = winningSeed;
+  telemetry.portfolioStats.winningSource = winningSource;
+  telemetry.portfolioStats.proofWorkerIndex = proofWorkerIndex;
+  telemetry.portfolioStats.proofScopeKey = proofScopeKey;
+  telemetry.portfolioStats.heterogeneous = heterogeneous;
+  telemetry.portfolioStats.workerRoles = workerIds.map(workerIndex => roleFor(workerIndex).role);
+  telemetry.portfolioStats.proofGraceMs = portfolioProofGraceMs;
+  telemetry.portfolioStats.proofGraceEffectiveMs = finiteMax(results.map(result => result.proofGraceEffectiveMs)) ?? 0;
+  telemetry.portfolioStats.proofGraceWaitMs = finiteMax(results.map(result => result.proofGraceWaitMs)) ?? 0;
+  telemetry.portfolioStats.proofGraceOutcome = results.find(result =>
+    result.proofGraceOutcome && result.proofGraceOutcome !== "not-entered")?.proofGraceOutcome || "not-entered";
+  telemetry.portfolioStats.proofGraceExpired = telemetry.portfolioStats.proofGraceOutcome === "expired";
+
+  return {
+    status: evidence.status,
+    method: `portfolio(${puzzleWorkers})`,
+    reason: portfolioReason(evidence, puzzleWorkers, telemetry.portfolioStats),
+    complete: evidence.complete,
+    terminationReason: evidence.terminationReason,
+    best,
+    overLimit: results.flatMap(result => result.overLimit || []),
+    candidateFailures: results.flatMap(result => result.candidateFailures || []),
+    firstCandidateMs: firstCandidate?.wallMs ?? null,
+    finalCost: best?.cost ?? null,
+    elapsedMs: wallMs,
+    reportedIterations: finiteSum(results.map(result => result.reportedIterations)) ?? 0,
+    lastCspInfo: results.map(result => result.lastCspInfo).filter(Boolean).join(" | "),
+    ...telemetry,
+    cspMs: telemetry.portfolioStats.sumCspMs,
+    p12SeedMs: telemetry.portfolioStats.sumP12SeedMs,
+    dfsMs: telemetry.portfolioStats.sumDfsMs,
+  };
 }
 
 function casePassed(testCase, result) {
@@ -189,16 +900,92 @@ function casePassed(testCase, result) {
   return result.status === "solved";
 }
 
+function metric(value) {
+  return Number.isFinite(value) ? String(Math.round(value * 100) / 100) : "-";
+}
+
+function describeTelemetry(result) {
+  const csp = result.cspStats || {};
+  const dfs = result.dfsStats || {};
+  const nodes = dfs.nodes ?? result.dfsInfo?.iterations ?? result.reportedIterations;
+  const deepest = dfs.deepestStep ?? dfs.deepest?.step ?? dfs.deepest ?? result.dfsInfo?.deepest?.step ?? result.dfsInfo?.deepest;
+  const portfolio = result.portfolioStats;
+  const timingLabel = portfolio
+    ? (portfolio.phaseTimesExact ? "Σworker" : "Σobserved+estimated")
+    : "";
+  const cspAbort = portfolio
+    ? `${csp.abortedWorkers || 0}/${csp.knownWorkers || 0}known`
+    : (csp.aborted ? (csp.abortReason || "yes") : "no");
+  const cspOverflow = portfolio
+    ? `${csp.overflowWorkers || 0}/${csp.knownWorkers || 0}known`
+    : (csp.overflow === true ? "yes" : (csp.overflow === false ? "no" : "-"));
+  return [
+    `nodes=${portfolio && portfolio.nodesExact === false ? ">=" : ""}${metric(nodes)}`,
+    `cspMs${portfolio ? `(${timingLabel})` : ""}=${metric(result.cspMs ?? portfolio?.sumCspMs)}`,
+    `p12SeedMs${portfolio ? `(${timingLabel})` : ""}=${metric(result.p12SeedMs ?? portfolio?.sumP12SeedMs)}`,
+    `dfsMs${portfolio ? `(${timingLabel})` : ""}=${metric(result.dfsMs ?? portfolio?.sumDfsMs)}`,
+    `cspPaths=${portfolio && csp.exact === false ? ">=" : ""}${metric(csp.pathsEnumerated)}`,
+    `cspPathIters=${portfolio && csp.exact === false ? ">=" : ""}${metric(csp.pathIterations)}`,
+    `cspCombinations=${portfolio && csp.exact === false ? ">=" : ""}${metric(csp.combinationIterations)}`,
+    `cspOverflow=${cspOverflow}`,
+    `cspAbort=${cspAbort}`,
+    `p12Seed=${portfolio
+      ? (Object.entries(csp.p12Seed?.terminationCounts || {}).map(([reason, count]) => `${reason}:${count}`).join(",") || "-")
+      : (csp.p12Seed?.terminationReason || "-")}`,
+    `deepest=${metric(deepest)}`,
+    `firstCandidateMs=${metric(result.firstCandidateMs)}`,
+    `finalCost=${metric(result.finalCost)}`,
+    `complete=${result.complete === true}`,
+    `terminationReason=${result.terminationReason || "missing"}`,
+    ...(portfolio ? [
+      `portfolioWallMs=${metric(portfolio.wallMs)}`,
+      `workers=${portfolio.workerCount}`,
+      `phaseTimesExact=${portfolio.phaseTimesExact}`,
+      `proofGraceMs(actual/effective/configured)=${metric(portfolio.proofGraceWaitMs)}/${metric(portfolio.proofGraceEffectiveMs)}/${portfolio.proofGraceMs}`,
+      `proofGraceOutcome=${portfolio.proofGraceOutcome}`,
+      `cspStatsKnown=${portfolio.cspStatsKnownWorkers}/${portfolio.workerCount}`,
+      `winner=${portfolio.winningWorkerIndex ?? "-"}/${portfolio.winningSeed ?? "-"}/${portfolio.winningSource || "-"}`,
+      `heterogeneous=${portfolio.heterogeneous === true}`,
+      `proofScopeKey=${portfolio.proofScopeKey || "-"}`,
+    ] : []),
+  ].join(" · ");
+}
+
 function describeResult(testCase, result) {
+  let summary;
   if (result.status === "solved") {
     const limit = testCase.maxTracks != null ? ` (≤${testCase.maxTracks})` : "";
-    return `${result.best.cost} tracks${limit} · ${result.best.steps} steps · ${result.method}`;
+    summary = `${solvedStatusLabel(result)} · ${result.best.cost} tracks${limit} · ${result.best.steps} steps · ${result.method}`
+      + (result.reason ? ` · ${result.reason}` : "");
+  } else {
+    const extras = [];
+    if (result.overLimit?.length) extras.push(`超限解 ${result.overLimit.map(s => s.cost).join("/")} 轨`);
+    if (result.candidateFailures?.length) extras.push(`失败候选 ${result.candidateFailures.length}`);
+    if (result.method) extras.push(result.method);
+    summary = `${result.status} · ${result.reason}${extras.length ? ` · ${extras.join(" · ")}` : ""}`;
   }
-  const extras = [];
-  if (result.overLimit?.length) extras.push(`超限解 ${result.overLimit.map(s => s.cost).join("/")} 轨`);
-  if (result.candidateFailures?.length) extras.push(`失败候选 ${result.candidateFailures.length}`);
-  if (result.method) extras.push(result.method);
-  return `${result.status} · ${result.reason}${extras.length ? ` · ${extras.join(" · ")}` : ""}`;
+  return `${summary} · ${describeTelemetry(result)}`;
+}
+
+function describePortfolioWorkers(result) {
+  if (!result.workerStats?.length) return "";
+  return result.workerStats.map(worker => [
+    `#${worker.workerIndex}`,
+    `seed=${worker.seed}`,
+    worker.status,
+    `nodes=${metric(worker.nodes)}`,
+    `deepest=${metric(worker.deepestStep)}`,
+    `cspMs=${metric(worker.cspMs)}`,
+    `p12SeedMs=${metric(worker.p12SeedMs)}`,
+    `dfsMs=${metric(worker.dfsMs)}`,
+    `firstMs=${metric(worker.firstCandidateMs)}`,
+    `cost=${metric(worker.bestCost)}`,
+    `source=${worker.sources.join("+") || "-"}`,
+    `timing=${worker.timingExact ? "exact" : (worker.timingEstimated ? "estimated" : "unknown")}`,
+    `grace=${metric(worker.proofGraceWaitMs)}/${metric(worker.proofGraceEffectiveMs)}/${worker.proofGraceMs}ms:${worker.proofGraceOutcome}`,
+    `complete=${worker.complete}`,
+    `reason=${worker.terminationReason}`,
+  ].join("/")).join(" | ");
 }
 
 const manifest = loadManifest();
@@ -216,7 +1003,8 @@ if (!selectedFiles.length) {
   process.exit(2);
 }
 
-console.log(`\nPuzzle solver cases: ${selectedFiles.length} (default timeout ${defaultTimeoutMs}ms each)\n`);
+console.log(`\nPuzzle solver cases: ${selectedFiles.length} (default timeout ${defaultTimeoutMs}ms each, workers ${puzzleWorkers}${puzzleWorkers > 1 ? `, portfolio ${heterogeneousPortfolio ? "heterogeneous" : "homogeneous"}` : ""}, proof grace ${puzzleWorkers > 1 ? portfolioProofGraceMs : 0}ms)`);
+console.log(`Solver options: ${Object.keys(solverOptions).length ? JSON.stringify(solverOptions) : "Worker defaults"}\n`);
 const results = [];
 for (const filePath of selectedFiles) {
   let testCase;
@@ -233,12 +1021,16 @@ for (const filePath of selectedFiles) {
   results.push({ ...testCase, result });
   const mark = casePassed(testCase, result) ? "✓" : "✗";
   console.log(`  ${mark} ${testCase.relativePath} · ${describeResult(testCase, result)} · ${result.elapsedMs}ms`);
+  if (result.workerStats?.length) console.log(`    workers: ${describePortfolioWorkers(result)}`);
 }
 
 const failed = results.filter(entry => !casePassed(entry, entry.result));
 const solvedCount = results.length - failed.length;
 const byStatus = {};
-for (const { result } of results) byStatus[result.status] = (byStatus[result.status] || 0) + 1;
+for (const { result } of results) {
+  const label = solvedStatusLabel(result);
+  byStatus[label] = (byStatus[label] || 0) + 1;
+}
 console.log(`\n═══════════ Puzzle solver: ${solvedCount} passed, ${failed.length} failed ═══════════`);
 console.log(`状态分布: ${Object.entries(byStatus).map(([k, v]) => `${k}=${v}`).join("  ")}\n`);
 
@@ -253,10 +1045,28 @@ if (failed.length) {
       method: result.method,
       info: result.info,
       overLimit: result.overLimit,
+      cspMs: result.cspMs,
+      p12SeedMs: result.p12SeedMs,
+      dfsMs: result.dfsMs,
+      cspStats: result.cspStats,
+      dfsStats: result.dfsStats,
+      nodes: result.dfsStats?.nodes ?? result.dfsInfo?.iterations ?? result.reportedIterations,
+      deepest: result.dfsStats?.deepestStep
+        ?? result.dfsStats?.deepest?.step
+        ?? result.dfsStats?.deepest
+        ?? result.dfsInfo?.deepest?.step
+        ?? result.dfsInfo?.deepest,
+      firstCandidateMs: result.firstCandidateMs,
+      finalCost: result.finalCost,
+      complete: result.complete,
+      terminationReason: result.terminationReason,
+      phase: result.phase,
       dfsInfo: result.dfsInfo,
       reportedIterations: result.reportedIterations,
       lastCspInfo: result.lastCspInfo,
       candidateFailures: result.candidateFailures,
+      portfolioStats: result.portfolioStats,
+      workerStats: result.workerStats,
     }));
   }
 }

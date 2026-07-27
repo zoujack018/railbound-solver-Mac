@@ -40,10 +40,13 @@ const fixtureFiles = fixturePaths.map(filePath => ({
 
 console.log("\n[Format 1] Current puzzle corpus recognition");
 const documents = fixturePaths.map(filePath => parsePuzzleDocument(fs.readFileSync(filePath, "utf8")));
-assert(fixtureFiles.length === 16, "All 16 current JSON puzzle cases are discovered recursively");
+/* 计数从目录推导，避免硬编码总数随语料增长而腐烂：
+   scratch_* 是带 puzzle/expected 包装的夹具文档，其余是正式 Puzzle。 */
+const expectedFixtureCount = fixturePaths.filter(filePath => path.basename(filePath).startsWith("scratch_")).length;
+assert(fixtureFiles.length >= 15 && expectedFixtureCount >= 3, `Corpus discovered recursively (${fixtureFiles.length} files, ${expectedFixtureCount} scratch fixtures)`);
 assert(documents.every(document => document.puzzle), "Every current case is a strictly loadable puzzle");
-assert(documents.filter(document => document.isFixture).length === 3, "Three scratch cases retain their fixture envelopes");
-assert(documents.filter(document => !document.isFixture).length === 13, "Thirteen 测试/ cases remain portable Puzzle documents");
+assert(documents.filter(document => document.isFixture).length === expectedFixtureCount, "All scratch_* cases retain their fixture envelopes");
+assert(documents.filter(document => !document.isFixture).length === fixtureFiles.length - expectedFixtureCount, "All non-scratch cases remain portable Puzzle documents");
 
 const oneDimensionalFixture = JSON.stringify({
   id: "one_dimensional_autoswitch",
@@ -71,7 +74,7 @@ assert(importedEntries.length === fixtureFiles.length, "Folder import returns on
 assert(importedEntries.every(entry => entry.category === "test"), "English and Chinese test paths use the test library tab");
 assert(importedEntries.every(entry => !entry.error && entry.puzzle), "Current cases are not mislabeled as malformed or preview-only");
 assert(importedEntries.some(entry => entry.name === "8x8 Extreme Benchmark Puzzle"), "Fixture display names come from envelope metadata");
-assert(importedEntries.filter(entry => entry.fixture).length === 3, "Fixture markers survive folder import");
+assert(importedEntries.filter(entry => entry.fixture).length === expectedFixtureCount, "Fixture markers survive folder import");
 assert(inferPuzzleCategory("project/test/demo.json") === "test", "test/ is recognized as a test category path");
 assert(inferPuzzleCategory("project/测试/demo.json") === "test", "测试/ is recognized as a test category path");
 

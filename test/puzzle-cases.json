@@ -20,14 +20,26 @@
     },
     {
       "file": "测试/关卡-6x7-8-3A.json",
-      "maxTracks": 16,
-      "timeoutMs": 240000,
-      "note": "16 轨解存在但 DFS 需要约 2-3 分钟（单 Worker、seed 0）；CSP 会先给出 17 轨超限解。缩短耗时属于后续搜索优化。"
+      "maxTracks": 19,
+      "timeoutMs": 300000,
+      "note": "上限 19（作者 2026-07-22 修正，此前误记 16）。对穿禁令下最小 17 轨；曾找到的 16 轨解依赖第 27 步对穿，已被正确拒绝。单 Worker、seed 0 需要数分钟。"
     },
     {
-      "file": "测试/普通/关卡-6x7-20260722-8-5A.json",
+      "file": "测试/关卡-6x7-20260722-8-5A.json",
       "maxTracks": null,
-      "note": "新增普通关卡；当前单 Worker、seed 0 基线为 28 轨、27 步。"
+      "note": "新增普通关卡；当前单 Worker、seed 0 基线为 28 轨、27 步（对穿禁令前）。"
+    },
+    {
+      "file": "测试/关卡-7x7-20260722-8-5A.json",
+      "maxTracks": null,
+      "timeoutMs": 120000,
+      "note": "对穿碰撞的来源关卡：自变 T (5,3) 处 3 向下、4 向右对穿曾被误放行。单 Worker、seed 0 在对穿禁令前 60s 无候选；浏览器多 seed 可解。"
+    },
+    {
+      "file": "测试/关卡-7x7-20260722-8-7A.json",
+      "maxTracks": 20,
+      "timeoutMs": 120000,
+      "note": "Barrier 慢基准，不进入快速 canary。v3.02 游戏截图显示该 20 轨布局完成时剩余 0，支持题面库存 20；公开开发者文字未逐关列数。seed 0、预算 19 在 10,199,936 节点 / 36.1s 完整穷尽，结合 20 轨合法候选证明当前规则下最小值 20。"
     },
     {
       "file": "测试/关卡-7x4-20260722-5-3A.json",
@@ -40,7 +52,7 @@
     {
       "file": "测试/关卡-7x5-20260722-7-4A.json",
       "maxTracks": null,
-      "note": "零号车踩变轨触发器后停车/循环。DFS 对'零号车驶向未决 blank'尚不能同时展开铺轨/不铺轨两个后继世界，当前无候选不是无解证明。"
+      "note": "零号车踩变轨触发器后停车/循环。当前金丝雀已证明 8 轨最优：预算 8 为 optimal-proven，预算 7 为 complete:true + search-exhausted。"
     },
     {
       "file": "测试/关卡-7x8-20260722-8-7.json",
@@ -51,6 +63,11 @@
       "file": "测试/关卡-8x5-20260722-8-1A.json",
       "maxTracks": null,
       "note": "静态 4 车组合题。有限 CSP 枚举失败后回退 DFS 仍预算耗尽；不能报告为无解。"
+    },
+    {
+      "file": "测试/关卡-8x8-20260722-8-5B.json",
+      "maxTracks": null,
+      "note": "静态 4 车 + 5 站台；49 个原始 blank 经筛选后有 47 个 useful，超过 classic CSP 的 45 格入口阈值，当前直接进入 DFS 并在 20s 预算内未定。它是 waypoint 路径爆炸与真正 P8 分段枚举的目标样本（docs/solver-optimization.md）。"
     },
     {
       "file": "测试/关卡-8x9-20260722-6-9D.json",
@@ -66,6 +83,11 @@
       "maxTracks": null
     },
     {
+      "file": "测试/关卡-10x11-20260722-8-6A.json",
+      "maxTracks": 37,
+      "note": "Afterburn 2024-04-12 回复确认新版题面从 44 调整为 37 轨。P12 seed 可快速给出经 simulate() 验证的 37 轨候选；关闭 P12 后的有机首候选及最优性证明仍未解决。"
+    },
+    {
       "file": "scratch_solve_7x7.json",
       "maxTracks": null
     },
@@ -75,9 +97,21 @@
       "note": "4 零号车 + 4 颜色变轨 T，距终点启发式无效，当前算法极限基准。"
     },
     {
+      "file": "scratch_test_rearend_4x2.json",
+      "maxTracks": null,
+      "hasSolution": false,
+      "note": "追撞回归夹具：车 2 第 2 步必然驶入接客等待中车 1 的格子，静止车=墙，预期 search-exhausted。"
+    },
+    {
+      "file": "scratch_test_swap_3x3.json",
+      "maxTracks": null,
+      "hasSolution": false,
+      "note": "对穿碰撞回归夹具：两车第 1 步必然对穿，铺轨无法避免，预期 search-exhausted。"
+    },
+    {
       "file": "scratch_test_autoswitch_6x4.json",
       "maxTracks": null,
-      "note": "夹具期望 hasSolution:true，但初始两车相邻同向，第 1 步权威模拟必然 TAILING（先于任何铺轨生效）。待关卡作者确认：修正初始布局 / 改期望为不可解 / 重新核对追尾规则。在确认前不要删除追尾判定。"
+      "note": "同向一格间距跟随合法的回归夹具；当前已证明 9 轨最优，预算 8 为 complete:true + search-exhausted。"
     }
   ]
 }

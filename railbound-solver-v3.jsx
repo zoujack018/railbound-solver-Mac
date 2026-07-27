@@ -5,6 +5,14 @@ import {
   simulate, forwardReachable, backwardReachable, filterBlanks
 } from "./railbound-logic.js";
 import { createSolverWorkerUrl } from "./railbound-worker-code.js";
+import {
+  createProofScopeKey,
+  inspectPortfolioCandidate,
+  normalizeCandidateSources,
+  portfolioSeed,
+  workerProofIssue,
+} from "./solver/portfolio-evidence.js";
+import { createPortfolioState, reducePortfolioEvent } from "./solver/portfolio-state-machine.js";
 import { normalizePuzzle } from "./puzzle-io.js";
 import PuzzleLibraryDialog from "./PuzzleLibraryDialog.jsx";
 import { DEFAULT_GRID_HEIGHT, DEFAULT_GRID_WIDTH, directionGlyphDirection, straightTrackForDirection } from "./editor-helpers.js";
@@ -28,6 +36,24 @@ const DA = { N: "↑", E: "→", S: "↓", W: "←" };
 const CC = ["#c45c3a", "#3a7cc4", "#8c5cbf", "#c4a43a", "#3ac4a4", "#c43a8c"];
 const ZERO_CAR_COLOR = "#aeb6c2";
 const CL = 52;
+/* Bounded window the first winning Worker keeps searching for an optimality
+   proof after every loser has been cancelled. */
+const BROWSER_PROOF_GRACE_MS = 100;
+const TERMINATION_LABELS = {
+  "portfolio-first-valid-candidate": "组合首个合法候选，未获最优性证明",
+  "portfolio-contract-conflict": "合法候选与完备无解声明冲突，完备性已撤销",
+  "portfolio-proof-mismatch": "最优证明成本与权威候选不一致",
+  "candidate-unproven-portfolio": "组合内没有 Worker 证明该候选最优",
+  "portfolio-incomplete": "搜索未完备",
+  "dfs-iteration-budget": "DFS 迭代预算耗尽",
+  "candidate-unproven-dfs-budget": "DFS 迭代预算耗尽",
+  "candidate-unproven-csp": "CSP 候选未证明",
+  "candidate-unproven-early-stop": "搜索提前停止",
+  "wall-clock-timeout": "墙钟超时",
+};
+function terminationLabel(reason) {
+  return TERMINATION_LABELS[reason] || reason || "搜索未完备";
+}
 function isZeroCarCell(c) { return c?.role === "zero" || String(c?.name) === "0"; }
 function carColor(c) { return isZeroCarCell(c) ? ZERO_CAR_COLOR : CC[(+c.name - 1) % CC.length]; }
 function carLabel(c) { return isZeroCarCell(c) ? "0" : String(c?.name ?? ""); }
@@ -50,7 +76,7 @@ export default function App() {
   const [tunnelColor, setTunnelColor] = useState(TUNNEL_COLORS[0]);
   const [barrierColor, setBarrierColor] = useState(BARRIER_COLORS[0]), [barrierInitState, setBarrierInitState] = useState("closed");
   const [barrierTrack, setBarrierTrack] = useState("|");
-  const [gateMode, setGateMode] = useState("trigger");
+  const [gateMode, setGateMode] = useState("fixed");
   const [tswTriggerTrack, setTswTriggerTrack] = useState("|");
   const [tswitchTrack, setTswitchTrack] = useState("T_NE_S");
   const [autoSwitchTrack, setAutoSwitchTrack] = useState("T_NE_S");
@@ -65,6 +91,7 @@ export default function App() {
   const [libraryDialog, setLibraryDialog] = useState(null);
   const tr = useRef(null);
   const workersRef = useRef([]), workerUrlRef = useRef(null), solveRequestRef = useRef(0);
+  const proofGraceTimerRef = useRef(null);
 
   const trackGroups = useMemo(classifyTracks, []);
 
@@ -101,9 +128,9 @@ export default function App() {
       const g = { ...p };
       if (tool === "empty") g[k] = { t: "empty" };
       else if (tool === "blank") g[k] = { t: "blank" };
-      else if (tool === "fixed") g[k] = { t: "fixed", track: trkPick };
-      else if (tool === "gate") {
-        if (gateMode === "trigger") {
+      else if (tool === "fixed") {
+        if (gateMode === "fixed") g[k] = { t: "fixed", track: trkPick };
+        else if (gateMode === "trigger") {
           const allTriggerTracks = [...BASIC_TRACKS, ...T_TRACKS];
           if (p[k]?.t === "trigger" && p[k].color === barrierColor) {
             const seq = allTriggerTracks;
@@ -168,7 +195,7 @@ export default function App() {
   function handleEnter(x, y) {
     if (!isDragging) return;
     if (dragMode === 'left') {
-      if (['blank', 'empty', 'fixed'].includes(tool)) click(x, y);
+      if (['blank', 'empty'].includes(tool) || (tool === 'fixed' && gateMode === 'fixed')) click(x, y);
     } else if (dragMode === 'right') {
       rclick({}, x, y);
     }
@@ -252,6 +279,7 @@ export default function App() {
   function getWorkerUrl() { if (!workerUrlRef.current) workerUrlRef.current = createSolverWorkerUrl(); return workerUrlRef.current; }
   function stopW() {
     solveRequestRef.current += 1;
+    if (proofGraceTimerRef.current != null) { clearTimeout(proofGraceTimerRef.current); proofGraceTimerRef.current = null; }
     workersRef.current.forEach(w => {
       w.onmessage = null; w.onerror = null; w.onmessageerror = null;
       try { w.terminate(); } catch { /* Worker may already be closed. */ }
@@ -266,28 +294,101 @@ export default function App() {
     const requestId = solveRequestRef.current;
     const { pruned } = filterBlanks(p);
     const nW = Math.min(navigator.hardwareConcurrency || 4, 16), t0 = performance.now();
-    let totalIters = 0, bestFound = null, done = 0, failures = 0, lastMethod = "?", lastInfo = "";
+    let totalIters = 0, failures = 0, lastMethod = "?", lastInfo = "";
     const url = getWorkerUrl(), pf = { ...p, _minTracks: true }, workers = [], settled = new Set();
-    function finishWorker(w, payload = {}) {
-      if (requestId !== solveRequestRef.current || settled.has(w)) return;
-      settled.add(w); done++;
-      if (payload.failed) failures++;
-      lastMethod = payload.method || lastMethod;
-      lastInfo = payload.info || lastInfo;
+    /* Per-Worker candidates that already passed the authoritative main-thread
+       simulate(). A Worker's optimality proof is only honoured when it matches
+       one of these, never when it merely claims a cost. */
+    const validated = new Array(nW).fill(null);
+    const candidateFailures = Array.from({ length: nW }, () => []);
+    const overLimit = Array.from({ length: nW }, () => []);
+    /* 异构组合：Worker 0 保持 CSP→DFS 作候选侦察兵，其余 Worker 跳过 CSP
+       直接以不同 seed 跑 DFS。`skipCsp` 进入 solverOptions，因此两种角色
+       天然拥有不同 proofScopeKey；组合的完备性域取 DFS-only 角色的域，
+       CSP 角色的完备性声明不跨域转移（候选照常比较与验证）。 */
+    const scopeKeyFor = roleOptions => createProofScopeKey({
+      requestId,
+      maxTracksHint: maxTrk > 0 ? maxTrk : 0,
+      minTracks: true,
+      solverOptions: roleOptions,
+    });
+    const heterogeneous = nW > 1;
+    const roleSolverOptions = i => (heterogeneous && i > 0 ? { skipCsp: true } : {});
+    const cspRoleScopeKey = scopeKeyFor({});
+    const dfsRoleScopeKey = heterogeneous ? scopeKeyFor({ skipCsp: true }) : cspRoleScopeKey;
+    const roleScopeKey = i => (heterogeneous && i > 0 ? dfsRoleScopeKey : cspRoleScopeKey);
+    const proofScopeKey = heterogeneous ? dfsRoleScopeKey : cspRoleScopeKey;
+    /* A single Worker has no portfolio race, so it keeps the old behaviour of
+       running to completion instead of stopping on its own first candidate. */
+    let machine = createPortfolioState({
+      workerIds: Array.from({ length: nW }, (_, i) => i),
+      expectSolution: nW > 1,
+      proofScopeKey,
+      proofGraceMs: BROWSER_PROOF_GRACE_MS,
+    });
+
+    function dispatch(event) {
+      if (requestId !== solveRequestRef.current) return;
+      const outcome = reducePortfolioEvent(machine, event);
+      machine = outcome.state;
+      for (const effect of outcome.effects) applyEffect(effect);
+    }
+    function stopWorker(i) {
+      const w = workers[i];
+      if (!w || settled.has(i)) return;
+      settled.add(i);
       workersRef.current = workersRef.current.filter(ww => ww !== w);
       w.onmessage = null; w.onerror = null; w.onmessageerror = null;
       try { w.terminate(); } catch { /* Worker may already be closed. */ }
-      if (done < nW) return;
+    }
+    function applyEffect(effect) {
+      if (effect.type === "cancel-worker") { stopWorker(effect.workerId); return; }
+      if (effect.type === "publish-candidate") {
+        const shown = validated[effect.workerId];
+        if (!shown) return;
+        setSol({ placed: shown.placed, result: shown.result, puzzle: p }); setStep(0);
+        setMsg(`候选 ${(performance.now() - t0).toFixed(0)}ms · ${shown.result.steps}步 · ${shown.cost}轨 · 剪除${pruned}`);
+        return;
+      }
+      if (effect.type === "start-proof-grace") {
+        if (proofGraceTimerRef.current != null) clearTimeout(proofGraceTimerRef.current);
+        proofGraceTimerRef.current = setTimeout(() => {
+          proofGraceTimerRef.current = null;
+          dispatch({ type: "proof-grace-expired", workerId: effect.workerId, atMs: performance.now() - t0 });
+        }, effect.delayMs);
+        return;
+      }
+      if (effect.type === "finish") {
+        if (proofGraceTimerRef.current != null) { clearTimeout(proofGraceTimerRef.current); proofGraceTimerRef.current = null; }
+        reportEvidence(effect.evidence);
+      }
+    }
+    function reportEvidence(evidence) {
       const ms = (performance.now() - t0).toFixed(0);
-      if (bestFound) setMsg(`✓ ${ms}ms · 最优${bestFound.__cost}轨 · ${lastMethod} · 剪除${pruned}${failures ? ` · ${failures}线程失败` : ""}`);
-      else if (failures === nW) setMsg(`✕ 求解器启动失败 (${lastInfo || "Worker 未返回错误详情"})`);
-      else setMsg(`✕ 无解 (${ms}ms · ${lastMethod}${lastInfo ? " · " + lastInfo : ""}${failures ? ` · ${failures}线程失败` : ""})`);
+      const cost = evidence.bestResult?.best?.cost ?? null;
+      const failTail = failures ? ` · ${failures}线程失败` : "";
+      if (evidence.complete === true && evidence.terminationReason === "optimal-proven") {
+        setMsg(`✓ ${ms}ms · 已证最优${cost}轨 · ${lastMethod} · 剪除${pruned}${failTail}`);
+      } else if (evidence.complete === true && evidence.terminationReason === "search-exhausted") {
+        setMsg(`✕ 完备无解 (${ms}ms · ${lastMethod}${lastInfo ? " · " + lastInfo : ""}${failTail})`);
+      } else if (cost != null) {
+        setMsg(`△ ${ms}ms · 候选${cost}轨 · 未获最优性证明 (${terminationLabel(evidence.terminationReason)}) · 剪除${pruned}${failTail}`);
+      } else if (failures === nW) {
+        setMsg(`✕ 求解器启动失败 (${lastInfo || "Worker 未返回错误详情"})`);
+      } else {
+        setMsg(`△ 未找到候选 · 搜索未完备 (${ms}ms · ${terminationLabel(evidence.terminationReason)}${failTail})`);
+      }
+    }
+    function settleWorker(i, event) {
+      if (requestId !== solveRequestRef.current || settled.has(i)) return;
+      stopWorker(i);
+      dispatch(event);
     }
     for (let i = 0; i < nW; i++) {
       const w = new Worker(url, { type: "module" });
       w.onmessage = (e) => {
         if (requestId !== solveRequestRef.current || e.data?.requestId !== requestId) return;
-        const { type, solution, cspInfo, info } = e.data;
+        const { type, solution, cspInfo } = e.data;
         if (type === "progress") {
           if (e.data.diagnosis) {
             const d = e.data.diagnosis;
@@ -301,33 +402,96 @@ export default function App() {
             let m = `求解中... ${nW}线程 · ${(totalIters / 1e6).toFixed(1)}M迭代 · ${el}s`;
             if (pruned) m += ` · 剪除${pruned}`; if (cspInfo) m += ` · ${cspInfo}`;
             if (e.data.info) m += ` · ${e.data.info}`;
-            if (bestFound) m += ` · 当前${bestFound.__cost}轨`; setMsg(m);
+            const current = machine.bestCandidate?.cost;
+            if (Number.isFinite(current)) m += ` · 当前${current}轨`; setMsg(m);
           }
         }
         if (type === "solution" && solution) {
-          const cost = solution.__cost || 0;
-          if (!bestFound || cost < bestFound.__cost) {
-            const clean = {}; for (const [k, v] of Object.entries(solution)) if (k !== "__cost") clean[k] = v;
-            const r = simulate(p, clean);
-            if (!r.ok) {
-              setMsg(`跳过无效候选 ${cost}轨: ${r.reason} @${r.steps}步`);
-              return;
-            }
-            bestFound = solution;
-            setSol({ placed: clean, result: r, puzzle: p }); setStep(0);
-            setMsg(`候选 ${(performance.now() - t0).toFixed(0)}ms · ${r.steps}步 · ${cost}轨 · 继续找更优 · 剪除${pruned}`);
+          const known = machine.bestCandidate?.cost;
+          const clean = {}; for (const [k, v] of Object.entries(solution)) if (k !== "__cost") clean[k] = v;
+          const r = simulate(p, clean);
+          const inspected = inspectPortfolioCandidate(solution, r, maxTrk);
+          if (!inspected.accepted) {
+            (inspected.kind === "over-limit" ? overLimit[i] : candidateFailures[i]).push(inspected.issue);
+            const reason = inspected.kind === "over-limit"
+              ? `超过上限 ${inspected.actualCost}>${maxTrk}`
+              : inspected.issue.reason;
+            setMsg(`跳过无效候选 ${inspected.actualCost}轨: ${reason}${Number.isFinite(r.steps) ? ` @${r.steps}步` : ""}`);
+            return;
           }
+          const cost = inspected.actualCost;
+          if (Number.isFinite(known) && cost >= known) return;
+          const sources = normalizeCandidateSources(e.data.source);
+          validated[i] = { cost, steps: r.steps, sources, placed: clean, result: r };
+          dispatch({
+            type: "valid-candidate",
+            workerId: i,
+            candidate: { cost, steps: r.steps, placed: clean, sources, seed: portfolioSeed(i) },
+            result: r,
+            atMs: performance.now() - t0,
+          });
         }
         if (type === "done") {
-          finishWorker(w, e.data);
+          lastMethod = e.data.method || lastMethod;
+          lastInfo = e.data.info || lastInfo;
+          const best = validated[i];
+          const proofIssue = workerProofIssue(e.data, {
+            best,
+            candidateFailures: candidateFailures[i],
+            overLimit: overLimit[i],
+          });
+          const status = best
+            ? "solved"
+            : (overLimit[i].length
+              ? "over-limit"
+              : (candidateFailures[i].length
+                ? "candidate-failed"
+                : (e.data.complete === true && e.data.terminationReason === "search-exhausted"
+                  ? "search-exhausted"
+                  : "incomplete")));
+          settleWorker(i, {
+            type: "worker-done",
+            workerId: i,
+            atMs: performance.now() - t0,
+            result: {
+              status,
+              complete: proofIssue == null && e.data.complete === true,
+              terminationReason: proofIssue || e.data.terminationReason || null,
+              finalCost: best?.cost ?? null,
+              best: best ? { cost: best.cost, sources: best.sources } : null,
+              candidateFailures: candidateFailures[i],
+              overLimit: overLimit[i],
+              proofScopeKey: roleScopeKey(i),
+              workerIndex: i,
+            },
+          });
         }
+      };
+      const failWorker = (method, info) => {
+        if (settled.has(i)) return;
+        failures++;
+        lastMethod = method; lastInfo = info || lastInfo;
+        settleWorker(i, {
+          type: "worker-failed",
+          workerId: i,
+          atMs: performance.now() - t0,
+          result: {
+            status: "error",
+            complete: false,
+            terminationReason: "worker-error",
+            finalCost: null,
+            best: null,
+            proofScopeKey: roleScopeKey(i),
+            workerIndex: i,
+          },
+        });
       };
       w.onerror = (event) => {
         event.preventDefault?.();
-        finishWorker(w, { failed: true, method: "worker-error", info: event.message || "Worker 加载或执行失败" });
+        failWorker("worker-error", event.message || "Worker 加载或执行失败");
       };
-      w.onmessageerror = () => finishWorker(w, { failed: true, method: "message-error", info: "Worker 消息无法反序列化" });
-      w.postMessage({ type: "solve", requestId, puzzle: pf, seed: i === 0 ? 0 : (i * 7919 + 31), maxTracksHint: maxTrk > 0 ? maxTrk : 0 });
+      w.onmessageerror = () => failWorker("message-error", "Worker 消息无法反序列化");
+      w.postMessage({ type: "solve", requestId, puzzle: pf, seed: portfolioSeed(i), maxTracksHint: maxTrk > 0 ? maxTrk : 0, solverOptions: roleSolverOptions(i) });
       workers.push(w);
     }
     workersRef.current = workers;
@@ -414,14 +578,13 @@ export default function App() {
 
   /* ═══════ Tool definitions ═══════ */
   const TOOLS = [
-    ["empty", "✕", "清除"],
-    ["blank", "◻", "铺轨区"],
-    ["fixed", "═", "固定轨"],
-    ["car", "■", "起点"],
-    ["goal", "◉", "终点"],
-    ["platform", "▣", "站台"],
-    ["tunnel", "⧆", "隧道"],
-    ["gate", "⚡", "机关"],
+    { id: "car", icon: "■", label: "起点" },
+    { id: "goal", icon: "◉", label: "终点" },
+    { id: "blank", icon: "◻", label: "铺轨区" },
+    { id: "empty", icon: "✕", label: "清除" },
+    { id: "fixed", icon: "═ ⚡", label: "固定轨 / 机关", wide: true },
+    { id: "platform", icon: "▣", label: "站台" },
+    { id: "tunnel", icon: "⧆", label: "隧道" },
   ];
 
   return (<div style={{ background: bg, minHeight: "100vh", color: tx, fontFamily: "'JetBrains Mono','Fira Code','SF Mono',monospace", fontSize: 12 }}>
@@ -434,20 +597,13 @@ export default function App() {
       <div style={{ display: "flex", gap: 12, alignItems: "flex-start", flexWrap: "wrap" }}>
         <div style={{ width: 210, flexShrink: 0, display: "flex", flexDirection: "column", gap: 7 }}>
           <Bx t="网格"><div style={{ display: "flex", gap: 6, alignItems: "center" }}><Stp v={W} s={v => resize(v, H)} mn={2} mx={12} /><span style={{ color: dm2 }}>×</span><Stp v={H} s={v => resize(W, v)} mn={2} mx={12} /></div></Bx>
-          <Bx t="工具"><div style={{ display: "grid", gridTemplateColumns: "repeat(4, minmax(0, 1fr))", gap: 3 }}>
-            {TOOLS.map(([id, ic, lb]) =>
-              <button key={id} title={lb} onClick={() => { setTool(id); setDirPick(null); setMsg(""); }} style={{ display: "flex", minWidth: 0, minHeight: 43, flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 2, padding: "3px 1px", background: tool === id ? "#2e2818" : "transparent", border: `1px solid ${tool === id ? hi : bd}`, borderRadius: 3, color: tool === id ? hi : tx, cursor: "pointer", fontSize: 9, fontFamily: "inherit", whiteSpace: "nowrap" }}><span style={{ textAlign: "center", fontSize: 14, lineHeight: 1 }}>{ic}</span>{lb}</button>)}
+          <Bx t="工具"><div style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: 4 }}>
+            {TOOLS.map(({ id, icon, label, wide }) =>
+              <button key={id} title={label} onClick={() => { setTool(id); setDirPick(null); setMsg(""); }} style={{ gridColumn: wide ? "1 / -1" : undefined, display: "flex", minWidth: 0, minHeight: 46, flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 3, padding: "5px 3px", background: tool === id ? "#2e2818" : "transparent", border: `1px solid ${tool === id ? hi : bd}`, borderRadius: 3, color: tool === id ? hi : tx, cursor: "pointer", fontSize: 10, fontFamily: "inherit", whiteSpace: "nowrap" }}><span style={{ textAlign: "center", fontSize: 15, lineHeight: 1 }}>{icon}</span>{label}</button>)}
           </div>
 
             {tool === "blank" && <div style={{ marginTop: 8 }}>
               <button onClick={doBlankAll} style={{ width: "100%", padding: "5px 7px", background: "#241f14", border: `1px solid ${bd}`, color: tx, borderRadius: 3, cursor: "pointer", fontSize: 11, fontFamily: "inherit" }}>全部空地设为可铺设</button>
-            </div>}
-
-            {/* ─── Fixed: grouped track picker ─── */}
-            {tool === "fixed" && <div style={{ marginTop: 8 }}>
-              <TrackGroup label="直线" tracks={trackGroups.straights} pick={trkPick} onPick={setTrkPick} />
-              <TrackGroup label="弯道" tracks={trackGroups.curves} pick={trkPick} onPick={setTrkPick} columns={2} />
-              <TrackGroup label="三头" tracks={trackGroups.tees} pick={trkPick} onPick={setTrkPick} columns={4} />
             </div>}
 
             {/* ─── Car: facing direction only ─── */}
@@ -492,11 +648,12 @@ export default function App() {
               <div style={{ fontSize: 9, color: dm2, marginTop: 4, lineHeight: 1.4 }}>选择火车从哪一侧进入隧道 · 每色最多2个</div>
             </div>}
 
-            {/* ─── Gate: merged trigger + barrier ─── */}
-            {tool === "gate" && <div style={{ marginTop: 8 }}>
+            {/* ─── Fixed track + mechanisms: all are track-backed cell types ─── */}
+            {tool === "fixed" && <div style={{ marginTop: 8 }}>
               <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 4, marginBottom: 7 }}>
-                {[["trigger", "◇ 触发器"], ["barrier", "▮ 关卡"], ["tswitch", "T 变轨T"], ["autoswitch", "A 自变T"]].map(([m, lb]) =>
+                {[["fixed", "═ 普通固定轨"], ["trigger", "◇ 触发器"], ["barrier", "▮ 关卡"], ["tswitch", "T 变轨T"], ["autoswitch", "A 自变T"]].map(([m, lb]) =>
                   <button key={m} onClick={() => setGateMode(m)} style={{
+                    gridColumn: m === "fixed" ? "1 / -1" : undefined,
                     minHeight: 32, fontSize: 11, fontFamily: "inherit", cursor: "pointer",
                     background: gateMode === m ? "#2e2818" : pnl,
                     color: gateMode === m ? hi : dm,
@@ -504,10 +661,15 @@ export default function App() {
                     borderRadius: 3,
                   }}>{lb}</button>)}
               </div>
-              {gateMode !== "autoswitch" && <>
+              {gateMode !== "fixed" && gateMode !== "autoswitch" && <>
                 <div style={{ fontSize: 10, color: dm, marginBottom: 3 }}>颜色</div>
                 <div style={{ display: "flex", gap: 3 }}>{BARRIER_COLORS.map(c => <button key={c} onClick={() => setBarrierColor(c)} style={{ width: 24, height: 24, borderRadius: 12, background: c, border: `2px solid ${barrierColor === c ? "#fff" : "transparent"}`, cursor: "pointer", boxShadow: barrierColor === c ? `0 0 6px ${c}` : "none" }} />)}</div>
               </>}
+              {gateMode === "fixed" && <div style={{ marginTop: 8 }}>
+                <TrackGroup label="直线" tracks={trackGroups.straights} pick={trkPick} onPick={setTrkPick} />
+                <TrackGroup label="弯道" tracks={trackGroups.curves} pick={trkPick} onPick={setTrkPick} columns={2} />
+                <TrackGroup label="三头" tracks={trackGroups.tees} pick={trkPick} onPick={setTrkPick} columns={4} />
+              </div>}
               {gateMode === "barrier" && <>
                 <div style={{ fontSize: 10, color: dm, marginBottom: 3, marginTop: 6 }}>初始状态</div>
                 <div style={{ display: "flex", gap: 2 }}>{[["closed", "🔒 关闭"], ["open", "🔓 打开"]].map(([v, lb]) =>
@@ -542,7 +704,7 @@ export default function App() {
                 </div>
               </div>}
               <div style={{ fontSize: 9, color: dm2, marginTop: 5, lineHeight: 1.4 }}>
-                {gateMode === "trigger" ? "触发器：车经过时切换同色关卡和变轨T" : gateMode === "barrier" ? "关卡：阻断/开放轨道通行" : gateMode === "tswitch" ? "变轨T轨：被同色触发器切换" : "自变T轨：无需触发器，经过后自动切换"}
+                {gateMode === "fixed" ? "普通固定轨：直接铺设不可被求解器修改的轨道" : gateMode === "trigger" ? "触发器：车经过时切换同色关卡和变轨T" : gateMode === "barrier" ? "关卡：阻断/开放轨道通行" : gateMode === "tswitch" ? "变轨T轨：被同色触发器切换" : "自变T轨：无需触发器，经过后自动切换"}
                 {gateMode === "trigger" ? " · 再点同色按底轨列表轮换" : gateMode === "barrier" ? " · 再点同色应用当前底轨" : ""}
               </div>
             </div>}
@@ -630,19 +792,26 @@ export default function App() {
               </g>;
             }))}
             {dirPick && (() => {
-              const sx = dirPick.x * CL + 1, sy = dirPick.y * CL + 1;
+              const pickerSize = 98, buttonSize = 32;
+              const boardWidth = W * CL + 2, boardHeight = H * CL + 2;
+              const targetCenterX = dirPick.x * CL + CL / 2 + 1;
+              const targetCenterY = dirPick.y * CL + CL / 2 + 1;
+              const sx = Math.min(Math.max(targetCenterX - pickerSize / 2, 2), boardWidth - pickerSize - 2);
+              const sy = Math.min(Math.max(targetCenterY - pickerSize / 2, 2), boardHeight - pickerSize - 2);
               const opts = [
-                { d: "N", x: CL / 2 - 10, y: 4 },
-                { d: "W", x: 5, y: CL / 2 - 10 },
-                { d: "E", x: CL - 25, y: CL / 2 - 10 },
-                { d: "S", x: CL / 2 - 10, y: CL - 25 },
+                { d: "N", x: 33, y: 4 },
+                { d: "W", x: 4, y: 33 },
+                { d: "E", x: 62, y: 33 },
+                { d: "S", x: 33, y: 62 },
               ];
+              const centerLabel = dirPick.tool === "car" ? "方向" : dirPick.tool === "platform" ? "道路" : "入口";
               return <g transform={`translate(${sx},${sy})`}>
-                <rect x={2} y={2} width={CL - 4} height={CL - 4} rx={5} fill="rgba(18,16,14,0.94)" stroke={hi} strokeWidth={1.4} />
-                {(dirPick.tool === "goal" || dirPick.tool === "tunnel") && <text x={CL / 2} y={CL / 2 + 1} textAnchor="middle" dominantBaseline="middle" fill={dm} fontSize={8}>入口</text>}
+                <rect x={0} y={0} width={pickerSize} height={pickerSize} rx={8} fill="rgba(18,16,14,0.97)" stroke={hi} strokeWidth={1.6} />
+                <circle cx={pickerSize / 2} cy={pickerSize / 2} r={13} fill="#17140f" stroke={bd} strokeWidth={1} />
+                <text x={pickerSize / 2} y={pickerSize / 2 + 1} textAnchor="middle" dominantBaseline="middle" fill={dm} fontSize={9}>{centerLabel}</text>
                 {opts.map(o => <g key={o.d} onMouseDown={e => { e.stopPropagation(); applyPickedDirection(o.d); }} style={{ cursor: "pointer" }}>
-                  <rect x={o.x} y={o.y} width={20} height={20} rx={3} fill="#241f14" stroke={bd} strokeWidth={1} />
-                  <text x={o.x + 10} y={o.y + 11} textAnchor="middle" dominantBaseline="middle" fill={hi} fontSize={13} fontWeight={800}>{DA[directionGlyphDirection(dirPick.tool, o.d)]}</text>
+                  <rect x={o.x} y={o.y} width={buttonSize} height={buttonSize} rx={6} fill="#2a2317" stroke={hi} strokeWidth={1.2} />
+                  <text x={o.x + buttonSize / 2} y={o.y + buttonSize / 2 + 1} textAnchor="middle" dominantBaseline="middle" fill={hi} fontSize={20} fontWeight={800}>{DA[directionGlyphDirection(dirPick.tool, o.d)]}</text>
                 </g>)}
               </g>;
             })()}

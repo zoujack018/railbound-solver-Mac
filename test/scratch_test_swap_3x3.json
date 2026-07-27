@@ -1,0 +1,38 @@
+{
+  "id": "scratch_test_swap_3x3",
+  "name": "Head-on swap is a collision",
+  "category": "1. 碰撞判定",
+  "description": "两车相邻对向行驶，双方起点底轨均为强制 '-'，第 1 步必然对穿交换格子。对穿=碰撞（作者确认，实例：关卡-7x7-20260722-8-5A 自变 T 处 3 向下、4 向右），任何铺轨都无法改变第 1 步，因此本关无解。回归目的：防止对穿判定被再次放宽。",
+  "puzzle": {
+    "formatVersion": 1,
+    "width": 3,
+    "height": 3,
+    "fixed": {},
+    "blanks": [
+      [0, 0],
+      [1, 0],
+      [2, 0],
+      [0, 2],
+      [1, 2],
+      [2, 2]
+    ],
+    "cars": [
+      { "name": "1", "x": 0, "y": 1, "entry": "W" },
+      { "name": "2", "x": 1, "y": 1, "entry": "E" }
+    ],
+    "goal": [2, 1],
+    "goal_entry": "W",
+    "order": ["1", "2"],
+    "max_steps": 50,
+    "tunnels": [],
+    "triggers": [],
+    "barriers": [],
+    "tsw_triggers": [],
+    "tswitches": [],
+    "autoSwitches": [],
+    "platforms": []
+  },
+  "expected": {
+    "hasSolution": false
+  }
+}

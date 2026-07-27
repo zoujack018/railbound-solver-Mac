@@ -1,6 +1,6 @@
 # Railbound 求解器与编辑器
 
-> P2 交接基线，更新于 2026-07-22。
+> P2 交接基线，更新于 2026-07-23。
 >
 > 这份 README 不只介绍如何启动项目，也记录 P0/P1 移植过程、当前代码边界、已知风险、测试缺口和下一轮对话的推荐执行顺序。后续接手者应先阅读“当前最重要的堵点”和“P2 路线图”，不要直接开始大规模重构。
 
@@ -45,8 +45,8 @@
 
 ### 本轮新增：测试夹具格式与逐题求解回归
 
-`test/` 当前有 16 个 JSON：`测试/` 下 13 个是 Portable Puzzle，根目录 3 个
-`scratch_*.json` 是带 `puzzle/expected` 的测试夹具文档：
+`test/` 下的逐题语料主要分为 `测试/` 中的 Portable Puzzle，以及根目录带
+`puzzle/expected` 的 `scratch_*.json` 测试夹具文档：
 
 ```json
 {
@@ -68,7 +68,7 @@
 - 有棋盘但故意不满足编辑器约束的诊断夹具：显示缩略图和“仅预览”原因，不允许误载入。
 - 只有 helper 参数、没有棋盘的夹具：显示元信息卡片，不再显示成“JSON 无效”。
 
-当前 16 个文件全部能通过严格格式校验并载入；解析器仍保留对“仅预览”和
+当前纳入格式语料的文件都能通过相应解析/校验；解析器仍保留对“仅预览”和
 helper-only 夹具的兼容能力。`test/format-adapter-tests.js` 会递归扫描当前语料，
 防止继续依赖已经丢失的旧 21 文件清单。
 
@@ -78,6 +78,91 @@ helper-only 夹具的兼容能力。`test/format-adapter-tests.js` 会递归扫�
 - 英文 `test/`、`tests/` 和中文 `测试/` 路径都会归入“测试”页签。
 
 一维测试棋盘现在允许使用 `1×N` 或 `N×1`。编辑器新建尺寸按钮仍以 2 为下限，这个放宽主要用于显示和复现规则夹具。
+
+### 求解测量、P1 CSP 时间盒、P12 候选 seed 与执行器 portfolio
+
+Worker 与逐题执行器现在把“找到候选”和“完成证明”分开报告。`done` 消息至少包含：
+
+- `cspMs`、`p12SeedMs`、`dfsMs`；
+- `cspStats`：路径迭代/枚举/保留数、逐车路径统计、组合迭代数、溢出状态、
+  是否跳过或中止及其原因；
+- `cspStats.p12Seed`：P12 applicability、工作预算、完整叶、`simulate()` 调用、
+  候选成本与阶段原因；其 progress phase 为 `p12-seed`，候选 source 为
+  `p12-pattern-seed`；
+- `dfsStats`：节点数、迭代上限、最深步数与状态、是否耗尽迭代预算、搜索是否完整；
+- `firstCandidateMs`、`finalCost`、`complete`、`terminationReason`。
+
+P1 只给 CSP 候选生成阶段增加了一个跨全部 slack 轮次共享的时间/路径/组合预算，
+没有修改轨道上限、关卡数据、碰撞规则、胜利条件或 DFS 分支顺序。保守默认值为：
+
+```js
+solverOptions: {
+  cspTimebox: {
+    enabled: true,
+    maxMs: 5000,
+    maxPaths: 100000,
+    maxCombinations: 5000000,
+  },
+  p12Seed: { enabled: true, maxMs: 50, maxWorkUnits: 1000 },
+}
+```
+
+CSP 触及任一预算时会记录 `cspStats.aborted` 和 `abortReason`，随后可靠进入 DFS；
+CSP 中止本身既不是无解结论，也不会单独决定整个 Worker 的 `complete`。逐题执行器可用
+`CSP_TIMEBOX=off` 关闭这层共享时间盒，作为修改前基准（原有的 CSP 内部路径、枚举和
+beam 上限仍然生效）。详细配置和结果语义见
+[开发与测试](docs/development.md) 与
+[求解器性能优化](docs/solver-optimization.md)。
+
+P12 只在超过经典 CSP 规模阈值后尝试一次有界的四车/四站台/单 AutoSwitch
+结构模板。模板从当前 puzzle 的相对几何和端口 usage 推导铺轨，不读取文件名或
+已知答案；候选先在 Worker 内通过 `simulate()`，调用方再复核一次。它是可能漏解
+的快速候选 seed，永远不参与 `search-exhausted`：不适用或失败会进入原 DFS，
+成功后 DFS 未走完时仍是 `complete:false`。canonical 配置为
+`solverOptions.p12Seed` 与 `P12_PATTERN_SEED=on|off`。
+
+P12 明确受公开解拓扑启发，当前只匹配语料库中的 10×11-8-6A。它可在约数毫秒
+内给出经权威 `simulate()` 验证的 37 轨、64 步候选，但结果仍是
+`complete:false`；关闭 P12 后的有机首候选和最优性证明都尚未解决。逐题记分板
+因此显示 `solved(p12-seed)`，不能把它写成求解器已经有机攻克该题。P12 约 370 行
+的专用实现也是维护负担；若没有第二道语料命中，应重新评估保留价值。真正的
+P8 仍指 8×8-8-5B 的 waypoint/CSP 分段枚举，目前未实现。
+
+逐题执行器支持 `PUZZLE_WORKERS=1..16`。默认 `1` 完全保持原单 Worker 路径。
+N>1 正例的首个候选必须先通过权威 `simulate()`；随后立即取消 losers，但 winner
+可在有界证明宽限内继续搜索。`PUZZLE_PROOF_GRACE_MS` 默认 100ms，设为 `0` 可
+回退到第七版的立即停止行为。effective grace 取配置值与“距题目墙钟尚余时间减
+10ms margin”的较小者。同证明域、同成本且没有候选失败/超限证据的
+`optimal-proven` 优先于 fast-candidate 降级；宽限未取得证明时仍返回
+`complete:false` + `portfolio-first-valid-candidate`。负例不进入宽限，必须等待
+同一证明域内某个 Worker 返回 `complete:true` + `search-exhausted`。
+
+输出分别标注 portfolio 墙钟与 `Σobserved+estimated` 阶段时间/节点，并报告
+proof grace 的 configured / effective / actual wait / outcome。取消线程的阶段时间按
+最后 phase 快照外推，并明确标记 `phaseTimesExact:false`；节点及部分计数仍只是
+下界。runner 的首候选/墙钟统一包含 Worker 启动，Worker-local 候选时钟另行保留。
+
+第七版 portfolio 基线中，7×7-8-5A 的 `N=1` 在 77,978ms、15,000,000 DFS 节点
+后仍无候选；`N=8`、grace=0 的代表跑约 5.45 秒找到 26 轨、95 步候选，仍为
+`complete:false`。第八版顺序 A/B 的两轮复现为：grace=0 首候选
+5,433/5,474ms、墙钟 5,440/5,480ms、成本 26；默认 100ms 宽限首候选
+5,443/5,455ms、墙钟 5,550/5,560ms、实际等待约 101ms，并在这两轮观察到成本 23，
+但仍是 `complete:false`。成本改善只是这两次额外搜索窗口中的观察值，不构成
+最优性证明或今后运行保证。portfolio 收益仍是 seed 覆盖并以 CPU 换延迟，不能
+称作剪枝；本轮也没有实施异构 CSP、P5 或 P7。
+
+另将 7×7-8-7A 固定为 Barrier 慢基准：它有 34 个 blank、6 个 Barrier、3 个
+trigger，没有平台、AutoSwitch 或零号车。19 轨预算在 10,199,936 节点、约
+36.1 秒后完整穷尽；20 轨候选在当前 HEAD 约 1.0 秒、38 步出现，因此当前规则下
+最小值为 20。v3.02 游戏截图中该 20 轨布局完成时库存为 0，支持题面库存 20，
+但这不是开发者逐关文字声明，证据强度需保留此限定。该题不进入快速 canary。
+
+第七版只有执行器 portfolio 属于新增性能优化；第八版唯一性能改动是 bounded
+portfolio proof grace。P12 正名与候选消息遥测补齐属于协议/测量修正。后续仍按
+单变量推进 Barrier P5②/P7、真正 P8、P10 Zobrist；异构 CSP/DFS portfolio 也必须
+另起一轮，不能混入 proof-grace 收益。
+P4 的旧负探针只否定 naive string-key TT；P5 的旧负探针只覆盖 10×11 P5①，
+都不能外推成 P10 或 Barrier P5②无效。
 
 ## 3. 当前最重要的堵点
 
@@ -97,16 +182,21 @@ helper-only 夹具的兼容能力。`test/format-adapter-tests.js` 会递归扫�
 本轮新增：
 
 - `test/solver-worker-node.js`：在 Node Worker Thread 中复用真实模块 Worker。
-- `test/puzzle-solver-tests.js`：递归运行 16 道关卡，逐候选调用权威 `simulate()` 复核，并为每题设置独立超时。
-- `npm test`：15 条格式断言，加 5×5 快速求解回归。
-- `npm run test:puzzles`：运行全部 16 道关卡；可用 `PUZZLE_TIMEOUT_MS` 调整单题预算。
+- `test/puzzle-solver-tests.js`：递归运行逐题语料，逐候选调用权威 `simulate()` 复核，
+  并为每题设置独立超时。
+- `npm test`：15 条格式断言、portfolio 纯契约与集成脚本、10 条搜索金丝雀、
+  2 条 CSP→DFS fallback 与 5 条 P12 协议检查。portfolio 集成门禁覆盖
+  grace=0 回退、证明保留、winner 多候选所有权和 N=4 swap 负例聚合。
+- `npm run test:puzzles`：递归运行逐题语料；可用 `PUZZLE_TIMEOUT_MS` 调整单题预算，
+  用 `PUZZLE_WORKERS=1..16` 选择单 Worker 或多 seed portfolio。
 
-2026-07-22 第二轮更新：测试契约纳入题目轨道上限（test/puzzle-cases.json），
-删除错误的追尾规则、新增排队机制（作者确认），并修复了零号车多后继世界的
-搜索完备性缺口。当前结果为 12 题通过、4 题未通过（全部为大型动态题预算耗尽），
-其中 4×8/5×5/6×7 恰好命中 9/11/16 轨上限，详见
+2026-07-22 第二轮历史快照：测试契约纳入题目轨道上限（test/puzzle-cases.json），
+删除错误的追尾规则，并修复了零号车多后继世界的搜索完备性缺口；当时还试验过
+后来回退的“排队等待”语义。当时结果为 12 题通过、4 题未通过（全部为大型动态题
+预算耗尽），4×8/5×5/6×7 曾记录为 9/11/16；后续对穿规则使 6×7 的 16 轨候选
+失效，现行题面上限为 19、已证最小值为 17，详见
 [test/SOLVER-REPORT.md](test/SOLVER-REPORT.md)。历史 73 条规则级断言仍未恢复，
-排队级联、多零号车、Barrier 队列释放等新语义尤其需要细粒度单测。
+静止车占格、零号车、Barrier 释放和对穿/隧道组合尤其需要细粒度单测。
 
 ### 3.2 已建立新 Git 基线，原始历史仍缺失
 
@@ -182,15 +272,31 @@ npm ci
 
 ```bash
 npm run dev       # http://127.0.0.1:5173/
-npm test          # 15 条格式断言 + 5×5 快速求解回归
-npm run test:puzzles # 逐题运行 test/ 下全部 16 个 JSON
+npm test          # 15 条格式 + portfolio 契约/集成 + 10 金丝雀 + 2 fallback + 5 P12
+npm run test:canary  # 只跑金丝雀：已证最小值必须可解、最小值-1 必须完备无解
+npm run test:puzzles # 递归运行逐题语料（清单文件会排除）
 npm run build     # Vite 生产构建和模块 Worker 打包
 npm run check     # 快速回归 + 生产构建
 npm run preview   # 本机预览生产产物
 npm audit         # 依赖审计
 ```
 
-完整 16 题包含长耗时基准，暂不放入每次快速 `npm test`。历史规则单测恢复后，
+逐题执行器的求解预算可通过环境变量配置：
+
+```bash
+CSP_TIMEBOX=on CSP_TIMEBOX_MS=5000 npm run test:puzzles
+CSP_PATH_BUDGET=100000 CSP_COMBINATION_BUDGET=5000000 npm run test:puzzles
+CSP_TIMEBOX=off npm run test:puzzles  # 关闭 P1 共享时间盒，运行对照基准
+P12_PATTERN_SEED=on npm run test:puzzles -- "10x11"
+P12_PATTERN_SEED=off npm run test:puzzles -- "10x11"  # 关闭 P12 候选 seed
+P12_PATTERN_SEED_MS=50 P12_PATTERN_SEED_WORK_BUDGET=1000 npm run test:puzzles -- "10x11"
+PUZZLE_WORKERS=8 npm run test:puzzles -- "7x7-20260722-8-5A"
+PUZZLE_PROOF_GRACE_MS=0 PUZZLE_WORKERS=8 npm run test:puzzles -- "4x8" # 第七版快停回退
+PUZZLE_PROOF_GRACE_MS=100 PUZZLE_WORKERS=8 npm run test:puzzles -- "4x8"
+DFS_MAX_ITERATIONS=15000000 npm run test:puzzles
+```
+
+完整逐题集包含长耗时基准，暂不放入每次快速 `npm test`。历史规则单测恢复后，
 应把稳定的细粒度断言纳入 `npm test` 和 `npm run check`。
 
 ## 5. 用户操作说明
@@ -229,7 +335,8 @@ npm audit         # 依赖审计
 - Helper 测试夹具：没有棋盘，只显示元信息。
 - “JSON 无效”：JSON 本身损坏，或既不是 Puzzle 也不是识别出的测试夹具。
 
-如果选择项目中的 `test/` 作为关卡库根目录，当前 16 个 JSON 会出现在“测试”页签。
+如果选择项目中的 `test/` 作为关卡库根目录，逐题 JSON 会出现在“测试”页签；
+`puzzle-cases.json` 等清单文件不会作为关卡显示。
 
 ## 6. 两种 JSON 契约
 
@@ -296,7 +403,7 @@ index.html
        -> railbound-logic.js              兼容性重导出
           -> railbound-rules.js           权威规则、模拟、剪枝、诊断
        -> railbound-worker-code.js        Vite 模块 Worker URL
-          -> railbound-worker.js          CSP + DFS 搜索
+          -> railbound-worker.js          CSP + P12 候选 seed + DFS 搜索
              -> railbound-rules.js        复用权威规则
 ```
 
@@ -366,10 +473,21 @@ P2 拆分时不能只按视觉组件切文件，还应先抽出纯数据转换�
 当前约 1,185 行，是第二个主要技术债：
 
 - 静态、小型关卡优先使用路径枚举 + CSP 合并。
-- 动态机关、零号车或 CSP 不可信场景回退 DFS。
+- 动态机关、零号车、CSP 不可信场景或 CSP 时间盒中止时回退 DFS。
 - 多 Worker 使用不同 seed 并行搜索。
 - Worker 回传 `progress`、`solution`、`done`，全部带 request ID。
-- “无解”只表示当前算法与预算内未找到，不是完备数学证明。
+- `progress`/`done` 回传 CSP/DFS 分阶段计时和结构化搜索统计；`solution` 带
+  `candidateMs` 和来源 `source`。
+- 只有 `complete:true` 且 `terminationReason:"search-exhausted"` 才能作为当前搜索边界内的
+  完备无解；预算耗尽、墙钟超时和 `complete:false` 都只表示结果未定。
+
+Node 逐题执行器默认仍为单 Worker。`PUZZLE_WORKERS>1` 才启用 portfolio：正例以
+首个经 `simulate()` 复核的候选取得 winner 所有权，立即取消 losers；winner 默认
+再获最多 100ms、且不侵占题目墙钟最后 10ms 的证明宽限。宽限内同域同成本的有效
+`optimal-proven` 可被保留，否则仍按未证明候选结束。负例继续等待完备证据。
+portfolio 的墙钟不等于各 Worker 工作量总和；报告中的阶段时间以
+`Σobserved+estimated` 单独标出并携带 `phaseTimesExact:false`，节点/部分计数按
+下界判读。
 
 ## 8. 运行时数据流
 
@@ -389,8 +507,9 @@ P2 拆分时不能只按视觉组件切文件，还应先抽出纯数据转换�
 ```text
 buildP()
   -> filterBlanks()
-  -> N 个模块 Worker
-  -> CSP 或 DFS
+  -> 1..16 个模块 Worker（逐题执行器默认 1）
+  -> CSP（可时间盒中止）
+  -> 必要时 DFS 回退（受独立迭代预算）
   -> candidate solution
   -> 主线程 simulate() 复核
   -> 只展示合法候选
@@ -436,17 +555,27 @@ buildP()
 ### 跟随与排队（2026-07-22 修正，作者确认）
 
 - 车辆一格间距同向跟随是合法的，不判碰撞。旧的 TAILING 追尾判定已删除，
-  依据是三项证据：4×8（6-3A）在旧规则下完备搜索最小 11 轨而题目上限 9，
-  删除后恰好 9 轨；6×7（8-3A）的 16 轨上限解仅因 TAILING 被拒；
-  autoswitch 6×4 夹具的 hasSolution:true 与旧规则第 1 步必然 TAILING 矛盾。
-- 排队机制：目标格被"不动车"（停车、等待、Barrier 阻挡、已排队）占据时，
-  后车原地排队而非碰撞，级联传播。实现为三阶段推进：意向移动 →
-  不动点降级 → 仅对实际移动的车辆触发机关信号与接客。
-- 两车同时驶入同一空格仍是 CELL_COLLISION；追撞永久停车的零号车会形成
-  永久排队，普通车因此永远无法到站（超时失败），语义自然正确。
-- 相邻两车同一步交换格子（对穿）当前仍允许。真实游戏很可能判碰撞，但
-  现有 15 题无一依赖该行为；如需修正应在 detectCarCollision 中补对穿检测，
-  并先建立会因此改判的夹具。
+  依据是两项硬证据：4×8（6-3A）在旧规则下完备搜索最小 11 轨而题目上限 9，
+  删除后恰好 9 轨；autoswitch 6×4 夹具的 hasSolution:true 与旧规则第 1 步
+  必然 TAILING 矛盾，删除后 9 轨可解。
+- 静止车就是墙（同日第三次修正，作者游戏实测）：驶入"不动车"（接客等待、
+  Barrier 阻挡、永久停车的零号车）所在格 = CELL_COLLISION。游戏中**没有**
+  预判性排队——曾短暂实现过"后车排队降级"机制，被 8×8-8-5B 实测推翻
+  （4 追撞接客等待 2 步的 3 = 撞车），已整体回退。回归夹具：
+  `test/scratch_test_rearend_4x2.json`（预期不可解）。
+- 因此解法必须靠时序与路线保证间距：后车要么绕更长的路，要么错开到达，
+  等前车离开等待格后再进入；这由求解器在追撞候选被 simulate() 拒绝后
+  自动搜索得到。
+- 移动推进保留三阶段结构：意向移动 → 占格碰撞裁决 → 仅对实际移动的
+  车辆触发机关信号与接客。
+- 对穿碰撞（同日第二次修正，作者确认）：相邻两车同一步穿过同一条边互换
+  格子判 `SWAP_COLLISION`。实例来自关卡-7x7-20260722-8-5A：自变 T (5,3)
+  处 3 向下、4 向右对穿曾被误放行。判定实现于规则层 `detectSwapCollision()`，
+  simulate、零号前瞻、DFS 与 CSP 快速校验四处共用；只对相邻格互换判撞，
+  经隧道传送导致的位置互换没有物理交汇，不判。回归夹具：
+  `test/scratch_test_swap_3x3.json`（预期不可解）。对穿禁令实施后，
+  6×7（8-3A）曾找到的 16 轨解被正确拒绝（第 27 步含对穿）；该关上限
+  经作者核实为 19（此前误记 16），当前规则下最小 17 轨，无矛盾。
 
 ### 站台
 
@@ -530,7 +659,7 @@ stepWorld(world, policy)
 1. 默认 6×6。
 2. 放置纵向起点得到竖轨。
 3. 终点入口箭头方向正确。
-4. 选择 `test/` 目录后出现当前 16 张测试卡片。
+4. 选择 `test/` 目录后出现当前逐题测试卡片（清单文件除外）。
 5. 可载入夹具进入编辑器；仅预览夹具不会误载入。
 6. 保存后 JSON 出现在正确分类并可重新载入。
 
@@ -549,6 +678,9 @@ stepWorld(world, policy)
 
 ### P2.5：求解器与性能
 
+性能优化的完整方法论（剪枝健全性分级、金丝雀契约、基准纪律、P1–P11
+待探索方向与阶段目标）见 [docs/solver-optimization.md](docs/solver-optimization.md)。要点：
+
 在完整测试和性能语料恢复后再进行：
 
 - 以关卡规模和动态特性决定 Worker 数量，而不是固定取硬件并发、上限 16。
@@ -556,6 +688,10 @@ stepWorld(world, policy)
 - 将“搜索预算耗尽”和“已证明无解”分开显示。
 - 为 7×7、8×8 JSON 建立可重复 benchmark。
 - 评估 Worker 初始化成本和共享只读预处理数据。
+
+当前性能路线的命名边界：P12 是专用 pattern seed；真正 P8 是尚未实现的
+waypoint/CSP 分段枚举；P10 是仍待 profile 的 Zobrist/状态编码工程路径。Barrier
+题下一轮优先分别验证 P5② 触发器可达性或 P7 成本下界，每轮仍只落地一个变量。
 
 ## 11. P2 完成定义
 
@@ -565,7 +701,7 @@ P2 不应以“文件拆开了”作为完成标准。建议同时满足：
 - `npm run check` 成为真实提交门禁。
 - 主要编辑器转换是纯函数并有测试。
 - 主模拟与零号前瞻通过共享 stepper 推进。
-- 测试目录当前 16 个 JSON 在关卡库中全部有合理显示状态。
+- 测试目录当前逐题 JSON 在关卡库中全部有合理显示状态。
 - 至少一条浏览器端到端路径覆盖编辑、保存、扫描、缩略图和载入。
 - Vite 生产构建和模块 Worker 回归通过。
 - npm audit 无已知漏洞，或对无法修复项有明确记录。
@@ -579,8 +715,9 @@ P2 不应以“文件拆开了”作为完成标准。建议同时满足：
 请先完整阅读 README.md、docs/architecture.md、docs/development.md、docs/puzzle-format.md 和 docs/migration.md，然后执行 P2.0。
 
 不要立刻重构模拟器。先阅读 test/SOLVER-REPORT.md，并继续查找上游/备份以恢复
-test/solver-tests.js 等历史细粒度规则测试。保留当前 15 条格式断言、5×5 快速回归
-和 test:puzzles 的逐题权威复核。
+test/solver-tests.js 等历史细粒度规则测试。保留当前 15 条格式断言、portfolio
+契约与集成门禁、10 条金丝雀、2 条 fallback、5 条 P12 协议检查和 test:puzzles 的逐题
+权威复核。
 
 在完整测试和 Git/上游来源问题解决后，再按 README 的 P2.1、P2.2 顺序抽取 editor model/reducer 和统一世界 stepper。所有规则改动必须由 simulate() 回归验证；不要把测试夹具的宽松预览契约混入正式 Puzzle v1 校验。
 ```
