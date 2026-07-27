@@ -281,17 +281,19 @@ lookups account for ~50–60% of ticks; GC is 0.9% (object pooling ruled
 out); P7's own share ≈7.6%. The next rounds, in order:
 
 The fifteenth round implemented the P10 exact compact visited key
-(`DFS_P10_COMPACT_KEY=off` to revert; fixed-slot 16-bit-per-char packing,
-component-wise bijective, automatic whole-run fallback to the legacy string
-key when any dimension exceeds the encoding limits): 13/13 off/on cases
-with exactly equal node counts pinned the equivalence relation, 7×7-8-7A
-wall −4.3% (budget 19) / −6.0% (budget 20) with bit-identical node counts.
-The gain is modest — the remaining hotspot is the ≈33% string-keyed
-IC-load bucket. The next rounds, in order:
+(`DFS_P10_COMPACT_KEY=off` to revert): 13/13 off/on cases with exactly
+equal node counts, wall −4.3%/−6.0% — modest. The sixteenth round cleared
+the profile's largest bucket (string-keyed IC loads) with integer-indexed
+array mirrors on the DFS hot path (semantic objects stay authoritative,
+dual-written at the existing mutation sites; no runtime flag — the revert
+unit is the commit; 13/13 cases bit-identical to the pre-refactor
+baseline): 7×7-8-7A wall 26.0s→12.6s (budget 19, −51.6%) and
+52.1s→25.3s (budget 20, −51.4%) with unchanged node counts; cumulative
+since the pre-P7 baseline: budget-19 exhaustion 34.2s→12.6s (−63%). The
+next rounds, in order:
 
-1. **String-keyed hot objects → array indexing** (`placed`, `useMap`,
-   `portBans`, `_barMap` …) — the profile's largest remaining bucket;
-   node-count-equality A/B like P10.
+1. **Re-profile** — the two known buckets are cleared; measure again
+   before choosing any further micro-variable.
 2. **P12 generalization (cycle families)** — only as a deliberate design
    round, if funnel-puzzle candidates beyond the DFS portfolio are needed.
 
@@ -342,11 +344,12 @@ Do not re-read the whole project per task:
   observed cost 23, still `complete:false`. That cost improvement is an
   observation, not an optimality proof or repeatability guarantee. The portfolio
   is seed coverage trading CPU for latency — not pruning.
-- 7×7-8-7A is a slow Barrier benchmark, not a fast canary: with P7 on, budget
-  19 exhausts completely at 7,262,738 nodes in ≈28.6s (P7 off: 10,199,936 /
-  ≈35.2s), and budget 20 completes within the default 15M iteration budget at
-  14,233,286 nodes (≈56.5s), giving a single-run `optimal-proven` minimum of
-  20 (candidate at ≈0.7s). A v3.02 game screenshot supports a 20-rail
-  inventory but is not a per-level developer text claim.
+- 7×7-8-7A is a slow Barrier benchmark, not a fast canary: with the full
+  P7+P10+array-mirror stack, budget 19 exhausts completely at 7,258,797
+  nodes in ≈12.6s (pre-P7 baseline: 10,199,936 / ≈34.2s), and budget 20
+  completes within the default 15M iteration budget at 14,226,560 nodes
+  (≈25.3s), giving a single-run `optimal-proven` minimum of 20 (candidate
+  at ≈0.4s). A v3.02 game screenshot supports a 20-rail inventory but is
+  not a per-level developer text claim.
 - `railbound-solver-v3.jsx` is the largest tech debt: grid state, SVG rendering, solver orchestration, and playback all in one file.
 - Dev and preview servers bind to `127.0.0.1` only. Don't use `--host 0.0.0.0` on untrusted networks.

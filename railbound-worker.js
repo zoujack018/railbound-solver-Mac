@@ -1599,21 +1599,65 @@ function solveDFS(pz, maxSol, minTracks, budget, seed, bs, meta, telemetry, maxI
   const _order = requiredOrder(pz);
   let bestCost = budget, iters = 0; const MAX = maxIters;
   let iterationBudgetHit = false, solutionLimitHit = false;
+  /* ═══ 第十六轮：热路径整型索引镜像 ═══
+     第十四版 profile 的最大剩余桶（≈33%）是字符串键动态查找。语义对象
+     （placed / portBans / 各静态图）保持权威不变——rememberSolution、
+     deepest、zeroSafetyLookahead、legacy sk 照旧读对象；DFS 热路径改读
+     以 cellIdx = y*W+x 为下标的数组镜像。镜像只在铺/回退、升级与
+     portBan 增删这些既有变更位点双写，节点数必须与镜像前逐位相等。 */
+  const _W = pz.width, _CELLS = pz.width * pz.height;
+  const _cellKey = new Array(_CELLS);
+  const _cellIdxMap = new Map();
+  for (let y = 0; y < pz.height; y++) for (let x = 0; x < _W; x++) {
+    const i = y * _W + x, k = pk(x, y);
+    _cellKey[i] = k; _cellIdxMap.set(k, i);
+  }
+  const _fixedArr = new Array(_CELLS), _tmArr = new Array(_CELLS), _tswitchArr = new Array(_CELLS),
+    _autoArr = new Array(_CELLS), _barArr = new Array(_CELLS), _trigArr = new Array(_CELLS),
+    _tswTrigArr = new Array(_CELLS), _metaArr = new Array(_CELLS), _platTargetArr = new Array(_CELLS);
+  const _bsArr = new Uint8Array(_CELLS);
+  for (let i = 0; i < _CELLS; i++) {
+    const k = _cellKey[i];
+    _fixedArr[i] = pz.fixed[k];
+    _tmArr[i] = tm[k] ? { ...tm[k], pairIdx: tm[k].pair.y * _W + tm[k].pair.x } : undefined;
+    _tswitchArr[i] = _tswitchMap[k];
+    _autoArr[i] = _autoSwitchMap[k];
+    _barArr[i] = _barMap[k];
+    _trigArr[i] = _trigMap[k];
+    _tswTrigArr[i] = _tswMap[k];
+    _metaArr[i] = meta[k];
+    _bsArr[i] = bs.has(k) ? 1 : 0;
+    _platTargetArr[i] = _platformState.targets[k];
+  }
+  const _placedArr = new Array(_CELLS);
+  let _placedCount = 0;
+  for (const k in placed) { _placedArr[_cellIdxMap.get(k)] = placed[k]; _placedCount += 1; }
+  const _portBanMask = new Uint8Array(_CELLS);
+  const _SIDE_BIT = { N: 1, E: 2, S: 4, W: 8 };
+  const _useArr = new Array(_CELLS);
   /* 零号车多后继世界的端口约束：portBans[k] = 该格禁止出现的入口端口集合。
      当零号车面对某格停车时，最终布局中该格不能有零号车入口侧的端口
      （否则零号车本应驶入）；该格仍可为其他车辆铺设不含该端口的轨道，也可不铺。
      放置(candidates)与升级(findUpgrades/canUpgrade)都必须遵守。 */
   const portBans = {};
-  function addPortBan(k, side) {
+  function addPortBan(k, idx, side) {
     if (!portBans[k]) portBans[k] = new Set();
     if (portBans[k].has(side)) return () => { };
     portBans[k].add(side);
-    return () => { portBans[k].delete(side); if (!portBans[k].size) delete portBans[k]; };
+    _portBanMask[idx] |= _SIDE_BIT[side];
+    return () => {
+      portBans[k].delete(side);
+      _portBanMask[idx] &= ~_SIDE_BIT[side];
+      if (!portBans[k].size) delete portBans[k];
+    };
   }
-  function trackViolatesPortBan(k, track) {
-    const bansAt = portBans[k];
-    if (!bansAt) return false;
-    for (const side of bansAt) if (exitPort(track, side) !== null) return true;
+  function trackViolatesPortBan(idx, track) {
+    const mask = _portBanMask[idx];
+    if (!mask) return false;
+    if ((mask & 1) && exitPort(track, "N") !== null) return true;
+    if ((mask & 2) && exitPort(track, "E") !== null) return true;
+    if ((mask & 4) && exitPort(track, "S") !== null) return true;
+    if ((mask & 8) && exitPort(track, "W") !== null) return true;
     return false;
   }
   /* ═══ P7 可采纳成本下界剪枝（第十轮，单变量，DFS_P7_LOWER_BOUND=off 可回退）═══
@@ -1681,12 +1725,12 @@ function solveDFS(pz, maxSol, minTracks, budget, seed, bs, meta, telemetry, maxI
         const v = vy * W + vx;
         if (goalRestricted && u === _p7GoalIdx && v !== _p7GeNeighborIdx) continue;
         if (!pass[v]) continue;
-        const w = blank[v] && placed[keys[v]] === undefined ? 1 : 0;
+        const w = blank[v] && _placedArr[v] === undefined ? 1 : 0;
         if (d + w < dist[v]) { dist[v] = d + w; (w ? nxt : cur).push(v); }
       }
       const tp = tunnelPair[u];
       if (tp >= 0 && !(goalRestricted && u === _p7GoalIdx)) {
-        const w = blank[tp] && placed[keys[tp]] === undefined ? 1 : 0;
+        const w = blank[tp] && _placedArr[tp] === undefined ? 1 : 0;
         if (d + w < dist[tp]) { dist[tp] = d + w; (w ? nxt : cur).push(tp); }
       }
     }
@@ -1775,6 +1819,7 @@ function solveDFS(pz, maxSol, minTracks, budget, seed, bs, meta, telemetry, maxI
         for (let y = 0; y < pz.height; y++) for (let x = 0; x < pz.width; x++) _p10.cellIdx.set(pk(x, y), y * pz.width + x);
         [...trackUniverse].sort().forEach((t, i) => { _p10.trackIds.set(t, i); });
         _p10.blankKeys = [...bs].sort();
+        _p10.blankIdxs = _p10.blankKeys.map(k => _cellIdxMap.get(k));
         _p10.buf = new Uint16Array(2 + _p10.carCount * 2 + 4 + _p10.blankKeys.length);
       }
     }
@@ -1815,12 +1860,13 @@ function solveDFS(pz, maxSol, minTracks, budget, seed, bs, meta, telemetry, maxI
       buf[n++] = served;
     }
     if (_hasZero) {
-      for (const k of _p10.blankKeys) {
-        const bans = portBans[k];
-        if (!bans || !bans.size) continue;
-        let mask = 0;
-        for (const side of bans) mask |= _p10.sideBit[side];
-        buf[n++] = (_p10.cellIdx.get(k) << 4) | mask;
+      /* _portBanMask 的位映射与 _p10.sideBit 一致，键值与旧的逐 Set 编码
+         逐位相同。 */
+      const idxs = _p10.blankIdxs;
+      for (let i = 0; i < idxs.length; i++) {
+        const mask = _portBanMask[idxs[i]];
+        if (!mask) continue;
+        buf[n++] = (_p10.cellIdx.get(_p10.blankKeys[i]) << 4) | mask;
       }
     }
     return String.fromCharCode.apply(null, buf.subarray(0, n));
@@ -1881,37 +1927,37 @@ function solveDFS(pz, maxSol, minTracks, budget, seed, bs, meta, telemetry, maxI
     }
     return false;
   }
-  const useMap = {};
-  function hasUsage(k, entry, exit) { const arr = useMap[k]; return !!arr && arr.some(u => u.entry === entry && u.exit === exit); }
-  function pushUsage(k, entry, exit) {
-    if (!useMap[k]) useMap[k] = [];
-    if (hasUsage(k, entry, exit)) return () => { };
-    useMap[k].push({ entry, exit });
-    return () => { useMap[k].pop(); if (!useMap[k].length) delete useMap[k]; };
+  function hasUsage(idx, entry, exit) { const arr = _useArr[idx]; return !!arr && arr.some(u => u.entry === entry && u.exit === exit); }
+  function pushUsage(idx, entry, exit) {
+    let arr = _useArr[idx];
+    if (!arr) { arr = []; _useArr[idx] = arr; }
+    if (hasUsage(idx, entry, exit)) return () => { };
+    arr.push({ entry, exit });
+    return () => { arr.pop(); };
   }
-  function trackSupportsUsages(track, k, extra) {
-    const arr = useMap[k] ? [...useMap[k]] : [];
+  function trackSupportsUsages(track, idx, extra) {
+    const arr = _useArr[idx] ? [..._useArr[idx]] : [];
     if (extra) arr.push(extra);
     for (const u of arr) { if (exitPort(track, u.entry) !== u.exit) return false; }
     return true;
   }
-  function tPortsAllUsedDFS(track, k) {
+  function tPortsAllUsedDFS(track, idx) {
     if (!track || !track.startsWith("T_")) return true;
     const ports = new Set(getPorts(track)), used = new Set();
-    for (const u of useMap[k] || []) { used.add(u.entry); used.add(u.exit); }
+    for (const u of _useArr[idx] || []) { used.add(u.entry); used.add(u.exit); }
     for (const p of ports) { if (!used.has(p)) return false; }
     return true;
   }
   function validatePlacedTUsage() {
-    for (const k in placed) { if (placed[k].startsWith("T_") && !tPortsAllUsedDFS(placed[k], k)) return false; }
+    for (const k in placed) { if (placed[k].startsWith("T_") && !tPortsAllUsedDFS(placed[k], _cellIdxMap.get(k))) return false; }
     return true;
   }
-  function canUpgradePlacedCellForEntry(k, entry) {
-    if (!placed[k]) return false;
+  function canUpgradePlacedCellForEntry(idx, entry) {
+    if (!_placedArr[idx]) return false;
     for (const tn of T_TRACKS) {
       const ex = exitPort(tn, entry); if (!ex) continue;
-      if (trackViolatesPortBan(k, tn)) continue;
-      if (trackSupportsUsages(tn, k)) return true;
+      if (trackViolatesPortBan(idx, tn)) continue;
+      if (trackSupportsUsages(tn, idx)) return true;
     }
     return false;
   }
@@ -1922,27 +1968,32 @@ function solveDFS(pz, maxSol, minTracks, budget, seed, bs, meta, telemetry, maxI
     } else {
       if (x < 0 || x >= pz.width || y < 0 || y >= pz.height) return false;
     }
-    const k = pk(x, y);
-    if (tm[k]) return entry === tm[k].facing;
-    if (_tswitchMap[k]) return tswitchTrackVariants(_tswitchMap[k]).some(t => exitPort(t, entry) !== null);
-    if (_autoSwitchMap[k]) return tswitchTrackVariants(_autoSwitchMap[k]).some(t => exitPort(t, entry) !== null);
-    if (pz.fixed[k]) return exitPort(pz.fixed[k], entry) !== null;
-    if (placed[k]) {
-      if (exitPort(placed[k], entry) !== null) return true;
-      return canUpgradePlacedCellForEntry(k, entry);
+    const idx = y * _W + x;
+    const tmc = _tmArr[idx];
+    if (tmc) return entry === tmc.facing;
+    const sw = _tswitchArr[idx];
+    if (sw) return tswitchTrackVariants(sw).some(t => exitPort(t, entry) !== null);
+    const au = _autoArr[idx];
+    if (au) return tswitchTrackVariants(au).some(t => exitPort(t, entry) !== null);
+    const f = _fixedArr[idx];
+    if (f) return exitPort(f, entry) !== null;
+    const p = _placedArr[idx];
+    if (p) {
+      if (exitPort(p, entry) !== null) return true;
+      return canUpgradePlacedCellForEntry(idx, entry);
     }
     if (isZero) return true;
-    return bs.has(k) && !portBans[k]?.has(entry);
+    return _bsArr[idx] === 1 && !(_portBanMask[idx] & _SIDE_BIT[entry]);
   }
   function candidates(c) {
-    const k = pk(c.x, c.y);
-    if (tm[k]) return [];
-    const m = meta[k];
+    const idx = c.y * _W + c.x;
+    if (_tmArr[idx]) return [];
+    const m = _metaArr[idx];
     let pool = m ? m.basicTracks.filter(t => exitPort(t, c.entry) !== null) : BASIC_BY_ENTRY[c.entry];
     const result = [];
     for (const tr of pool) {
       const ex = exitPort(tr, c.entry); if (!ex) continue;
-      if (trackViolatesPortBan(k, tr)) continue;
+      if (trackViolatesPortBan(idx, tr)) continue;
       const nx = c.x + DELTA[ex][0], ny = c.y + DELTA[ex][1], ne = OPPOSITE[ex];
       if (isZeroCar(c) && nx === gx && ny === gy) continue;
       if (!cellCanAcceptDFS(nx, ny, ne, isZeroCar(c))) continue;
@@ -1963,25 +2014,28 @@ function solveDFS(pz, maxSol, minTracks, budget, seed, bs, meta, telemetry, maxI
     return result;
   }
   function findUpgrades(oldTrack, cx, cy, newEntry, isZero = false) {
-    const k = pk(cx, cy), ups = [];
+    const idx = cy * _W + cx, ups = [];
     for (const tn of T_TRACKS) {
       const ex = exitPort(tn, newEntry); if (!ex) continue;
-      if (trackViolatesPortBan(k, tn)) continue;
-      if (!trackSupportsUsages(tn, k, { entry: newEntry, exit: ex })) continue;
+      if (trackViolatesPortBan(idx, tn)) continue;
+      if (!trackSupportsUsages(tn, idx, { entry: newEntry, exit: ex })) continue;
       const nx = cx + DELTA[ex][0], ny = cy + DELTA[ex][1];
       if (!cellCanAcceptDFS(nx, ny, OPPOSITE[ex], isZero)) continue;
       ups.push({ track: tn, exit: ex });
     }
     return ups;
   }
-  /* 热路径轨道查询：语义与 effectiveTrackAt 一致，但直接查 placed/fixed，
-     避免每车每步构造 { ...pz.fixed, ...placed } 合并对象 */
-  function effTrackAtDFS(k, tsTog, autoTog) {
-    if (_tswitchMap[k]) return effectiveTSwitchTrack(_tswitchMap[k], tsTog);
-    if (_autoSwitchMap[k]) return effectiveAutoSwitchTrack(_autoSwitchMap[k], autoTog, k);
-    const t = placed[k];
+  /* 热路径轨道查询：语义与 effectiveTrackAt 一致，但按格子索引直查数组镜像，
+     避免每车每步构造 { ...pz.fixed, ...placed } 合并对象与字符串键查找 */
+  function effTrackAtDFS(idx, tsTog, autoTog) {
+    const sw = _tswitchArr[idx];
+    if (sw) return effectiveTSwitchTrack(sw, tsTog);
+    const au = _autoArr[idx];
+    if (au) return effectiveAutoSwitchTrack(au, autoTog, _cellKey[idx]);
+    const t = _placedArr[idx];
     if (t !== undefined) return t;
-    return pz.fixed[k] !== undefined ? pz.fixed[k] : null;
+    const f = _fixedArr[idx];
+    return f !== undefined ? f : null;
   }
 
   function dfs(cars, arrived, step, visited, toggled, tsToggled, autoToggled, tsLocks, servedPlatforms) {
@@ -2015,12 +2069,12 @@ function solveDFS(pz, maxSol, minTracks, budget, seed, bs, meta, telemetry, maxI
       const zs = zeroSafetyLookahead(pz, cars, { tracks: { ...pz.fixed, ...placed }, tm, triggers: _trigMap, barriers: _barMap, tswTriggers: _tswMap, tswitchMap: _tswitchMap, autoSwitchMap: _autoSwitchMap, toggled, tsToggled, autoToggled, tsLocks });
       if (zs.ok) {
         if (!validatePlacedTUsage()) return;
-        const cost = Object.keys(placed).length - _prePlacedCount; if (!minTracks || cost <= bestCost) rememberSolution(cost); return;
+        const cost = _placedCount - _prePlacedCount; if (!minTracks || cost <= bestCost) rememberSolution(cost); return;
       }
       /* zs.ok is false — fall through to let DFS continue placing tracks for the zero car.
          The cycle-at-visited detection below will catch valid zero-car cycles. */
     }
-    const placedCount = Object.keys(placed).length;
+    const placedCount = _placedCount;
     if (step > ms || placedCount > bestCost || (placedCount === bestCost && solutions.length >= MAX_ALTERNATES)) return;
     if (_p7.enabled) {
       /* h ≤ 未铺 blank 总数 ≤ bs.size，因此 slack ≥ bs.size 时评估不可能
@@ -2034,23 +2088,24 @@ function solveDFS(pz, maxSol, minTracks, budget, seed, bs, meta, telemetry, maxI
     }
     if (candidateLimitReached()) return;
     for (const c0 of cars) {
-      const c = c0; const k = pk(c.x, c.y);
+      const c = c0; const idx = c.y * _W + c.x;
       if (c.parked) continue; /* parked zero car: no track needed */
       if (c.wait > 0) continue;
-      if (tm[k]) continue;
-      if (_tswitchMap[k]) continue;
-      if (_autoSwitchMap[k]) continue;
-      if (pz.fixed[k]) continue;
-      if (placed[k]) {
-        const old = placed[k];
+      if (_tmArr[idx]) continue;
+      if (_tswitchArr[idx]) continue;
+      if (_autoArr[idx]) continue;
+      if (_fixedArr[idx]) continue;
+      if (_placedArr[idx]) {
+        const k = _cellKey[idx];
+        const old = _placedArr[idx];
         const ex0 = exitPort(old, c.entry);
         /* FIX: Zero cars on already-placed tracks should not force upgrades
            or block DFS progress. If the track works for them, just continue.
            If not (ex0 is null), zero cars should skip (not abort DFS). */
         if (isZeroCar(c)) {
           if (ex0 !== null) {
-            if (!hasUsage(k, c.entry, ex0)) {
-              const undo = pushUsage(k, c.entry, ex0);
+            if (!hasUsage(idx, c.entry, ex0)) {
+              const undo = pushUsage(idx, c.entry, ex0);
               dfs(cars, arrived, step, visited, toggled, tsToggled, autoToggled, tsLocks, servedPlatforms); undo(); return;
             }
             continue;
@@ -2059,10 +2114,10 @@ function solveDFS(pz, maxSol, minTracks, budget, seed, bs, meta, telemetry, maxI
           const ups = findUpgrades(old, c.x, c.y, c.entry, true);
           for (const up of ups) {
             if (up.exit === ex0) continue;
-            placed[k] = up.track;
-            const undo = pushUsage(k, c.entry, up.exit);
+            placed[k] = up.track; _placedArr[idx] = up.track;
+            const undo = pushUsage(idx, c.entry, up.exit);
             dfs(cars, arrived, step, visited, toggled, tsToggled, autoToggled, tsLocks, servedPlatforms); undo();
-            placed[k] = old;
+            placed[k] = old; _placedArr[idx] = old;
             if (candidateLimitReached()) return;
           }
           return; /* Zero car must have a traversable track — can't skip */
@@ -2070,34 +2125,35 @@ function solveDFS(pz, maxSol, minTracks, budget, seed, bs, meta, telemetry, maxI
         const ups = findUpgrades(old, c.x, c.y, c.entry);
         for (const up of ups) {
           if (up.exit === ex0) continue;
-          placed[k] = up.track;
-          const undo = pushUsage(k, c.entry, up.exit);
+          placed[k] = up.track; _placedArr[idx] = up.track;
+          const undo = pushUsage(idx, c.entry, up.exit);
           dfs(cars, arrived, step, visited, toggled, tsToggled, autoToggled, tsLocks, servedPlatforms); undo();
-          placed[k] = old;
+          placed[k] = old; _placedArr[idx] = old;
           if (candidateLimitReached()) return;
         }
         if (ex0 !== null) {
-          if (!hasUsage(k, c.entry, ex0)) {
-            const undo = pushUsage(k, c.entry, ex0);
+          if (!hasUsage(idx, c.entry, ex0)) {
+            const undo = pushUsage(idx, c.entry, ex0);
             dfs(cars, arrived, step, visited, toggled, tsToggled, autoToggled, tsLocks, servedPlatforms); undo(); return;
           }
           continue;
         }
         return;
       }
-      if (!bs.has(k)) {
+      if (!_bsArr[idx]) {
         /* No track and not a blank cell — can't proceed (for any car) */
         return;
       }
       const cands = candidates(c);
       for (const tr of cands) {
-        if (Object.keys(placed).length + 1 > bestCost) continue;
+        if (_placedCount + 1 > bestCost) continue;
         const ex = exitPort(tr, c.entry); if (!ex) continue;
-        placed[k] = tr;
+        const k = _cellKey[idx];
+        placed[k] = tr; _placedArr[idx] = tr; _placedCount += 1;
         _p7.version += 1;
-        const undo = pushUsage(k, c.entry, ex);
+        const undo = pushUsage(idx, c.entry, ex);
         dfs(cars, arrived, step, visited, toggled, tsToggled, autoToggled, tsLocks, servedPlatforms); undo();
-        delete placed[k];
+        delete placed[k]; _placedArr[idx] = undefined; _placedCount -= 1;
         _p7.version += 1;
         if (candidateLimitReached()) return;
       }
@@ -2118,7 +2174,7 @@ function solveDFS(pz, maxSol, minTracks, budget, seed, bs, meta, telemetry, maxI
     if (visited.has(sk)) {
       if (arrived.length === _order.length && !cars.some(c => !isZeroCar(c))) {
         if (allPlatformsServed(_platformState, servedPlatforms) && validatePlacedTUsage()) {
-          const cost = Object.keys(placed).length - _prePlacedCount;
+          const cost = _placedCount - _prePlacedCount;
           if (!minTracks || cost <= bestCost) rememberSolution(cost);
         }
       }
@@ -2131,22 +2187,23 @@ function solveDFS(pz, maxSol, minTracks, budget, seed, bs, meta, telemetry, maxI
     /* 三阶段推进（与权威 simulate 一致）：意向移动 -> 占格碰撞裁决 -> 移动者发信号 */
     const _recs = [];
     for (const c0 of cars) {
-      const c = c0; const k = pk(c.x, c.y);
+      const c = c0; const idx = c.y * _W + c.x;
       /* Parked zero car: stays put forever */
       if (c.parked) { _recs.push({ stay: true, c, keep: { ...c } }); continue; }
       if (c.wait > 0) { _recs.push({ stay: true, c, keep: { ...c, wait: c.wait - 1 } }); continue; }
       let nx, ny, ne, _usedTSLock = false, _usedAutoSwitch = false;
-      if (tm[k]) {
-        if (c.entry !== tm[k].facing) { visited.delete(sk); return; }
-        const p = tm[k].pair;
+      const _tmc = _tmArr[idx];
+      if (_tmc) {
+        if (c.entry !== _tmc.facing) { visited.delete(sk); return; }
+        const p = _tmc.pair;
 
         nx = p.x + DELTA[p.facing][0]; ny = p.y + DELTA[p.facing][1]; ne = OPPOSITE[p.facing];
       } else {
         /* Use effectiveTrackAt from Rule Layer — single source of truth */
         const _locked = tsLocks[c.name];
-        const t = _locked && _locked.k === k ? _locked.track : effTrackAtDFS(k, tsToggled, autoToggled);
-        _usedTSLock = !!(_locked && _locked.k === k);
-        _usedAutoSwitch = !!_autoSwitchMap[k] && !_usedTSLock;
+        _usedTSLock = !!(_locked && _locked.idx === idx);
+        const t = _usedTSLock ? _locked.track : effTrackAtDFS(idx, tsToggled, autoToggled);
+        _usedAutoSwitch = !!_autoArr[idx] && !_usedTSLock;
         /* No track or incompatible entry: always an error (zero cars need track too) */
         if (!t || !exitPort(t, c.entry)) {
           visited.delete(sk); return;
@@ -2164,9 +2221,10 @@ function solveDFS(pz, maxSol, minTracks, budget, seed, bs, meta, telemetry, maxI
           const pfx = _order.slice(0, na.length);
           if (na.join(",") !== pfx.join(",")) { visited.delete(sk); return; }
         }
-        if (_trigMap[pk(nx, ny)]) _trgd.push(_trigMap[pk(nx, ny)]);
-        if (_tswMap[pk(nx, ny)]) _tsTrgd.push(_tswMap[pk(nx, ny)]);
-        if (_usedAutoSwitch) _autoUsed.push(k);
+        const _gidx = gy * _W + gx;
+        if (_trigArr[_gidx]) _trgd.push(_trigArr[_gidx]);
+        if (_tswTrigArr[_gidx]) _tsTrgd.push(_tswTrigArr[_gidx]);
+        if (_usedAutoSwitch) _autoUsed.push(_cellKey[idx]);
         if (_usedTSLock) _releaseTSLocks.add(c.name);
         continue;
       }
@@ -2175,7 +2233,7 @@ function solveDFS(pz, maxSol, minTracks, budget, seed, bs, meta, telemetry, maxI
         if (isZeroCar(c)) { _recs.push({ stay: true, c, keep: { ...c, parked: true } }); continue; }
         visited.delete(sk); return;
       }
-      const _nk = pk(nx, ny);
+      const _nidx = ny * _W + nx;
       /* 零号车面对下一格缺乏可用端口时的多后继世界（advance-world branching）：
          最终布局在该格有三类可能，每类都是独立后继世界：
            1. 铺了接受零号车入口的轨 —— 零号车驶入，放置/升级阶段决定轨型；
@@ -2183,13 +2241,13 @@ function solveDFS(pz, maxSol, minTracks, budget, seed, bs, meta, telemetry, maxI
               该格挂端口约束(portBans)后重放本步；
          已有轨且端口不匹配、又无法升级的格子只有停车世界。
          portBans 进入 visited 状态键，各世界独立推进。 */
-      if (isZeroCar(c) && !tm[_nk]) {
-        const _nkTrack = effTrackAtDFS(_nk, tsToggled, autoToggled);
+      if (isZeroCar(c) && !_tmArr[_nidx]) {
+        const _nkTrack = effTrackAtDFS(_nidx, tsToggled, autoToggled);
         const _mismatch = !_nkTrack || !exitPort(_nkTrack, ne);
-        const _unassignedBlank = bs.has(_nk) && !placed[_nk] && !pz.fixed[_nk] && !_tswitchMap[_nk] && !_autoSwitchMap[_nk];
-        if (_mismatch && _unassignedBlank && !portBans[_nk]?.has(ne)) {
+        const _unassignedBlank = _bsArr[_nidx] === 1 && !_placedArr[_nidx] && !_fixedArr[_nidx] && !_tswitchArr[_nidx] && !_autoArr[_nidx];
+        if (_mismatch && _unassignedBlank && !(_portBanMask[_nidx] & _SIDE_BIT[ne])) {
           /* 世界 2：停车 + 端口约束（含"最终不铺"与"铺不含该端口的轨"两种结局） */
-          const _undoBan = addPortBan(_nk, ne);
+          const _undoBan = addPortBan(_cellKey[_nidx], _nidx, ne);
           const _carsB = cars.map(cc => cc === c0 ? { ...cc, parked: true } : cc);
           dfs(_carsB, arrived, step, visited, toggled, tsToggled, autoToggled, tsLocks, servedPlatforms);
           _undoBan();
@@ -2198,10 +2256,10 @@ function solveDFS(pz, maxSol, minTracks, budget, seed, bs, meta, telemetry, maxI
         } else if (_mismatch && _unassignedBlank) {
           /* 该格入口已被约束禁止 —— 只有停车世界 */
           _recs.push({ stay: true, c, keep: { ...c, parked: true } }); continue;
-        } else if (_mismatch && placed[_nk] && canUpgradePlacedCellForEntry(_nk, ne)) {
+        } else if (_mismatch && _placedArr[_nidx] && canUpgradePlacedCellForEntry(_nidx, ne)) {
           /* 已铺基础轨可升级：世界 A) 保持现状停车（挂端口约束防后续升级破坏一致性）；
              世界 B) 驶入，放置阶段升级为 T。 */
-          const _undoBan = addPortBan(_nk, ne);
+          const _undoBan = addPortBan(_cellKey[_nidx], _nidx, ne);
           const _carsB = cars.map(cc => cc === c0 ? { ...cc, parked: true } : cc);
           dfs(_carsB, arrived, step, visited, toggled, tsToggled, autoToggled, tsLocks, servedPlatforms);
           _undoBan();
@@ -2212,9 +2270,10 @@ function solveDFS(pz, maxSol, minTracks, budget, seed, bs, meta, telemetry, maxI
         }
       }
       let _barrierBlocked = false;
-      if (_barMap[_nk]) {
-        const _b = _barMap[_nk], _isT = toggled[_b.color] || false;
-        const _cs = _b.initialState === 'closed' ? (_isT ? 'open' : 'closed') : (_isT ? 'closed' : 'open');
+      const _barc = _barArr[_nidx];
+      if (_barc) {
+        const _isT = toggled[_barc.color] || false;
+        const _cs = _barc.initialState === 'closed' ? (_isT ? 'open' : 'closed') : (_isT ? 'closed' : 'open');
         if (_cs === 'closed') { _barrierBlocked = true; }
       }
       if (_barrierBlocked) {
@@ -2223,20 +2282,20 @@ function solveDFS(pz, maxSol, minTracks, budget, seed, bs, meta, telemetry, maxI
       }
       /* Apply cellCanAcceptDFS to ALL cars including zero cars. */
       if (!cellCanAcceptDFS(nx, ny, ne, isZeroCar(c))) { visited.delete(sk); return; }
-      _recs.push({ stay: false, c, nx, ny, ne, _usedTSLock, _usedAutoSwitch, fromKey: k });
+      _recs.push({ stay: false, c, nx, ny, ne, _usedTSLock, _usedAutoSwitch, fromIdx: idx });
     }
     /* 静止车=墙：无排队降级，驶入不动车格子由占格检测判碰撞（作者实测） */
     for (const m of _recs) {
       if (m.stay) { nxt.push(m.keep); continue; }
-      const { c, nx, ny, ne, _usedTSLock, _usedAutoSwitch, fromKey } = m;
-      const _nk = pk(nx, ny);
-      if (_trigMap[_nk]) _trgd.push(_trigMap[_nk]);
-      if (_tswMap[_nk]) _tsTrgd.push(_tswMap[_nk]);
-      if (_usedAutoSwitch) _autoUsed.push(fromKey);
+      const { c, nx, ny, ne, _usedTSLock, _usedAutoSwitch, fromIdx } = m;
+      const _nidx = ny * _W + nx;
+      if (_trigArr[_nidx]) _trgd.push(_trigArr[_nidx]);
+      if (_tswTrigArr[_nidx]) _tsTrgd.push(_tswTrigArr[_nidx]);
+      if (_usedAutoSwitch) _autoUsed.push(_cellKey[fromIdx]);
       if (_usedTSLock) _releaseTSLocks.add(c.name);
       let _wait = 0;
-      if (!isZeroCar(c)) {
-        const _pickup = platformPickupForCar(_platformState, _nServed, c.name, _nk);
+      if (!isZeroCar(c) && _platTargetArr[_nidx]) {
+        const _pickup = platformPickupForCar(_platformState, _nServed, c.name, _cellKey[_nidx]);
         if (!_pickup.ok) { visited.delete(sk); return; }
         _wait = _pickup.wait;
       }
@@ -2244,8 +2303,10 @@ function solveDFS(pz, maxSol, minTracks, budget, seed, bs, meta, telemetry, maxI
     }
     const occ = new Set();
     for (const c of nxt) {
-      const k = pk(c.x, c.y); if (occ.has(k)) { visited.delete(sk); return; } occ.add(k);
-      if (tm[k]) { const pkp = pk(tm[k].pair.x, tm[k].pair.y); if (occ.has(pkp)) { visited.delete(sk); return; } occ.add(pkp); }
+      const oidx = c.y * _W + c.x;
+      if (occ.has(oidx)) { visited.delete(sk); return; } occ.add(oidx);
+      const otm = _tmArr[oidx];
+      if (otm) { if (occ.has(otm.pairIdx)) { visited.delete(sk); return; } occ.add(otm.pairIdx); }
     }
     /* 追尾判定已删除（作者确认）：跟随合法，追撞由排队与占格碰撞覆盖 */
     if (detectSwapCollision(cars, nxt)) { visited.delete(sk); return; }
@@ -2257,7 +2318,7 @@ function solveDFS(pz, maxSol, minTracks, budget, seed, bs, meta, telemetry, maxI
     const _locks = _hasTS ? { ...tsLocks } : tsLocks;
     if (_hasTS) for (const name of _releaseTSLocks) delete _locks[name];
     const _tsTrgdSet = new Set(_tsTrgd);
-    if (_hasTS) for (const c of nxt) { const k = pk(c.x, c.y), sw = _tswitchMap[k]; if (sw && _tsTrgdSet.has(sw.color)) _locks[c.name] = { k, track: effectiveTSwitchTrack(sw, tsToggled) }; }
+    if (_hasTS) for (const c of nxt) { const lidx = c.y * _W + c.x, sw = _tswitchArr[lidx]; if (sw && _tsTrgdSet.has(sw.color)) _locks[c.name] = { k: _cellKey[lidx], idx: lidx, track: effectiveTSwitchTrack(sw, tsToggled) }; }
     if (_tsTrgd.length) for (const cl of _tsTrgd) _nts[cl] = !_nts[cl];
     const _nat = _hasAuto && _autoUsed.length ? { ...autoToggled } : autoToggled;
     if (_autoUsed.length) for (const k of _autoUsed) _nat[k] = !_nat[k];
